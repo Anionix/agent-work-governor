@@ -29,7 +29,10 @@ enum RecipeArgValue {
 
 impl RecipeArg {
     pub(crate) fn literal(value: String) -> Result<Self, ExecutionRecipeError> {
-        if value.is_empty() || !value.is_ascii() {
+        if value.is_empty()
+            || !value.is_ascii()
+            || value.bytes().any(|byte| byte.is_ascii_control())
+        {
             Err(ExecutionRecipeError)
         } else {
             Ok(Self(RecipeArgValue::Literal(value)))
@@ -194,6 +197,7 @@ mod tests {
     #[test]
     fn resolved_recipes_reject_invalid_primitives() -> Result<(), Box<dyn StdError>> {
         assert!(RecipeArg::literal(String::new()).is_err());
+        assert!(RecipeArg::literal("bad\0argv".into()).is_err());
         assert!(RecipeArg::artifact("../artifact".into()).is_err());
         let draft = ExecutionRecipeDraft {
             argv: vec![RecipeArg::literal("tool".into())?],
