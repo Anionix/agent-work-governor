@@ -39,6 +39,7 @@ normalization_reasons = [
 schema_bound_json_contracts = [
   ".codex-plugin/plugin.json=.codex-plugin/LLM-CONTRACT.md",
   "adapters/check-recipes.v1.json=adapters/check-recipes.v1.LLM-CONTRACT.md",
+  "adapters/rust-check-recipes.v1.json=adapters/rust-check-recipes.v1.LLM-CONTRACT.md",
   "adapters/ask-matt-routes.json=adapters/LLM-CONTRACT.md",
   "references/ask-matt.lock.json=references/LLM-CONTRACT.md",
   "references/canonical-validators.lock.json=references/LLM-CONTRACT.md",

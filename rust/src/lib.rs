@@ -1,5 +1,6 @@
 //! Fail-closed Rust implementation of the Agent Work Governor static checks.
 
+mod adapter_catalog;
 mod bootstrap;
 mod contract;
 mod governance_ir;
@@ -8,6 +9,7 @@ mod okf;
 mod policy;
 mod python_adapter;
 mod reference;
+mod rust_adapter;
 
 use std::path::{Path, PathBuf};
 
