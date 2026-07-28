@@ -1,0 +1,6 @@
+# LLM contract: issue entry -> TEMPLATE or PRIVATE_REPORT; blank entry -> rejected.
+blank_issues_enabled: false
+contact_links:
+  - name: Private security report
+    url: https://github.com/Anionix/agent-work-governor/security/advisories/new
+    about: Report vulnerabilities without public disclosure.

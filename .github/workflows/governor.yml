@@ -1,0 +1,72 @@
+name: governor
+
+on:
+  pull_request:
+    # LLM contract: PR evidence change -> revalidation; stale evidence -> failure.
+    # Source: https://docs.github.com/actions/using-workflows/events-that-trigger-workflows#pull_request
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: governor-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: governor / validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+      EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PR_BODY: ${{ github.event.pull_request.body || '' }}
+    steps:
+      # LLM contract: repository input -> VALIDATED or job failure; there is no
+      # implicit allow path. Source: https://github.com/actions/checkout/releases/tag/v7.0.1
+      - name: Check out the reviewed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ env.EXPECTED_HEAD_SHA }}
+
+      # LLM contract: pinned flake -> Nix environment or job failure.
+      # Source: https://github.com/cachix/install-nix-action/releases/tag/v31.11.0
+      - name: Install Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          enable_kvm: false
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate repository contract
+        shell: bash
+        run: |
+          # LLM contract: candidate tree -> CONTRACT_OK or non-zero exit.
+          set -euo pipefail
+          required=(AGENTS.md CONTRIBUTING.md SECURITY.md flake.nix flake.lock)
+          for path in "${required[@]}"; do
+            test -f "$path" || { echo "::error::missing $path"; exit 1; }
+          done
+          forbidden="$(git ls-files --cached --ignored --exclude-standard)"
+          test -z "$forbidden" || { echo "::error::tracked generated/runtime files"; echo "$forbidden"; exit 1; }
+          unpinned="$(grep -RhoE 'uses:[[:space:]]+[^[:space:]]+@[^[:space:]]+' .github/workflows | grep -Ev '@[0-9a-f]{40}$' || true)"
+          test -z "$unpinned" || { echo "::error::unpinned action"; echo "$unpinned"; exit 1; }
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            labels=('^Issue/spec:' '^State transition and fail-closed outcome:' '^- Primary sources:' '^- Reviewed commit:' '^- Code-review skill digest:' '^- Checks:')
+            for label in "${labels[@]}"; do
+              test "$(grep -Ec "$label" <<<"$PR_BODY")" -eq 1 || { echo "::error::PR evidence must occur once: $label"; exit 1; }
+            done
+            evidence=('^Issue/spec:[[:space:]]+[^[:space:]]' '^State transition and fail-closed outcome:[[:space:]]+[^[:space:]]' '^- Primary sources:[[:space:]]+[^[:space:]]' '^- Checks:[[:space:]]+[^[:space:]]')
+            for pattern in "${evidence[@]}"; do
+              grep -Eq "$pattern" <<<"$PR_BODY" || { echo "::error::missing PR evidence: $pattern"; exit 1; }
+            done
+            grep -Fqx -- "- Reviewed commit: $EXPECTED_HEAD_SHA" <<<"$PR_BODY" || { echo "::error::reviewed commit does not match PR head"; exit 1; }
+            grep -Fqx -- "- Code-review skill digest: 6a65cc61114f96db07ec41e3920e67c9c5bf70dd6e0901eb9460ebcb2bdc209f" <<<"$PR_BODY" || { echo "::error::unexpected code-review skill"; exit 1; }
+          fi
+          git diff --check "$BASE_SHA...HEAD"
+
+      - name: Check reproducible environment
+        run: nix flake check --no-update-lock-file --no-write-lock-file --print-build-logs
