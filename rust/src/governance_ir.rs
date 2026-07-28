@@ -1,11 +1,14 @@
 //! Typed, language-neutral governance intermediate representation.
 #![allow(
     dead_code,
-    reason = "Issue #2 defines the private IR before the adapters in Issues #4 and #5 consume it"
+    reason = "Issues #2, #4, #5, and #6 build the private plan pipeline before Issue #7 exposes it"
 )]
 
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
+
+pub(crate) mod execution_plan;
+pub(crate) mod execution_recipe;
 
 // LLM-CONTRACT
 // id: agent-work-governor.resolved-governance-ir

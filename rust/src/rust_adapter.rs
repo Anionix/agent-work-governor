@@ -6,7 +6,10 @@
 
 use crate::{
     adapter_catalog::{closed_id, sha256_hex, tool_version},
-    governance_ir::{CheckDraft, CheckKind, GovernanceIr, Language},
+    governance_ir::{
+        CheckDraft, CheckKind, GovernanceIr, Language,
+        execution_recipe::{ExecutionRecipe, ExecutionRecipeDraft, RecipeArg},
+    },
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -133,6 +136,39 @@ fn parse_rust_recipe_catalog(bytes: &str) -> Result<Vec<Recipe>, RustAdapterErro
     }
     draft.recipes.sort_by_key(|recipe| recipe.id);
     Ok(draft.recipes)
+}
+
+pub(crate) fn execution_recipes() -> Result<Vec<ExecutionRecipe>, RustAdapterError> {
+    parse_rust_recipe_catalog(RECIPE_BYTES)?
+        .into_iter()
+        .map(|recipe| {
+            match recipe.working_directory {
+                WorkingDirectory::ProjectRoot => {}
+            }
+            let argv = recipe
+                .argv
+                .into_iter()
+                .map(RecipeArg::literal)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| RustAdapterError::RECIPE_CATALOG_INVALID)?;
+            ExecutionRecipe::resolve(ExecutionRecipeDraft {
+                argv,
+                dependencies: recipe
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.as_str().into())
+                    .collect(),
+                identifier: recipe.id.as_str().into(),
+                input_artifacts: Vec::new(),
+                kind: recipe.kind,
+                language: Language::Rust,
+                output_artifacts: Vec::new(),
+                timeout_seconds: recipe.timeout_seconds,
+                tool_identity: recipe.tool.as_str().into(),
+            })
+            .map_err(|_| RustAdapterError::RECIPE_CATALOG_INVALID)
+        })
+        .collect()
 }
 
 pub(crate) fn adapt_rust(project: RustProjectDraft) -> Result<RustCheckSet, RustAdapterError> {
