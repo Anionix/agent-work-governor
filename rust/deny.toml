@@ -1,0 +1,36 @@
+# LLM-CONTRACT
+# id: agent-work-governor.cargo-deny-policy
+# state: LOCKED_DEPENDENCIES -> POLICY_AUDIT -> CLEAN | DENIED
+# preconditions: Cargo.lock is present and registry sources are explicit
+# invariant: advisories, wildcard dependencies, licenses, and unknown sources are checked
+# failure: cargo-deny reports a policy violation and exits non-zero
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: advisories
+# test: bundle:rust/tests/interface.rs
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "Unicode-3.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

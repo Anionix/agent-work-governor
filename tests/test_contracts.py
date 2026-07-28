@@ -1,0 +1,1169 @@
+from __future__ import annotations
+
+import contextlib
+import hashlib
+import io
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import tomllib
+import unittest
+from pathlib import Path
+from unittest import mock
+
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = PLUGIN_ROOT / "scripts"
+sys.path.insert(0, str(SCRIPTS))
+
+import attest_policy
+import bootstrap
+import contract_blocks
+import doctor
+import package_runtime
+import rust_dispatch
+import validate_canonical
+import validate_okf
+import validate_policy
+
+# LLM-CONTRACT
+# id: agent-work-governor.contract-tests
+# state: FIXTURE -> EXERCISED -> EXPECTED_VERDICT | TEST_FAILURE
+# preconditions: fixtures are isolated from user repositories
+# invariant: tests operate only on plugin source or temporary directories
+# failure: unittest reports the exact violated contract
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: unittest.main
+# test: bundle:tests/test_contracts.py
+
+
+def json_frontmatter(metadata: dict[str, object], body: str = "# Body\n") -> str:
+    return f"---\n{json.dumps(metadata)}\n---\n{body}"
+
+
+def profile_metadata(concept_type: str = "Reference") -> dict[str, object]:
+    return {
+        "type": concept_type,
+        "status": "draft",
+        "generated": {
+            "by": "process:contract-test",
+            "at": "2026-07-28T00:00:00+09:00",
+        },
+        "stale_after": "2026-10-28",
+        "sources": [{"resource": "https://example.invalid/primary"}],
+    }
+
+
+def bundled_runtime_or_skip(
+    test_case: unittest.TestCase,
+) -> rust_dispatch.BinarySelection:
+    """Return a verified release binary when this is an installed bundle."""
+
+    if not (PLUGIN_ROOT / rust_dispatch.MANIFEST).is_file():
+        baseline = tomllib.loads(
+            (PLUGIN_ROOT / "SOURCE_BASELINE.toml").read_text(encoding="utf-8")
+        )
+        test_case.assertEqual("0.1", baseline["schema_version"])
+        test_case.assertRegex(baseline["source_bundle_sha256"], r"^[0-9a-f]{64}$")
+        test_case.skipTest(
+            "source-only checkout intentionally excludes compiled release artifacts"
+        )
+    return rust_dispatch.resolve_binary(PLUGIN_ROOT)
+
+
+class PolicyTests(unittest.TestCase):
+    def test_safe_and_owner_presets_validate(self) -> None:
+        policies = (
+            PLUGIN_ROOT / "assets/repository/.agent-work-governor/policy.toml",
+            PLUGIN_ROOT / "assets/presets/owner-original.toml",
+        )
+        for path in policies:
+            with self.subTest(path=path):
+                self.assertTrue(validate_policy.build_receipt(path)["valid"])
+
+    def test_unknown_scope_cannot_grant_write(self) -> None:
+        policy = {
+            "schema_version": "0.1",
+            "policy_id": "unsafe",
+            "repository_scope": "unknown",
+            "authority": {
+                "repository_write": True,
+                "external_side_effects": False,
+                "destructive_actions": False,
+            },
+            "budget": {
+                "max_in_flight": 1,
+                "max_delegation_depth": 0,
+                "max_repair_rounds": 0,
+            },
+            "routing": {
+                "authority": "ask-matt-or-explicit-user-selection",
+                "require_explicit_route": True,
+                "allow_route_substitution": False,
+                "implicit_ask_matt_invocation": False,
+                "ask_matt_sha256": "0" * 64,
+            },
+            "completion": {
+                "require_terminal_evidence": True,
+                "require_satisfied_postcondition": True,
+                "require_current_artifact_review": True,
+            },
+            "knowledge": {"okf_version": "0.2", "bundle": "knowledge"},
+            "receipts": {
+                "directory": ".governance/receipts",
+                "include_in_okf_bundle": False,
+            },
+        }
+        codes = {item["code"] for item in validate_policy.validate_document(policy)}
+        self.assertIn("SCOPE_AUTHORITY_CONFLICT", codes)
+
+    def test_external_repository_cannot_self_authorize_write(self) -> None:
+        policy = {
+            "schema_version": "0.1",
+            "policy_id": "self-authored-external",
+            "repository_scope": "authorized_external",
+            "authority": {
+                "repository_write": True,
+                "external_side_effects": True,
+                "destructive_actions": False,
+            },
+            "external_authority": {
+                "authority_receipt": "repo://self-authored-receipt",
+                "authority_receipt_sha256": "0" * 64,
+                "upstream_policy": "repo://self-authored-policy",
+                "upstream_policy_sha256": "1" * 64,
+            },
+            "budget": {
+                "max_in_flight": 1,
+                "max_delegation_depth": 0,
+                "max_repair_rounds": 0,
+            },
+            "routing": {
+                "authority": "ask-matt-or-explicit-user-selection",
+                "require_explicit_route": True,
+                "allow_route_substitution": False,
+                "implicit_ask_matt_invocation": False,
+                "ask_matt_sha256": validate_policy.ASK_MATT_SHA256,
+            },
+            "completion": {
+                "require_terminal_evidence": True,
+                "require_satisfied_postcondition": True,
+                "require_current_artifact_review": True,
+            },
+            "knowledge": {"okf_version": "0.2", "bundle": "knowledge"},
+            "receipts": {
+                "directory": ".governance/receipts",
+                "include_in_okf_bundle": False,
+            },
+        }
+        codes = {item["code"] for item in validate_policy.validate_document(policy)}
+        self.assertIn("EXTERNAL_WRITE_ADAPTER_UNAVAILABLE", codes)
+
+    def test_owner_rules_are_enforced_not_decorative(self) -> None:
+        path = PLUGIN_ROOT / "assets/presets/owner-original.toml"
+        policy, parse_findings = validate_policy.load_policy(path)
+        self.assertEqual([], parse_findings)
+        self.assertIsNotNone(policy)
+        assert policy is not None
+        policy["github"]["one_pr_one_task"] = False
+        policy["quality"]["require_code_review_skill"] = False
+        policy["environment"]["require_nix_flake"] = False
+        codes = {item["code"] for item in validate_policy.validate_document(policy)}
+        self.assertIn("UNSAFE_VALUE", codes)
+
+    def test_receipt_attestation_binds_policy_and_validator(self) -> None:
+        policy = PLUGIN_ROOT / "assets/repository/.agent-work-governor/policy.toml"
+        receipt = validate_policy.build_receipt(policy)
+        self.assertEqual("PASS", attest_policy.attest(receipt, policy)["verdict"])
+        mutated = dict(receipt)
+        mutated["policy_sha256"] = "0" * 64
+        self.assertEqual("FAIL", attest_policy.attest(mutated, policy)["verdict"])
+
+
+class ContractBlockTests(unittest.TestCase):
+    def test_marker_alone_is_invalid(self) -> None:
+        self.assertFalse(contract_blocks.has_valid_contract("# LLM-CONTRACT\n"))
+
+    def test_state_requires_transition_arrow(self) -> None:
+        source = (
+            "# LLM-CONTRACT\n"
+            "# id: example.invalid-state\n"
+            "# state: ONLY_ONE_STATE\n"
+            "# preconditions: input exists\n"
+            "# invariant: bounded\n"
+            "# failure: fail closed\n"
+            "# source: https://example.invalid/source\n"
+            "# knowledge: AGENTS.md\n"
+            "# enforced_by: example\n"
+            "# test: tests/test_example.py\n"
+        )
+        self.assertEqual(
+            "state field must contain a transition arrow (->)",
+            contract_blocks.contract_diagnostic(source),
+        )
+
+    def test_complete_contract_is_valid(self) -> None:
+        source = (
+            "// LLM-CONTRACT\n"
+            "// id: example.complete\n"
+            "// state: INPUT -> OUTPUT\n"
+            "// preconditions: input exists\n"
+            "// invariant: output is bounded\n"
+            "// failure: return a typed error\n"
+            "// source: https://example.invalid/source\n"
+            "// knowledge: AGENTS.md\n"
+            "// enforced_by: example\n"
+            "// test: tests/test_example.py\n"
+        )
+        self.assertTrue(contract_blocks.has_valid_contract(source))
+
+
+class OkfTests(unittest.TestCase):
+    def test_plugin_bundle_passes_both_layers(self) -> None:
+        report = validate_okf.validate_bundle(PLUGIN_ROOT / "knowledge")
+        self.assertEqual("valid", report["okf_core"]["status"])
+        self.assertEqual("valid", report["governor_profile"]["status"])
+
+    def test_missing_index_is_profile_only_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "concept.md").write_text(
+                json_frontmatter(profile_metadata()),
+                encoding="utf-8",
+            )
+            report = validate_okf.validate_bundle(bundle)
+        self.assertEqual("valid", report["okf_core"]["status"])
+        self.assertEqual("invalid", report["governor_profile"]["status"])
+
+    def test_root_index_without_version_is_profile_only_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "index.md").write_text("# Index\n", encoding="utf-8")
+            (bundle / "concept.md").write_text(
+                json_frontmatter(profile_metadata()),
+                encoding="utf-8",
+            )
+            report = validate_okf.validate_bundle(bundle)
+        self.assertEqual("valid", report["okf_core"]["status"])
+        self.assertEqual("invalid", report["governor_profile"]["status"])
+
+    def test_unknown_type_key_and_broken_link_are_not_core_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "index.md").write_text(
+                '---\n{"okf_version":"0.2"}\n---\n# Index\n',
+                encoding="utf-8",
+            )
+            metadata = profile_metadata("Future Concept")
+            metadata["unknown_extension"] = {"safe": True}
+            (bundle / "concept.md").write_text(
+                json_frontmatter(metadata, "[Missing](not-yet-written.md)\n"),
+                encoding="utf-8",
+            )
+            report = validate_okf.validate_bundle(bundle)
+        self.assertEqual("valid", report["okf_core"]["status"])
+        self.assertEqual("valid", report["governor_profile"]["status"])
+        self.assertEqual("BROKEN_LINK_ALLOWED_BY_OKF", report["warnings"][0]["code"])
+
+    def test_missing_type_is_core_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            metadata = profile_metadata()
+            metadata.pop("type")
+            (bundle / "concept.md").write_text(
+                json_frontmatter(metadata),
+                encoding="utf-8",
+            )
+            report = validate_okf.validate_bundle(bundle)
+        self.assertEqual("invalid", report["okf_core"]["status"])
+
+    def test_general_yaml_without_parser_is_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "concept.md").write_text(
+                "---\ntype: Reference\n---\n# Body\n",
+                encoding="utf-8",
+            )
+            report = validate_okf.validate_bundle(bundle)
+        self.assertEqual("inconclusive", report["okf_core"]["status"])
+
+    def test_invalid_source_actor_is_profile_failure_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "index.md").write_text(
+                '---\n{"okf_version":"0.2"}\n---\n# Index\n',
+                encoding="utf-8",
+            )
+            metadata = profile_metadata()
+            metadata["sources"] = [
+                {
+                    "resource": "https://example.invalid/source",
+                    "author": "team:not-an-okf-actor",
+                    "last_modified": "2026-07-24",
+                }
+            ]
+            (bundle / "concept.md").write_text(
+                json_frontmatter(metadata),
+                encoding="utf-8",
+            )
+            report = validate_okf.validate_bundle(bundle)
+        self.assertEqual("valid", report["okf_core"]["status"])
+        self.assertEqual("invalid", report["governor_profile"]["status"])
+        codes = {item["code"] for item in report["governor_profile"]["errors"]}
+        self.assertIn("PROFILE_SOURCE_AUTHOR_INVALID", codes)
+
+
+class DoctorTests(unittest.TestCase):
+    def test_unknown_okf_status_fails_closed(self) -> None:
+        self.assertEqual("PASS", doctor.normalize_validator_status("valid"))
+        self.assertEqual(
+            "INCONCLUSIVE", doctor.normalize_validator_status("inconclusive")
+        )
+        self.assertEqual("FAIL", doctor.normalize_validator_status("invalid"))
+        self.assertEqual("FAIL", doctor.normalize_validator_status("future-status"))
+
+    def test_audit_exit_codes_do_not_admit_inconclusive(self) -> None:
+        expected = {"PASS": 0, "WARN": 0, "FAIL": 1, "INCONCLUSIVE": 2, "future": 2}
+        for status, exit_code in expected.items():
+            with self.subTest(status=status):
+                self.assertEqual(exit_code, doctor.audit_exit_code(status))
+
+    def test_doctor_marks_corrupt_rust_as_fail(self) -> None:
+        with mock.patch.object(
+            rust_dispatch,
+            "resolve_binary",
+            side_effect=rust_dispatch.IntegrityError("fixture digest mismatch"),
+        ):
+            report = doctor.audit(PLUGIN_ROOT)
+        findings = {item["check"]: item["status"] for item in report["findings"]}
+        self.assertEqual("FAIL", findings["rust_core_artifact"])
+        self.assertEqual("FAIL", findings["rust_okf_core"])
+        self.assertEqual("FAIL", report["overall"])
+
+    def test_doctor_marks_unsupported_rust_as_inconclusive(self) -> None:
+        with mock.patch.object(
+            rust_dispatch,
+            "resolve_binary",
+            side_effect=rust_dispatch.UnsupportedHostError("fixture host"),
+        ):
+            report = doctor.audit(PLUGIN_ROOT)
+        findings = {item["check"]: item["status"] for item in report["findings"]}
+        self.assertEqual("INCONCLUSIVE", findings["rust_core_artifact"])
+        self.assertEqual("INCONCLUSIVE", findings["rust_okf_core"])
+        self.assertNotEqual("PASS", report["overall"])
+
+    def test_main_preserves_machine_readable_exit_contract(self) -> None:
+        for status, expected in (("PASS", 0), ("FAIL", 1), ("INCONCLUSIVE", 2)):
+            report = {"overall": status, "findings": [], "mutation_count": 0}
+            with (
+                self.subTest(status=status),
+                mock.patch.object(doctor, "audit", return_value=report),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(
+                    expected,
+                    doctor.main(["--repo", str(PLUGIN_ROOT), "--json"]),
+                )
+
+    def test_runtime_drift_during_doctor_check_is_structured_fail(self) -> None:
+        selection = bundled_runtime_or_skip(self)
+        with mock.patch.object(
+            rust_dispatch,
+            "invoke",
+            side_effect=rust_dispatch.IntegrityError("fixture concurrent drift"),
+        ):
+            status, evidence, report = doctor.rust_check(selection, ["okf", "fixture"])
+        self.assertEqual("FAIL", status)
+        self.assertIn("concurrent drift", evidence)
+        self.assertIsNone(report)
+
+    def test_packaged_doctor_runtime_checks_pass(self) -> None:
+        bundled_runtime_or_skip(self)
+        report = doctor.audit(PLUGIN_ROOT)
+        states = {item["check"]: item["status"] for item in report["findings"]}
+        self.assertEqual("PASS", states["rust_core_artifact"])
+        self.assertEqual("PASS", states["rust_okf_core"])
+        self.assertEqual("PASS", states["okf_runtime_differential"])
+
+    def test_canonical_validator_locks_match_installed_sources(self) -> None:
+        lock = validate_canonical.load_lock(PLUGIN_ROOT)
+        for key in ("plugin_validator", "skill_validator"):
+            path = Path.home() / lock[key]["path"]
+            self.assertEqual(
+                (
+                    "https://raw.githubusercontent.com/openai/codex/"
+                    f"{lock[key]['source_commit']}/{lock[key]['source_path']}"
+                ),
+                lock[key]["source_url"],
+            )
+            if path.is_file():
+                self.assertEqual(
+                    lock[key]["sha256"],
+                    hashlib.sha256(path.read_bytes()).hexdigest(),
+                )
+
+    def test_code_review_source_lock_matches_installed_source(self) -> None:
+        lock = json.loads(
+            (PLUGIN_ROOT / "references/code-review.lock.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        path = Path.home() / ".codex/skills/code-review/SKILL.md"
+        if not path.is_file():
+            self.skipTest("code-review Skill is not installed")
+        self.assertEqual(lock["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+
+
+class RustDispatchTests(unittest.TestCase):
+    @staticmethod
+    def runtime_bundle(
+        root: Path,
+        *,
+        stdout: str = '{"status":"PASS","mutation_count":0}',
+        exit_code: int = 0,
+        delay_seconds: float = 0,
+    ) -> Path:
+        for relative in rust_dispatch.SOURCE_INPUTS:
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"fixture:{relative}\n", encoding="utf-8")
+        source = root / "rust/src/main.rs"
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("// fixture\n", encoding="utf-8")
+        test_source = root / "rust/tests/fixture.rs"
+        test_source.parent.mkdir(parents=True, exist_ok=True)
+        test_source.write_text("// fixture\n", encoding="utf-8")
+        target = rust_dispatch.host_target()
+        binary = root / f"bin/{target}/agent-work-governor"
+        binary.parent.mkdir(parents=True, exist_ok=True)
+        delay = f"sleep {delay_seconds}\n" if delay_seconds else ""
+        binary.write_text(
+            f"#!/bin/sh\n{delay}printf '%s' '{stdout}'\nexit {exit_code}\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        manifest = rust_dispatch.build_manifest(
+            root,
+            binary.relative_to(root),
+            target=target,
+            component_version="0.1.0",
+            rustc_version="rustc fixture",
+        )
+        (root / "bin/manifest.json").write_text(
+            json.dumps(manifest),
+            encoding="utf-8",
+        )
+        return binary
+
+    def test_host_mapping_is_explicit(self) -> None:
+        self.assertEqual(
+            "aarch64-apple-darwin",
+            rust_dispatch.host_target("Darwin", "arm64"),
+        )
+        self.assertEqual(
+            "x86_64-unknown-linux-gnu",
+            rust_dispatch.host_target("Linux", "amd64"),
+        )
+        with self.assertRaises(rust_dispatch.UnsupportedHostError):
+            rust_dispatch.host_target("Plan9", "mips")
+
+    def test_verified_fixture_runs_without_a_shell_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.runtime_bundle(root)
+            selection = rust_dispatch.resolve_binary(root)
+            invocation = rust_dispatch.invoke(selection, ["okf", "fixture"])
+        self.assertEqual("PASS", rust_dispatch.invocation_status(invocation))
+        self.assertIsNotNone(invocation.report)
+        assert invocation.report is not None
+        self.assertEqual(0, invocation.report["mutation_count"])
+
+    def test_package_runtime_writes_resolvable_manifest_once(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = self.runtime_bundle(root)
+            (root / rust_dispatch.MANIFEST).unlink()
+            arguments = [
+                "--plugin-root",
+                str(root),
+                "--relative-binary",
+                str(binary.relative_to(root)),
+                "--target",
+                rust_dispatch.host_target(),
+                "--component-version",
+                "0.1.0",
+                "--rustc-version",
+                "rustc fixture",
+            ]
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(0, package_runtime.main(arguments))
+            self.assertEqual(binary.resolve(), rust_dispatch.resolve_binary(root).path)
+            with contextlib.redirect_stderr(output):
+                self.assertEqual(1, package_runtime.main(arguments))
+
+    def test_digest_drift_and_symlinks_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            binary = self.runtime_bundle(root)
+            binary.write_bytes(binary.read_bytes() + b"drift")
+            with self.assertRaises(rust_dispatch.IntegrityError):
+                rust_dispatch.resolve_binary(root)
+
+            binary = self.runtime_bundle(root)
+            outside = root / "outside"
+            shutil.copy2(binary, outside)
+            binary.unlink()
+            binary.symlink_to(outside)
+            with self.assertRaises(rust_dispatch.IntegrityError):
+                rust_dispatch.resolve_binary(root)
+
+    def test_invalid_json_and_usage_exit_are_inconclusive(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.runtime_bundle(root, stdout="not-json")
+            invocation = rust_dispatch.run_rust(["okf"], plugin_root=root)
+            self.assertEqual(
+                "INCONCLUSIVE",
+                rust_dispatch.invocation_status(invocation),
+            )
+
+    def test_timeout_is_a_typed_inconclusive_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.runtime_bundle(root, delay_seconds=1)
+            selection = rust_dispatch.resolve_binary(root)
+            with self.assertRaises(rust_dispatch.InvocationError):
+                rust_dispatch.invoke(selection, ["okf"], timeout_seconds=0)
+
+            self.runtime_bundle(root, exit_code=64)
+            invocation = rust_dispatch.run_rust(["okf"], plugin_root=root)
+            self.assertEqual(
+                "INCONCLUSIVE",
+                rust_dispatch.invocation_status(invocation),
+            )
+
+    def test_bundled_release_matches_manifest_and_component_version(self) -> None:
+        selection = bundled_runtime_or_skip(self)
+        process = subprocess.run(
+            [str(selection.path), "--version"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(0, process.returncode, process.stderr)
+        self.assertEqual(
+            f"agent-work-governor {selection.component_version}",
+            process.stdout.strip(),
+        )
+
+    def test_policy_and_okf_overlap_matches_rust(self) -> None:
+        selection = bundled_runtime_or_skip(self)
+        policy_path = PLUGIN_ROOT / "assets/presets/owner-original.toml"
+        policy = rust_dispatch.invoke(selection, ["policy", str(policy_path)])
+        self.assertEqual("PASS", rust_dispatch.invocation_status(policy))
+        self.assertIsNotNone(policy.report)
+        assert policy.report is not None
+        python_policy = validate_policy.build_receipt(policy_path)
+        self.assertEqual(python_policy["valid"], policy.report["valid"])
+        self.assertEqual(
+            [item["code"] for item in python_policy["findings"]],
+            [item["code"] for item in policy.report["findings"]],
+        )
+
+        okf = rust_dispatch.invoke(
+            selection,
+            ["okf", str(PLUGIN_ROOT / "knowledge")],
+        )
+        self.assertEqual("PASS", rust_dispatch.invocation_status(okf))
+        self.assertIsNotNone(okf.report)
+        assert okf.report is not None
+        python_okf = validate_okf.validate_bundle(PLUGIN_ROOT / "knowledge")
+        self.assertEqual(
+            python_okf["okf_core"]["status"],
+            okf.report["okf_core"]["status"],
+        )
+        self.assertEqual(
+            python_okf["governor_profile"]["status"],
+            okf.report["governor_profile"]["status"],
+        )
+
+
+class RouterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.adapter = json.loads(
+            (PLUGIN_ROOT / "adapters/ask-matt-routes.json").read_text(encoding="utf-8")
+        )
+        self.source_lock = json.loads(
+            (PLUGIN_ROOT / "references/ask-matt.lock.json").read_text(encoding="utf-8")
+        )
+
+    def test_adapter_and_source_lock_are_identical(self) -> None:
+        self.assertEqual(self.source_lock["commit"], self.adapter["source"]["commit"])
+        self.assertEqual(self.source_lock["sha256"], self.adapter["source"]["sha256"])
+
+    def test_adapter_cannot_route_or_substitute(self) -> None:
+        authority = self.adapter["authority"]
+        self.assertFalse(authority["route_substitution"])
+        self.assertFalse(authority["implicit_ask_matt_invocation"])
+        self.assertEqual(
+            "ROUTE_DECISION_REQUIRED", self.adapter["missing_route_result"]
+        )
+        self.assertEqual(
+            "SETUP_REQUIRED",
+            self.adapter["preconditions"]["engineering_flow"]["missing_result"],
+        )
+
+    def test_route_ids_are_unique(self) -> None:
+        route_ids = [route["route_id"] for route in self.adapter["routes"]]
+        self.assertEqual(len(route_ids), len(set(route_ids)))
+
+    def test_main_flow_preserves_single_and_multi_session_branches(self) -> None:
+        main_routes = {
+            route["selection_receipt"]["multi_session"]: route["selected_flow"]
+            for route in self.adapter["routes"]
+            if route["route_id"].startswith("idea-to-ship-codebase-")
+        }
+        self.assertEqual(
+            {
+                False: ["grill-with-docs", "implement"],
+                True: [
+                    "grill-with-docs",
+                    "to-spec",
+                    "to-tickets",
+                    "implement",
+                ],
+            },
+            main_routes,
+        )
+
+    def test_adapter_covers_every_ask_matt_standalone_route(self) -> None:
+        selected = {
+            skill
+            for route in self.adapter["routes"]
+            for skill in route["selected_flow"]
+        }
+        expected = {
+            "code-review",
+            "codebase-design",
+            "compact",
+            "domain-modeling",
+            "grill-me",
+            "handoff",
+            "implement",
+            "prototype",
+            "research",
+            "setup-matt-pocock-skills",
+            "tdd",
+            "teach",
+            "writing-great-skills",
+        }
+        self.assertLessEqual(expected, selected)
+
+    def test_wayfinder_preserves_small_and_mapped_outcomes(self) -> None:
+        outcomes = {
+            route["selection_receipt"]["wayfinder_outcome"]: route["selected_flow"]
+            for route in self.adapter["routes"]
+            if route["route_id"].startswith("huge-foggy-effort-")
+        }
+        self.assertEqual(
+            {
+                "genuinely-small": ["wayfinder", "implement"],
+                "multi-session-map": [
+                    "wayfinder",
+                    "to-spec",
+                    "to-tickets",
+                    "implement",
+                ],
+            },
+            outcomes,
+        )
+
+    def test_installed_source_matches_when_present(self) -> None:
+        source = Path.home() / ".codex/skills/ask-matt/SKILL.md"
+        if not source.is_file():
+            self.skipTest("ask-matt is not installed")
+        actual = hashlib.sha256(source.read_bytes()).hexdigest()
+        self.assertEqual(self.source_lock["sha256"], actual)
+
+
+class BootstrapTests(unittest.TestCase):
+    def test_dry_run_does_not_write_and_reports_existing_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".git").mkdir()
+            plan, conflicts = bootstrap.build_plan(repo, "safe")
+            self.assertFalse(conflicts)
+            self.assertTrue(plan)
+            self.assertFalse((repo / ".agent-work-governor").exists())
+
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = bootstrap.main(["--repo", str(repo)])
+            self.assertEqual(0, result)
+            policy = repo / ".agent-work-governor/policy.toml"
+            self.assertFalse(policy.exists())
+            report = json.loads(output.getvalue())
+            self.assertEqual("DRY_RUN", report["status"])
+            self.assertEqual(0, report["mutation_count"])
+
+            policy.parent.mkdir()
+            policy.write_text("conflict = true\n", encoding="utf-8")
+            _, conflicts = bootstrap.build_plan(repo, "safe")
+            self.assertIn(
+                str(repo.resolve() / ".agent-work-governor/policy.toml"),
+                conflicts,
+            )
+
+    def test_symbolic_link_parent_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo = root / "repo"
+            outside = root / "outside"
+            repo.mkdir()
+            outside.mkdir()
+            (repo / ".git").mkdir()
+            (repo / ".github").symlink_to(outside, target_is_directory=True)
+            _, conflicts = bootstrap.build_plan(repo, "safe")
+        self.assertIn(
+            str(repo.resolve() / ".github/workflows/agent-work-governor.yml"),
+            conflicts,
+        )
+
+    def test_planned_bundle_is_portable_when_materialized_by_a_harness(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".git").mkdir()
+            plan, conflicts = bootstrap.build_plan(repo, "safe")
+            self.assertEqual([], conflicts)
+            for item in plan:
+                target = Path(item["target"])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(item["source"], target)
+
+            test_file = repo / ".agent-work-governor/tests/test_repo_bundle.py"
+            environment = dict(os.environ)
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+            process = subprocess.run(
+                [sys.executable, str(test_file)],
+                cwd=repo,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        self.assertEqual(0, process.returncode, process.stderr)
+
+
+class RepositoryGateTests(unittest.TestCase):
+    def git(self, repo: Path, *args: str) -> str:
+        process = subprocess.run(
+            ["git", "-c", "commit.gpgsign=false", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return process.stdout.strip()
+
+    def test_owner_gate_rejects_self_attestation_and_current_sha_drift(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            self.git(repo, "init", "-b", "main")
+            self.git(repo, "config", "user.name", "Contract Test")
+            self.git(repo, "config", "user.email", "contract@example.invalid")
+
+            gate = repo / ".agent-work-governor"
+            gate.mkdir()
+            shutil.copy2(
+                PLUGIN_ROOT / "assets/presets/owner-original.toml",
+                gate / "policy.toml",
+            )
+            shutil.copy2(
+                PLUGIN_ROOT / "scripts/validate_policy.py",
+                gate / "validate_policy.py",
+            )
+            shutil.copy2(
+                PLUGIN_ROOT / "scripts/contract_blocks.py",
+                gate / "contract_blocks.py",
+            )
+            shutil.copy2(
+                PLUGIN_ROOT / "assets/repository/.agent-work-governor/validate.py",
+                gate / "validate.py",
+            )
+            shutil.copy2(
+                PLUGIN_ROOT / "toolchain.lock.json",
+                gate / "toolchain.lock.json",
+            )
+            (repo / "AGENTS.md").write_text("# Agents\n", encoding="utf-8")
+            (repo / ".gitignore").write_text(".governance/\n", encoding="utf-8")
+            (repo / "flake.nix").write_text("{}\n", encoding="utf-8")
+            (repo / "flake.lock").write_text("{}\n", encoding="utf-8")
+            (repo / "existing.py").write_text(
+                "# LLM-CONTRACT\n"
+                "# id: fixture.module\n"
+                "# state: INPUT -> OUTPUT\n"
+                "# preconditions: input exists\n"
+                "# invariant: output remains bounded\n"
+                "# failure: raise a typed error\n"
+                "# source: repo:AGENTS.md\n"
+                "# knowledge: repo:AGENTS.md\n"
+                "# enforced_by: EXISTING\n"
+                "# test: repo:existing.py\n"
+                "EXISTING = 1\n",
+                encoding="utf-8",
+            )
+            self.git(repo, "add", ".")
+            self.git(repo, "commit", "-m", "baseline")
+            base = self.git(repo, "rev-parse", "HEAD")
+            self.git(repo, "update-ref", "refs/remotes/origin/main", base)
+
+            self.git(repo, "switch", "-c", "work/task-1")
+            (repo / "module.py").write_text(
+                "# LLM-CONTRACT\n"
+                "# id: fixture.module\n"
+                "# state: INPUT -> OUTPUT\n"
+                "# preconditions: input exists\n"
+                "# invariant: output is derived from input\n"
+                "# failure: raise a typed error\n"
+                "# source: repo:AGENTS.md\n"
+                "# knowledge: repo:AGENTS.md\n"
+                "# enforced_by: VALUE\n"
+                "# test: repo:tests/test_module.py\n"
+                "VALUE = 1\n",
+                encoding="utf-8",
+            )
+            test_path = repo / "tests/test_module.py"
+            test_path.parent.mkdir()
+            test_path.write_text(
+                "# LLM-CONTRACT\n"
+                "# id: fixture.test-module\n"
+                "# state: CASE -> PASS | FAIL\n"
+                "# preconditions: module is importable\n"
+                "# invariant: VALUE remains one\n"
+                "# failure: unittest reports the mismatch\n"
+                "# source: repo:AGENTS.md\n"
+                "# knowledge: repo:AGENTS.md\n"
+                "# enforced_by: test_value\n"
+                "# test: repo:tests/test_module.py\n"
+                "def test_value():\n"
+                "    assert True\n",
+                encoding="utf-8",
+            )
+            self.git(repo, "add", "module.py", "tests/test_module.py")
+            self.git(repo, "commit", "-m", "feat: add module")
+            reviewed = self.git(repo, "rev-parse", "HEAD")
+
+            receipt_path = repo / ".governance/receipts/pre-pr.json"
+            receipt_path.parent.mkdir(parents=True)
+            review_artifact = receipt_path.parent / "code-review.md"
+            review_artifact.write_text(
+                "# Two-axis review\n\nStandards: PASS\n\nSpec: PASS\n",
+                encoding="utf-8",
+            )
+            input_digest = hashlib.sha256(
+                json.dumps(
+                    {
+                        "head_sha": reviewed,
+                        "branch_base_sha": base,
+                        "task_id": "task-1",
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "receipt_id": "review-task-1",
+                        "session_id": "session-task-1",
+                        "action_kind": "code-review",
+                        "input_digest": input_digest,
+                        "output_digest": hashlib.sha256(
+                            review_artifact.read_bytes()
+                        ).hexdigest(),
+                        "policy_bundle_digest": hashlib.sha256(
+                            (gate / "policy.toml").read_bytes()
+                        ).hexdigest(),
+                        "capability_lease_digest": None,
+                        "change_intent_digest": None,
+                        "environment_digest": "2" * 64,
+                        "actor": "code-review/1",
+                        "trace_span_ids": ["standards", "spec"],
+                        "replay_ref": f"git:{base}...{reviewed}",
+                        "attester": {
+                            "id": "two-axis-review",
+                            "source_digest": (
+                                "6a65cc61114f96db07ec41e3920e67c9"
+                                "c5bf70dd6e0901eb9460ebcb2bdc209f"
+                            ),
+                        },
+                        "started_at": "2026-07-28T00:00:00Z",
+                        "finished_at": "2026-07-28T00:01:00Z",
+                        "verdict": "PASS",
+                        "reason_code": "TWO_AXIS_REVIEW_PASSED",
+                        "head_sha": reviewed,
+                        "branch_base_sha": base,
+                        "task_id": "task-1",
+                        "one_task": True,
+                        "review_artifact": ".governance/receipts/code-review.md",
+                        "primary_sources": ["https://example.invalid/primary"],
+                        "code_review": {
+                            "skill": "code-review",
+                            "artifact_sha": reviewed,
+                            "standards": "PASS",
+                            "spec": "PASS",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            current = reviewed
+
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "GITHUB_BASE_REF": "main",
+                    "GITHUB_HEAD_REF": "work/task-1",
+                    "GOVERNOR_HEAD_SHA": current,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                }
+            )
+            process = subprocess.run(
+                [sys.executable, str(gate / "validate.py")],
+                cwd=repo,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, process.returncode)
+            codes = {item["code"] for item in json.loads(process.stdout)["errors"]}
+            self.assertIn("CODE_REVIEW_ATTESTATION_UNTRUSTED", codes)
+            self.assertIn("LLM_CONTRACT_AST_ATTESTATION_REQUIRED", codes)
+            self.assertIn("LLM_CONTRACT_ID_DUPLICATE", codes)
+
+            (repo / "module.py").write_text(
+                (repo / "module.py").read_text(encoding="utf-8") + "VALUE_2 = 2\n",
+                encoding="utf-8",
+            )
+            self.git(repo, "add", "module.py")
+            self.git(repo, "commit", "-m", "feat: drift after review")
+            environment["GOVERNOR_HEAD_SHA"] = self.git(repo, "rev-parse", "HEAD")
+            process = subprocess.run(
+                [sys.executable, str(gate / "validate.py")],
+                cwd=repo,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(1, process.returncode)
+            codes = {item["code"] for item in json.loads(process.stdout)["errors"]}
+            self.assertIn("REVIEW_SHA_MISMATCH", codes)
+
+
+class SourceHygieneTests(unittest.TestCase):
+    @staticmethod
+    def governed_source_files() -> list[Path]:
+        ignored_parts = {"__pycache__", ".direnv", ".venv", "target"}
+        return sorted(
+            path
+            for path in PLUGIN_ROOT.rglob("*")
+            if path.is_file()
+            and path.suffix in {".nix", ".py", ".rs", ".toml", ".yaml", ".yml"}
+            and ignored_parts.isdisjoint(path.parts)
+        )
+
+    def test_source_files_have_llm_contracts(self) -> None:
+        source_files = self.governed_source_files()
+        self.assertTrue(source_files)
+        missing = [
+            str(path.relative_to(PLUGIN_ROOT))
+            for path in source_files
+            if not contract_blocks.has_valid_contract(path.read_text(encoding="utf-8"))
+        ]
+        self.assertEqual([], missing)
+
+    def test_source_contract_references_self_host(self) -> None:
+        identifiers: dict[str, str] = {}
+        errors: list[str] = []
+        for path in self.governed_source_files():
+            source = path.read_text(encoding="utf-8")
+            for contract in contract_blocks.parsed_contracts(source):
+                identifier = contract["id"]
+                if identifier in identifiers:
+                    errors.append(
+                        f"duplicate {identifier}: {identifiers[identifier]} and {path}"
+                    )
+                identifiers[identifier] = str(path)
+                for field in ("source", "knowledge", "test"):
+                    _, error = contract_blocks.resolve_contract_reference(
+                        contract[field],
+                        repo_root=PLUGIN_ROOT,
+                        bundle_root=PLUGIN_ROOT,
+                        allow_external=field == "source",
+                    )
+                    if error is not None:
+                        errors.append(f"{path}:{field}:{contract[field]}: {error}")
+                if not contract_blocks.enforcement_token_is_present(
+                    source,
+                    contract["enforced_by"],
+                ):
+                    errors.append(
+                        f"{path}: enforcement token missing: {contract['enforced_by']}"
+                    )
+        self.assertEqual([], errors)
+
+    def test_no_todo_placeholders_remain(self) -> None:
+        offenders: list[str] = []
+        placeholder = "[TODO" + ":"
+        for path in sorted(PLUGIN_ROOT.rglob("*")):
+            if not path.is_file() or "__pycache__" in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if placeholder in text:
+                offenders.append(str(path.relative_to(PLUGIN_ROOT)))
+        self.assertEqual([], offenders)
+
+    def test_toolchain_has_a_pinned_security_checker(self) -> None:
+        lock = json.loads(
+            (PLUGIN_ROOT / "toolchain.lock.json").read_text(encoding="utf-8")
+        )
+        security = lock["pip-audit"]
+        self.assertEqual("security", security["category"])
+        self.assertRegex(security["version"], r"^\d+\.\d+\.\d+$")
+        self.assertTrue(security["source"].startswith("https://"))
+        self.assertRegex(security["source_digest"], r"^git:[0-9a-f]{40}$")
+
+    def test_toolchain_locks_match_project_inputs_and_required_checks(self) -> None:
+        lock = json.loads(
+            (PLUGIN_ROOT / "toolchain.lock.json").read_text(encoding="utf-8")
+        )
+        active_lock = json.loads(
+            (PLUGIN_ROOT / ".agent-work-governor/toolchain.lock.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(lock, active_lock)
+
+        project = tomllib.loads(
+            (PLUGIN_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        )
+        development_pins = dict(
+            dependency.split("==", maxsplit=1)
+            for dependency in project["dependency-groups"]["dev"]
+        )
+        uv_document = tomllib.loads(
+            (PLUGIN_ROOT / "uv.lock").read_text(encoding="utf-8")
+        )
+        uv_versions = {
+            package["name"]: package["version"] for package in uv_document["package"]
+        }
+        for tool in ("ruff", "ty", "pip-audit"):
+            self.assertEqual(lock[tool]["version"], development_pins[tool])
+            self.assertEqual(lock[tool]["version"], uv_versions[tool])
+            self.assertRegex(lock[tool]["source_digest"], r"^git:[0-9a-f]{40}$")
+            self.assertIn(lock[tool]["version"], lock[tool]["source"])
+        self.assertEqual(
+            f">={lock['python']['minimum']}",
+            project["project"]["requires-python"],
+        )
+
+        rust_lock = json.loads(
+            (PLUGIN_ROOT / "rust/toolchain.lock.json").read_text(encoding="utf-8")
+        )
+        rust_toolchain = tomllib.loads(
+            (PLUGIN_ROOT / "rust/rust-toolchain.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            rust_lock["rust"]["version"],
+            rust_toolchain["toolchain"]["channel"],
+        )
+        rust_readme = (PLUGIN_ROOT / "rust/README.md").read_text(encoding="utf-8")
+        for tool in ("cargo-audit", "cargo-deny"):
+            self.assertIn(rust_lock[tool]["version"], rust_lock[tool]["source"])
+            self.assertIn(rust_lock[tool]["command"], rust_readme)
+
+        workflow = (PLUGIN_ROOT / ".github/workflows/governor.yml").read_text(
+            encoding="utf-8"
+        )
+        for evidence in (
+            "scripts/validate_canonical.py --fetch-missing",
+            "cargo audit --file rust/Cargo.lock",
+            "cargo deny --manifest-path rust/Cargo.toml",
+            "pip-audit --version",
+            "ruff --version",
+            "ty --version",
+        ):
+            self.assertIn(evidence, workflow)
+
+    def test_source_baseline_and_json_contract_sidecars_are_bound(self) -> None:
+        baseline = tomllib.loads(
+            (PLUGIN_ROOT / "SOURCE_BASELINE.toml").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            "27862b406fffa58ac92b395f83ca970d08ef76b7d2220f63876b1c7113b63926",
+            baseline["source_bundle_sha256"],
+        )
+        self.assertEqual(67, baseline["source_bundle_file_count"])
+        self.assertEqual(65, baseline["source_only_file_count"])
+        self.assertIn("bin/**", baseline["excluded_from_import"])
+        self.assertIn("rust/target/**", baseline["excluded_from_import"])
+        bindings = {}
+        for binding in baseline["schema_bound_json_contracts"]:
+            json_path, contract_path = binding.split("=", maxsplit=1)
+            bindings[json_path] = contract_path
+            self.assertTrue((PLUGIN_ROOT / json_path).is_file(), json_path)
+            self.assertTrue((PLUGIN_ROOT / contract_path).is_file(), contract_path)
+            self.assertIsNone(
+                contract_blocks.contract_diagnostic(
+                    (PLUGIN_ROOT / contract_path).read_text(encoding="utf-8")
+                ),
+                contract_path,
+            )
+            contract_source = (PLUGIN_ROOT / contract_path).read_text(encoding="utf-8")
+            for contract in contract_blocks.parsed_contracts(contract_source):
+                _, source_error = contract_blocks.resolve_contract_reference(
+                    contract["source"],
+                    repo_root=PLUGIN_ROOT,
+                    bundle_root=PLUGIN_ROOT,
+                    allow_external=True,
+                )
+                self.assertIsNone(source_error, contract_path)
+                for field in ("knowledge", "test"):
+                    _, reference_error = contract_blocks.resolve_contract_reference(
+                        contract[field],
+                        repo_root=PLUGIN_ROOT,
+                        bundle_root=PLUGIN_ROOT,
+                        allow_external=False,
+                    )
+                    self.assertIsNone(reference_error, contract_path)
+                self.assertTrue(
+                    contract_blocks.enforcement_token_is_present(
+                        contract_source,
+                        contract["enforced_by"],
+                    ),
+                    contract_path,
+                )
+        ignored_parts = {"bin", "target", ".governance", ".venv"}
+        governed_json = {
+            str(path.relative_to(PLUGIN_ROOT))
+            for path in PLUGIN_ROOT.rglob("*.json")
+            if ignored_parts.isdisjoint(path.parts)
+        }
+        self.assertEqual(governed_json, set(bindings))
+
+
+if __name__ == "__main__":
+    unittest.main()

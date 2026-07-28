@@ -1,0 +1,15 @@
+# LLM-CONTRACT
+# id: agent-work-governor.rust-toolchain
+# state: TOOLCHAIN_REQUESTED -> PINNED_COMPONENTS -> AVAILABLE | INSTALL_FAILURE
+# preconditions: the pinned Rust channel publishes clippy and rustfmt components
+# invariant: local and CI Rust commands resolve the same compiler release
+# failure: rustup or Nix reports an unavailable component
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: channel
+# test: bundle:rust/tests/interface.rs
+
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

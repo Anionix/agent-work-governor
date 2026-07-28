@@ -1,0 +1,45 @@
+# LLM-CONTRACT
+# id: agent-work-governor.safe-policy-template
+# state: UNKNOWN_SCOPE -> READ_ONLY_POLICY -> VALID | INVALID
+# preconditions: no trusted owner scope was selected
+# invariant: an unknown repository never gains write or external-effect authority
+# failure: canonical policy validation rejects any widened authority
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: repository_scope
+# test: bundle:tests/test_contracts.py
+
+schema_version = "0.1"
+policy_id = "repository-safe-default"
+repository_scope = "unknown"
+default_branch = "main"
+
+[authority]
+repository_write = false
+external_side_effects = false
+destructive_actions = false
+
+[budget]
+max_in_flight = 1
+max_delegation_depth = 1
+max_repair_rounds = 1
+
+[routing]
+authority = "ask-matt-or-explicit-user-selection"
+require_explicit_route = true
+allow_route_substitution = false
+implicit_ask_matt_invocation = false
+ask_matt_sha256 = "b1a134ada29cbfded84bc9a7f93356ab7a3d7f800edf1f541a2a964118ad45a7"
+
+[completion]
+require_terminal_evidence = true
+require_satisfied_postcondition = true
+require_current_artifact_review = true
+
+[knowledge]
+okf_version = "0.2"
+bundle = "plugin://agent-work-governor/knowledge"
+
+[receipts]
+directory = ".governance/receipts"
+include_in_okf_bundle = false

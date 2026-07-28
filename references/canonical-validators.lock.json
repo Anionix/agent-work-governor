@@ -1,0 +1,19 @@
+{
+  "schema_version": "0.1",
+  "plugin_validator": {
+    "path": ".codex/skills/.system/plugin-creator/scripts/validate_plugin.py",
+    "source_repository": "https://github.com/openai/codex",
+    "source_commit": "bb1af235ea2822d7a40f75ef52e4d6a2cde84da2",
+    "source_path": "codex-rs/skills/src/assets/samples/plugin-creator/scripts/validate_plugin.py",
+    "source_url": "https://raw.githubusercontent.com/openai/codex/bb1af235ea2822d7a40f75ef52e4d6a2cde84da2/codex-rs/skills/src/assets/samples/plugin-creator/scripts/validate_plugin.py",
+    "sha256": "ebda00d55d7518b127f675f062fb5c6e7a1ffdc0a99df1a55ac594400d7d3228"
+  },
+  "skill_validator": {
+    "path": ".codex/skills/.system/skill-creator/scripts/quick_validate.py",
+    "source_repository": "https://github.com/openai/codex",
+    "source_commit": "bb1af235ea2822d7a40f75ef52e4d6a2cde84da2",
+    "source_path": "codex-rs/skills/src/assets/samples/skill-creator/scripts/quick_validate.py",
+    "source_url": "https://raw.githubusercontent.com/openai/codex/bb1af235ea2822d7a40f75ef52e4d6a2cde84da2/codex-rs/skills/src/assets/samples/skill-creator/scripts/quick_validate.py",
+    "sha256": "6cc9dc3199c935916cf6f73fcbbbb0e3bb1b58c8f5109fefa499978908164f51"
+  }
+}

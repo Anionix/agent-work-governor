@@ -1,0 +1,36 @@
+# LLM-CONTRACT
+# id: agent-work-governor.python-toolchain
+# state: LOCKED_PROJECT -> SYNCED_DEV_ENV -> CHECKED_SOURCE | TOOL_FAILURE
+# preconditions: pyproject.toml and uv.lock are updated together
+# invariant: runtime dependencies remain empty and quality tools are exact-version inputs
+# failure: uv, ruff, ty, pip-audit, or canonical validation exits non-zero
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: dependency-groups
+# test: bundle:tests/test_contracts.py
+# Primary source: https://docs.astral.sh/uv/concepts/projects/dependencies/
+
+[project]
+name = "agent-work-governor"
+version = "0.1.0"
+description = "Python validation tools for the source-only Agent Work Governor baseline"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = [
+  "pip-audit==2.10.1",
+  "pyyaml==6.0.3",
+  "ruff==0.16.0",
+  "ty==0.0.64",
+]
+
+[tool.uv]
+package = false
+
+[tool.ty.environment]
+extra-paths = ["./scripts"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test bootstrap deliberately adds the source scripts directory before importing it.
+"tests/*.py" = ["E402"]

@@ -1,0 +1,15 @@
+# LLM-CONTRACT
+# id: agent-work-governor.runtime-skill-interface
+# state: SELECTED_ROUTE -> GOVERNED_PROMPT -> BOUNDED_RESULT | CLOSED_DENIAL
+# preconditions: a single explicit workflow route was selected
+# invariant: the interface asks for policy and evidence gates without rerouting
+# failure: the Governor returns a typed blocker without side effects
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: default_prompt
+# test: bundle:tests/test_contracts.py
+
+interface:
+  display_name: "Govern Agent Work"
+  short_description: "Enforce bounded policy around selected agent flows"
+  default_prompt: "Use $govern-agent-work to run this selected workflow under explicit policy and evidence gates."
