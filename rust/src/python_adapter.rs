@@ -11,7 +11,7 @@ use thiserror::Error;
 
 const RECIPE_BYTES: &str = include_str!("../../adapters/check-recipes.v1.json");
 const RECIPE_SCHEMA: &str = "0.2";
-const RECIPE_SHA256: &str = "cc26c033e2b563f82c4975e381fab699ee942259b3f85799047a4b6c6b9bce1a";
+const RECIPE_SHA256: &str = "35dd14bb851cc822d50327db3f5bb3ccb89b2e5f8a958d35f19d27166a302333";
 const TOOLCHAIN_BYTES: &str = include_str!("../../toolchain.lock.json");
 const TOOLCHAIN_SCHEMA: &str = "0.2";
 
@@ -304,7 +304,7 @@ mod tests {
         assert_eq!(7, checks.len());
         assert_eq!("0.2", encoded["catalog_version"]);
         assert_eq!(
-            "cc26c033e2b563f82c4975e381fab699ee942259b3f85799047a4b6c6b9bce1a",
+            "35dd14bb851cc822d50327db3f5bb3ccb89b2e5f8a958d35f19d27166a302333",
             encoded["catalog_sha256"]
         );
         assert_eq!(
@@ -413,6 +413,17 @@ mod tests {
                 "<python-audit-requirements>"
             ],
             export.argv.iter().map(atom).collect::<Vec<_>>().as_slice()
+        );
+        assert_eq!(
+            [
+                "python", "-B", "-m", "unittest", "discover", "-s", "tests", "-p", "test*.py"
+            ],
+            recipes[3]
+                .argv
+                .iter()
+                .map(atom)
+                .collect::<Vec<_>>()
+                .as_slice()
         );
         assert_eq!(180, recipes[0].timeout_seconds);
         Ok(())
