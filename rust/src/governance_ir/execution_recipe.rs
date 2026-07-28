@@ -2,6 +2,7 @@
 
 use super::{CheckKind, Language};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 // LLM-CONTRACT
@@ -40,6 +41,13 @@ impl RecipeArg {
             Ok(Self(RecipeArgValue::Artifact { artifact: value }))
         } else {
             Err(ExecutionRecipeError)
+        }
+    }
+
+    fn artifact_name(&self) -> Option<&str> {
+        match &self.0 {
+            RecipeArgValue::Literal(_) => None,
+            RecipeArgValue::Artifact { artifact } => Some(artifact),
         }
     }
 }
@@ -87,12 +95,29 @@ impl ExecutionRecipe {
         ]
         .iter()
         .all(|values| values.windows(2).all(|pair| pair[0] != pair[1]));
+        let declared_artifacts = draft
+            .input_artifacts
+            .iter()
+            .chain(&draft.output_artifacts)
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let argv_artifacts = draft
+            .argv
+            .iter()
+            .filter_map(RecipeArg::artifact_name)
+            .collect::<BTreeSet<_>>();
+        let directions_are_disjoint = draft
+            .input_artifacts
+            .iter()
+            .all(|artifact| draft.output_artifacts.binary_search(artifact).is_err());
         if draft.argv.is_empty()
             || draft.timeout_seconds == 0
             || !portable_token(&draft.identifier)
             || !portable_token(&draft.tool_identity)
             || !metadata.into_iter().all(|value| portable_token(value))
             || !unique
+            || !directions_are_disjoint
+            || argv_artifacts != declared_artifacts
         {
             return Err(ExecutionRecipeError);
         }
@@ -182,6 +207,21 @@ mod tests {
             tool_identity: "tool".into(),
         };
         assert!(ExecutionRecipe::resolve(draft).is_err());
+        let undeclared_artifact = ExecutionRecipeDraft {
+            argv: vec![
+                RecipeArg::literal("tool".into())?,
+                RecipeArg::artifact("artifact".into())?,
+            ],
+            dependencies: Vec::new(),
+            identifier: "check.valid".into(),
+            input_artifacts: Vec::new(),
+            kind: CheckKind::Test,
+            language: Language::Rust,
+            output_artifacts: Vec::new(),
+            timeout_seconds: 1,
+            tool_identity: "tool".into(),
+        };
+        assert!(ExecutionRecipe::resolve(undeclared_artifact).is_err());
         Ok(())
     }
 }

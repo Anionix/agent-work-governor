@@ -5,7 +5,7 @@ use super::{
     execution_recipe::{ExecutionRecipe, RecipeArg},
 };
 use serde::Serialize;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 const PLAN_SCHEMA_VERSION: &str = "0.1";
@@ -107,10 +107,89 @@ fn closed_recipes() -> Result<Vec<ExecutionRecipe>, PlanError> {
         .windows(2)
         .any(|pair| pair[0].identifier() == pair[1].identifier())
     {
-        Err(PlanError::CATALOG_INVALID)
-    } else {
-        Ok(recipes)
+        return Err(PlanError::CATALOG_INVALID);
     }
+    validate_recipe_graph(&recipes)?;
+    Ok(recipes)
+}
+
+// LLM-CONTRACT
+// id: agent-work-governor.closed-artifact-graph
+// state: TYPED_EXECUTION_RECIPES -> CLOSED_ARTIFACT_GRAPH | PLAN_CATALOG_INVALID
+// preconditions: recipe identifiers, dependencies, and artifact directions are explicit
+// invariant: every input has one producer reachable through an acyclic dependency graph
+// failure: graph validation rejects the whole catalog without returning a partial plan
+// source: repo:adapters/check-recipes.v1.LLM-CONTRACT.md
+// knowledge: bundle:knowledge/policies/work-governor.md
+// enforced_by: validate_recipe_graph
+// test: bundle:rust/src/governance_ir/execution_plan.rs
+fn validate_recipe_graph(recipes: &[ExecutionRecipe]) -> Result<(), PlanError> {
+    let by_id = recipes
+        .iter()
+        .map(|recipe| (recipe.identifier(), recipe))
+        .collect::<BTreeMap<_, _>>();
+    let mut emitted = BTreeSet::new();
+    while emitted.len() < recipes.len() {
+        let Some(recipe) = recipes.iter().find(|recipe| {
+            !emitted.contains(recipe.identifier())
+                && recipe
+                    .dependencies()
+                    .iter()
+                    .all(|dependency| emitted.contains(dependency.as_str()))
+        }) else {
+            return Err(PlanError::CATALOG_INVALID);
+        };
+        emitted.insert(recipe.identifier());
+    }
+
+    let mut producers = BTreeMap::new();
+    for recipe in recipes {
+        for artifact in recipe.output_artifacts() {
+            if producers
+                .insert(artifact.as_str(), recipe.identifier())
+                .is_some()
+            {
+                return Err(PlanError::CATALOG_INVALID);
+            }
+        }
+    }
+    for recipe in recipes {
+        for artifact in recipe.input_artifacts() {
+            let producer = producers
+                .get(artifact.as_str())
+                .ok_or(PlanError::CATALOG_INVALID)?;
+            if !dependency_reaches(recipe, producer, &by_id) {
+                return Err(PlanError::CATALOG_INVALID);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn dependency_reaches<'a>(
+    consumer: &'a ExecutionRecipe,
+    producer: &str,
+    by_id: &BTreeMap<&'a str, &'a ExecutionRecipe>,
+) -> bool {
+    let mut pending = consumer
+        .dependencies()
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    while let Some(dependency) = pending.pop() {
+        if dependency == producer {
+            return true;
+        }
+        if !visited.insert(dependency) {
+            continue;
+        }
+        let Some(recipe) = by_id.get(dependency) else {
+            return false;
+        };
+        pending.extend(recipe.dependencies().iter().map(String::as_str));
+    }
+    false
 }
 
 fn bind<'a>(
@@ -185,6 +264,7 @@ struct PlanTool<'a> {
 #[cfg(test)]
 mod tests {
     use super::super::CheckDraft;
+    use super::super::execution_recipe::ExecutionRecipeDraft;
     use super::*;
     use std::error::Error as StdError;
 
@@ -247,6 +327,43 @@ mod tests {
         assert_eq!(expected, result.err().map_or("planned", PlanError::code));
     }
 
+    fn recipe(
+        identifier: &str,
+        dependencies: &[&str],
+        input_artifacts: &[&str],
+        output_artifacts: &[&str],
+    ) -> Result<ExecutionRecipe, Box<dyn StdError>> {
+        let argv = std::iter::once(RecipeArg::literal("tool".into())?)
+            .chain(
+                input_artifacts
+                    .iter()
+                    .chain(output_artifacts)
+                    .map(|artifact| RecipeArg::artifact((*artifact).into()))
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .collect();
+        Ok(ExecutionRecipe::resolve(ExecutionRecipeDraft {
+            argv,
+            dependencies: dependencies
+                .iter()
+                .map(|dependency| (*dependency).into())
+                .collect(),
+            identifier: identifier.into(),
+            input_artifacts: input_artifacts
+                .iter()
+                .map(|artifact| (*artifact).into())
+                .collect(),
+            kind: CheckKind::Test,
+            language: Language::Rust,
+            output_artifacts: output_artifacts
+                .iter()
+                .map(|artifact| (*artifact).into())
+                .collect(),
+            timeout_seconds: 1,
+            tool_identity: "tool".into(),
+        })?)
+    }
+
     #[test]
     fn mixed_golden_is_canonical_and_digest_bound() -> Result<(), Box<dyn StdError>> {
         let plan = PlanEmitter::emit(&GovernanceIr::resolve(fixtures())?)?;
@@ -275,6 +392,57 @@ mod tests {
         assert_eq!(
             expected,
             PlanEmitter::emit(&GovernanceIr::resolve(reversed)?)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_graph_requires_one_reachable_producer() -> Result<(), Box<dyn StdError>> {
+        let producer = recipe("check.producer", &[], &[], &["artifact"])?;
+        let intermediary = recipe("check.intermediary", &["check.producer"], &[], &[])?;
+        let consumer = recipe(
+            "check.consumer",
+            &["check.intermediary"],
+            &["artifact"],
+            &[],
+        )?;
+        assert_eq!(
+            Ok(()),
+            validate_recipe_graph(&[consumer.clone(), intermediary, producer.clone()])
+        );
+
+        let missing = recipe("check.missing", &[], &["missing"], &[])?;
+        assert_eq!(
+            Err(PlanError::CATALOG_INVALID),
+            validate_recipe_graph(&[missing])
+        );
+
+        let unreachable = recipe("check.unreachable", &[], &["artifact"], &[])?;
+        assert_eq!(
+            Err(PlanError::CATALOG_INVALID),
+            validate_recipe_graph(&[producer.clone(), unreachable])
+        );
+
+        let duplicate = recipe("check.duplicate", &[], &[], &["artifact"])?;
+        assert_eq!(
+            Err(PlanError::CATALOG_INVALID),
+            validate_recipe_graph(&[producer, duplicate])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_graph_rejects_unknown_or_cyclic_dependencies() -> Result<(), Box<dyn StdError>> {
+        let unknown = recipe("check.unknown", &["check.missing"], &[], &[])?;
+        assert_eq!(
+            Err(PlanError::CATALOG_INVALID),
+            validate_recipe_graph(&[unknown])
+        );
+        let left = recipe("check.left", &["check.right"], &[], &[])?;
+        let right = recipe("check.right", &["check.left"], &[], &[])?;
+        assert_eq!(
+            Err(PlanError::CATALOG_INVALID),
+            validate_recipe_graph(&[left, right])
         );
         Ok(())
     }
