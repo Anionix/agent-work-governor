@@ -3,7 +3,9 @@
 use std::fs;
 use std::process::Command;
 
-use agent_work_governor::{CheckReport, CheckRequest, Governor, PlanAction, Preset, Status};
+use agent_work_governor::{
+    CheckReport, CheckRequest, Governor, PlanAction, PlanBindings, PlanProject, Preset, Status,
+};
 use tempfile::tempdir;
 
 // LLM-CONTRACT
@@ -349,5 +351,198 @@ fn bootstrap_rejects_a_regular_file_repository() -> Result<(), Box<dyn std::erro
     };
     assert!(error.to_string().contains("path is not a directory"));
     assert_eq!("not a repository\n", fs::read_to_string(repository)?);
+    Ok(())
+}
+
+const REPOSITORY_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+const REVISION_SHA256: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const POLICY_SHA256: &str = "3333333333333333333333333333333333333333333333333333333333333333";
+const TOOLCHAIN_SHA256: &str = "f123483a002951bec0907eb883c67ecdf3987561630947165f5ae30c3b34467a";
+const ENVIRONMENT_SHA256: &str = "5555555555555555555555555555555555555555555555555555555555555555";
+
+fn plan_bindings(values: [&str; 5]) -> PlanBindings {
+    PlanBindings::new(values[0], values[1], values[2], values[3], values[4])
+}
+
+fn valid_plan_bindings() -> PlanBindings {
+    plan_bindings([
+        REPOSITORY_SHA256,
+        REVISION_SHA256,
+        POLICY_SHA256,
+        TOOLCHAIN_SHA256,
+        ENVIRONMENT_SHA256,
+    ])
+}
+
+fn assert_plan_cli_matches_library(
+    project: PlanProject,
+    project_arguments: &[&str],
+) -> Result<String, Box<dyn std::error::Error>> {
+    let report = Governor.check(CheckRequest::plan(valid_plan_bindings(), project))?;
+    let succeeded = report.succeeded();
+    let encoded = serde_json::to_string_pretty(&report)?;
+    let temporary = tempdir()?;
+    let sentinel = temporary.path().join("sentinel");
+    fs::write(&sentinel, "unchanged\n")?;
+    let output = Command::new(env!("CARGO_BIN_EXE_agent-work-governor"))
+        .args([
+            "plan",
+            "--repository-sha256",
+            REPOSITORY_SHA256,
+            "--revision-sha256",
+            REVISION_SHA256,
+            "--policy-sha256",
+            POLICY_SHA256,
+            "--toolchain-sha256",
+            TOOLCHAIN_SHA256,
+            "--environment-sha256",
+            ENVIRONMENT_SHA256,
+        ])
+        .args(project_arguments)
+        .current_dir(temporary.path())
+        .output()?;
+    assert_eq!(succeeded, output.status.success());
+    assert_eq!(format!("{encoded}\n").as_bytes(), output.stdout);
+    assert!(output.stderr.is_empty());
+    assert_eq!("unchanged\n", fs::read_to_string(sentinel)?);
+    assert_eq!(1, fs::read_dir(temporary.path())?.count());
+    Ok(encoded)
+}
+
+#[test]
+fn plan_library_and_cli_match_the_golden_report() -> Result<(), Box<dyn std::error::Error>> {
+    let encoded = assert_plan_cli_matches_library(
+        PlanProject::RustCargoWorkspace {
+            working_directory: ".".into(),
+        },
+        &["rust-cargo-workspace", "--working-directory", "."],
+    )?;
+    let expected = include_str!("fixtures/rust-plan-report.json").trim_end();
+    assert_eq!(expected, encoded);
+    assert!(!encoded.contains("\"authority\""));
+    assert!(!encoded.contains("\"receipt\""));
+    assert!(!encoded.contains("\"verdict\""));
+    Ok(())
+}
+
+#[test]
+fn every_profile_and_rejection_match_the_cli() -> Result<(), Box<dyn std::error::Error>> {
+    let python = assert_plan_cli_matches_library(
+        PlanProject::PythonUvUnittest {
+            working_directory: ".".into(),
+        },
+        &["python-uv-unittest", "--working-directory", "."],
+    )?;
+    assert_eq!(
+        7,
+        serde_json::from_str::<serde_json::Value>(&python)?["execution_plan"]["checks"]
+            .as_array()
+            .map_or(0, Vec::len)
+    );
+    let mixed = assert_plan_cli_matches_library(
+        PlanProject::MixedUvCargo {
+            python_working_directory: "python".into(),
+            rust_working_directory: "rust".into(),
+        },
+        &[
+            "mixed-uv-cargo",
+            "--python-working-directory",
+            "python",
+            "--rust-working-directory",
+            "rust",
+        ],
+    )?;
+    assert_eq!(
+        12,
+        serde_json::from_str::<serde_json::Value>(&mixed)?["execution_plan"]["checks"]
+            .as_array()
+            .map_or(0, Vec::len)
+    );
+    let rejected = assert_plan_cli_matches_library(
+        PlanProject::RustCargoWorkspace {
+            working_directory: "../rust".into(),
+        },
+        &["rust-cargo-workspace", "--working-directory", "../rust"],
+    )?;
+    assert_eq!(
+        include_str!("fixtures/rejected-plan-report.json").trim_end(),
+        rejected
+    );
+    Ok(())
+}
+
+#[test]
+fn malformed_bindings_and_toolchain_drift_fail_without_a_plan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let valid = [
+        REPOSITORY_SHA256,
+        REVISION_SHA256,
+        POLICY_SHA256,
+        TOOLCHAIN_SHA256,
+        ENVIRONMENT_SHA256,
+    ];
+    for index in 0..valid.len() {
+        let mut values = valid;
+        values[index] = "ABC";
+        let report = Governor.check(CheckRequest::plan(
+            plan_bindings(values),
+            PlanProject::PythonUvUnittest {
+                working_directory: ".".into(),
+            },
+        ))?;
+        let CheckReport::Plan(report) = report else {
+            return Err("unexpected report variant".into());
+        };
+        assert_eq!(Status::Fail, report.status());
+        assert_eq!(0, report.mutation_count());
+        assert!(report.execution_plan().is_none());
+        assert_eq!("PLAN_INPUT_DIGEST_INVALID", report.findings()[0].code);
+    }
+
+    let report = Governor.check(CheckRequest::plan(
+        plan_bindings([
+            REPOSITORY_SHA256,
+            REVISION_SHA256,
+            POLICY_SHA256,
+            ENVIRONMENT_SHA256,
+            ENVIRONMENT_SHA256,
+        ]),
+        PlanProject::PythonUvUnittest {
+            working_directory: ".".into(),
+        },
+    ))?;
+    let CheckReport::Plan(report) = report else {
+        return Err("unexpected report variant".into());
+    };
+    assert_eq!("PLAN_TOOLCHAIN_DIGEST_MISMATCH", report.findings()[0].code);
+    assert!(report.execution_plan().is_none());
+    Ok(())
+}
+
+#[test]
+fn mixed_plan_is_deterministic_and_unsafe_facts_fail_closed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let request = || {
+        CheckRequest::plan(
+            valid_plan_bindings(),
+            PlanProject::MixedUvCargo {
+                python_working_directory: "python".into(),
+                rust_working_directory: "rust".into(),
+            },
+        )
+    };
+    let first = Governor.check(request())?;
+    let second = Governor.check(request())?;
+    assert_eq!(serde_json::to_vec(&first)?, serde_json::to_vec(&second)?,);
+    let encoded = serde_json::to_value(first)?;
+    assert_eq!(
+        12,
+        encoded["execution_plan"]["checks"]
+            .as_array()
+            .map_or(0, Vec::len)
+    );
+    assert_eq!(0, encoded["mutation_count"]);
+    assert_eq!("PLANNED", encoded["status"]);
+
     Ok(())
 }

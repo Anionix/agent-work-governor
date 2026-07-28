@@ -4,7 +4,7 @@ use super::{
     CheckId, CheckKind, Dependency, GovernanceIr, Language, ResolvedCheck,
     execution_recipe::{ExecutionRecipe, RecipeArg},
 };
-use serde::Serialize;
+use serde::{Serialize, Serializer, ser::Error as _};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
@@ -21,19 +21,35 @@ const PLAN_SCHEMA_VERSION: &str = "0.1";
 // enforced_by: emit
 // test: bundle:rust/src/governance_ir/execution_plan.rs
 
+/// Opaque canonical plan with exact JSON bytes and their SHA-256 digest.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct CanonicalExecutionPlan {
+pub struct CanonicalExecutionPlan {
     canonical_json: Vec<u8>,
     sha256: String,
 }
 
 impl CanonicalExecutionPlan {
-    pub(crate) fn canonical_json(&self) -> &[u8] {
+    /// Exact canonical JSON bytes covered by [`Self::sha256`].
+    #[must_use]
+    pub fn canonical_json(&self) -> &[u8] {
         &self.canonical_json
     }
 
-    pub(crate) fn sha256(&self) -> &str {
+    /// Lowercase SHA-256 digest of [`Self::canonical_json`].
+    #[must_use]
+    pub fn sha256(&self) -> &str {
         &self.sha256
+    }
+}
+
+impl Serialize for CanonicalExecutionPlan {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serde_json::from_slice::<serde_json::Value>(&self.canonical_json)
+            .map_err(S::Error::custom)?
+            .serialize(serializer)
     }
 }
 
@@ -51,6 +67,10 @@ impl PlanError {
 
     pub(crate) const fn code(self) -> &'static str {
         self.0
+    }
+
+    pub(crate) fn is_encoding_failed(self) -> bool {
+        self.0 == Self::ENCODING_FAILED.0
     }
 }
 

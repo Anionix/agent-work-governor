@@ -1,9 +1,4 @@
 //! Typed, language-neutral governance intermediate representation.
-#![allow(
-    dead_code,
-    reason = "Issues #2, #4, #5, and #6 build the private plan pipeline before Issue #7 exposes it"
-)]
-
 use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
@@ -114,10 +109,18 @@ impl Error for GovernanceIrError {}
 
 impl GovernanceIr {
     pub(crate) fn resolve(drafts: Vec<CheckDraft>) -> Result<Self, GovernanceIrError> {
-        let mut checks = drafts
+        let checks = drafts
             .into_iter()
             .map(ResolvedCheck::resolve)
             .collect::<Result<Vec<_>, _>>()?;
+        Self::from_checks(checks)
+    }
+
+    pub(crate) fn merge(parts: Vec<Self>) -> Result<Self, GovernanceIrError> {
+        Self::from_checks(parts.into_iter().flat_map(|part| part.checks).collect())
+    }
+
+    fn from_checks(mut checks: Vec<ResolvedCheck>) -> Result<Self, GovernanceIrError> {
         checks.sort_by(|left, right| left.identifier.cmp(&right.identifier));
         if checks
             .windows(2)

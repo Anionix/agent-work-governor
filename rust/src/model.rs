@@ -53,6 +53,13 @@ pub enum CheckRequest {
         /// Installed or source plugin root.
         plugin_root: PathBuf,
     },
+    /// Produce one digest-bound execution plan from confirmed project facts.
+    Plan {
+        /// Repository and governed-environment bindings.
+        bindings: crate::planning::PlanBindings,
+        /// Closed caller-confirmed project profile.
+        project: crate::planning::PlanProject,
+    },
 }
 
 /// Supported bootstrap policy presets.
@@ -78,6 +85,8 @@ pub enum Status {
     DryRun,
     /// A dry-run plan found an existing target conflict.
     Conflict,
+    /// A canonical execution plan was produced without granting PASS authority.
+    Planned,
 }
 
 /// A deterministic finding emitted by a check.
@@ -138,6 +147,8 @@ pub enum CheckReport {
     Bootstrap(crate::bootstrap::BootstrapReport),
     /// Common repository report.
     Repository(RepositoryReport),
+    /// Digest-bound execution plan report.
+    Plan(crate::planning::PlanReport),
 }
 
 impl CheckReport {
@@ -153,6 +164,7 @@ impl CheckReport {
             }
             Self::Bootstrap(report) => report.status == Status::DryRun,
             Self::Repository(report) => report.status == Status::Pass,
+            Self::Plan(report) => report.status() == Status::Planned,
         }
     }
 }

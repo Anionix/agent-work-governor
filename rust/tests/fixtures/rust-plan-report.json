@@ -1,0 +1,140 @@
+{
+  "bindings": {
+    "environment_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "policy_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "repository_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "revision_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "toolchain_sha256": "f123483a002951bec0907eb883c67ecdf3987561630947165f5ae30c3b34467a"
+  },
+  "execution_plan": {
+    "checks": [
+      {
+        "argv": [
+          "cargo",
+          "audit",
+          "--no-fetch",
+          "--deny",
+          "warnings",
+          "--file",
+          "Cargo.lock"
+        ],
+        "dependencies": [],
+        "identifier": "rust.cargo-audit",
+        "input_artifacts": [],
+        "kind": "security",
+        "language": "rust",
+        "output_artifacts": [],
+        "path": ".",
+        "timeout_seconds": 180,
+        "tool": {
+          "identity": "cargo-audit",
+          "version": "0.22.2"
+        }
+      },
+      {
+        "argv": [
+          "cargo",
+          "deny",
+          "--manifest-path",
+          "Cargo.toml",
+          "--config",
+          "deny.toml",
+          "--workspace",
+          "--locked",
+          "--offline",
+          "--all-features",
+          "check",
+          "advisories",
+          "bans",
+          "licenses",
+          "sources"
+        ],
+        "dependencies": [],
+        "identifier": "rust.cargo-deny",
+        "input_artifacts": [],
+        "kind": "security",
+        "language": "rust",
+        "output_artifacts": [],
+        "path": ".",
+        "timeout_seconds": 300,
+        "tool": {
+          "identity": "cargo-deny",
+          "version": "0.20.2"
+        }
+      },
+      {
+        "argv": [
+          "cargo",
+          "clippy",
+          "--workspace",
+          "--all-targets",
+          "--all-features",
+          "--locked",
+          "--offline",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "dependencies": [],
+        "identifier": "rust.clippy",
+        "input_artifacts": [],
+        "kind": "lint",
+        "language": "rust",
+        "output_artifacts": [],
+        "path": ".",
+        "timeout_seconds": 300,
+        "tool": {
+          "identity": "clippy",
+          "version": "0.1.97"
+        }
+      },
+      {
+        "argv": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--check"
+        ],
+        "dependencies": [],
+        "identifier": "rust.rustfmt",
+        "input_artifacts": [],
+        "kind": "format",
+        "language": "rust",
+        "output_artifacts": [],
+        "path": ".",
+        "timeout_seconds": 60,
+        "tool": {
+          "identity": "rustfmt",
+          "version": "1.9.0"
+        }
+      },
+      {
+        "argv": [
+          "cargo",
+          "test",
+          "--workspace",
+          "--all-features",
+          "--locked",
+          "--offline"
+        ],
+        "dependencies": [],
+        "identifier": "rust.tests",
+        "input_artifacts": [],
+        "kind": "test",
+        "language": "rust",
+        "output_artifacts": [],
+        "path": ".",
+        "timeout_seconds": 600,
+        "tool": {
+          "identity": "cargo",
+          "version": "1.97.1"
+        }
+      }
+    ],
+    "schema_version": "0.1"
+  },
+  "execution_plan_sha256": "9b0da67149618af42ce095d758797102e0582a8263c2595c455c71b9a3e1f05e",
+  "findings": [],
+  "mutation_count": 0,
+  "status": "PLANNED"
+}

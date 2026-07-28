@@ -6,6 +6,7 @@ mod contract;
 mod governance_ir;
 mod model;
 mod okf;
+mod planning;
 mod policy;
 mod python_adapter;
 mod reference;
@@ -14,8 +15,10 @@ mod rust_adapter;
 use std::path::{Path, PathBuf};
 
 pub use bootstrap::PlanAction;
+pub use governance_ir::execution_plan::CanonicalExecutionPlan;
 pub use model::{CheckReport, CheckRequest, Finding, Preset, RepositoryReport, Status};
 pub use okf::OkfStatus;
+pub use planning::{PlanBindings, PlanProject, PlanReport};
 use thiserror::Error;
 
 /// Static Governor Module with one public checking Interface.
@@ -37,6 +40,12 @@ pub enum GovernorError {
     /// A report could not be encoded.
     #[error("failed to encode report: {0}")]
     Encode(#[from] serde_json::Error),
+    /// The canonical plan encoder violated its internal contract.
+    #[error("failed to encode execution plan: {code}")]
+    PlanEncoding {
+        /// Stable internal reason code.
+        code: &'static str,
+    },
 }
 
 impl Governor {
@@ -76,6 +85,9 @@ impl Governor {
             CheckRequest::Repository { repo, plugin_root } => Ok(CheckReport::Repository(
                 check_repository(&repo, &plugin_root)?,
             )),
+            CheckRequest::Plan { bindings, project } => {
+                Ok(CheckReport::Plan(planning::build_plan(bindings, project)?))
+            }
         }
     }
 }
@@ -145,9 +157,9 @@ fn check_repository(repo: &Path, plugin_root: &Path) -> Result<RepositoryReport,
 
 // LLM-CONTRACT
 // id: agent-work-governor.rust-static-interface
-// state: REQUEST -> PURE_CHECKS -> REPORT | INFRASTRUCTURE_FAULT
+// state: REQUEST -> PURE_CHECKS -> REPORT | PLANNED | INFRASTRUCTURE_FAULT
 // preconditions: paths are explicit and external attestations are not caller supplied
-// invariant: check never mutates a repository and unknown trust cannot become PASS
+// invariant: check never mutates a repository and planning cannot grant PASS authority
 // failure: return typed infrastructure faults or fail-closed findings
 // source: bundle:knowledge/policies/work-governor.md
 // knowledge: bundle:knowledge/policies/work-governor.md

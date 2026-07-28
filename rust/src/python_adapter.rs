@@ -1,9 +1,4 @@
 //! Pure mapping from resolved Python project facts to typed governed checks.
-#![allow(
-    dead_code,
-    reason = "Issue #4 defines the private adapter before Issue #7 exposes planning"
-)]
-
 use crate::{
     adapter_catalog::{closed_id, sha256_hex, tool_version},
     governance_ir::{
@@ -34,12 +29,20 @@ const TOOLCHAIN_BYTES: &str = include_str!("../../toolchain.lock.json");
 pub(crate) enum RepositoryKind {
     PythonOnly,
     Mixed,
+    #[allow(
+        dead_code,
+        reason = "stable unsupported-profile rejection is unit tested"
+    )]
     Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PythonLayout {
     UvUnittest,
+    #[allow(
+        dead_code,
+        reason = "stable unsupported-layout rejection is unit tested"
+    )]
     Unsupported,
 }
 
@@ -123,6 +126,12 @@ pub(crate) struct PythonCheckSet {
     catalog_sha256: String,
     toolchain_sha256: String,
     governance_ir: GovernanceIr,
+}
+
+impl PythonCheckSet {
+    pub(crate) fn into_plan_inputs(self) -> (GovernanceIr, String) {
+        (self.governance_ir, self.toolchain_sha256)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
