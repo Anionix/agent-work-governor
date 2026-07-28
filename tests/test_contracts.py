@@ -107,14 +107,18 @@ def run_nix_bootstrap_fixture(
     source_mismatch: bool = False,
     action_mismatch: bool = False,
     preinstalled_nix: bool = False,
+    repository_template: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run the real pre-Nix workflow script with isolated fake transport."""
 
     expected_installer = b"verified nix installer\n"
     downloaded_installer = downloaded_installer or expected_installer
-    workflow = (PLUGIN_ROOT / ".github/workflows/governor.yml").read_text(
-        encoding="utf-8"
+    workflow_source = PLUGIN_ROOT / (
+        "assets/repository/.github/workflows/agent-work-governor.yml"
+        if repository_template
+        else ".github/workflows/governor.yml"
     )
+    workflow = workflow_source.read_text(encoding="utf-8")
     catalog = json.loads(
         (PLUGIN_ROOT / "toolchain.lock.json").read_text(encoding="utf-8")
     )
@@ -132,13 +136,29 @@ def run_nix_bootstrap_fixture(
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
-        workflow_path = root / ".github/workflows/governor.yml"
+        workflow_relative = Path(
+            ".github/workflows/agent-work-governor.yml"
+            if repository_template
+            else ".github/workflows/governor.yml"
+        )
+        query_relative = Path(
+            ".agent-work-governor/toolchain_catalog.py"
+            if repository_template
+            else "scripts/toolchain_catalog.py"
+        )
+        catalog_relative = Path(
+            ".agent-work-governor/toolchain.lock.json"
+            if repository_template
+            else "toolchain.lock.json"
+        )
+        workflow_path = root / workflow_relative
         workflow_path.parent.mkdir(parents=True)
         workflow_path.write_text(workflow, encoding="utf-8")
-        scripts = root / "scripts"
-        scripts.mkdir()
-        shutil.copy2(PLUGIN_ROOT / "scripts/toolchain_catalog.py", scripts)
-        (root / "toolchain.lock.json").write_text(
+        query_path = root / query_relative
+        query_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(PLUGIN_ROOT / "scripts/toolchain_catalog.py", query_path)
+        catalog_path = root / catalog_relative
+        catalog_path.write_text(
             json.dumps(catalog),
             encoding="utf-8",
         )
@@ -170,7 +190,14 @@ def run_nix_bootstrap_fixture(
             fake_nix = fake_bin / "nix"
             fake_nix.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             fake_nix.chmod(0o755)
-        step = workflow_run_block(workflow, "Validate unified toolchain catalog")
+        step = workflow_run_block(
+            workflow,
+            (
+                "Validate Nix bootstrap identity"
+                if repository_template
+                else "Validate unified toolchain catalog"
+            ),
+        )
         bash = shutil.which("bash")
         if bash is None:
             raise unittest.SkipTest("bash is unavailable")
@@ -1223,6 +1250,45 @@ class SourceHygieneTests(unittest.TestCase):
                 self.assertNotEqual(0, rejected.returncode)
                 self.assertIn(evidence, rejected.stdout + rejected.stderr)
 
+    def test_repository_template_rejects_nix_bootstrap_mutations(self) -> None:
+        accepted = run_nix_bootstrap_fixture(repository_template=True)
+        self.assertEqual(0, accepted.returncode, accepted.stderr)
+
+        cases = (
+            (
+                run_nix_bootstrap_fixture(
+                    downloaded_installer=b"tampered installer\n",
+                    repository_template=True,
+                ),
+                "FAILED",
+            ),
+            (
+                run_nix_bootstrap_fixture(
+                    source_mismatch=True,
+                    repository_template=True,
+                ),
+                "TOOLCHAIN_NIX_SOURCE_MISMATCH",
+            ),
+            (
+                run_nix_bootstrap_fixture(
+                    action_mismatch=True,
+                    repository_template=True,
+                ),
+                "TOOLCHAIN_ACTION_IDENTITY_MISMATCH",
+            ),
+            (
+                run_nix_bootstrap_fixture(
+                    preinstalled_nix=True,
+                    repository_template=True,
+                ),
+                "TOOLCHAIN_NIX_PREINSTALLED",
+            ),
+        )
+        for rejected, evidence in cases:
+            with self.subTest(evidence=evidence):
+                self.assertNotEqual(0, rejected.returncode)
+                self.assertIn(evidence, rejected.stdout + rejected.stderr)
+
     def test_unified_toolchain_matches_project_and_environment_inputs(self) -> None:
         catalog_path = PLUGIN_ROOT / "toolchain.lock.json"
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
@@ -1273,6 +1339,13 @@ class SourceHygieneTests(unittest.TestCase):
             pins["rust"]["version"],
             rust_toolchain["toolchain"]["channel"],
         )
+        self.assertEqual(pins["rust"]["version"], pins["cargo"]["version"])
+        for component in ("clippy", "rustfmt"):
+            self.assertEqual(pins["rust"]["source"], pins[component]["source"])
+            self.assertEqual(
+                pins["rust"]["source_digest"],
+                pins[component]["source_digest"],
+            )
 
         flake_lock = json.loads(
             (PLUGIN_ROOT / "flake.lock").read_text(encoding="utf-8")
@@ -1336,6 +1409,9 @@ class SourceHygieneTests(unittest.TestCase):
             "bindNixPackage",
             "pkgs.autoPatchelfHook",
             "pkgs.pythonManylinuxPackages.manylinux2014",
+            "clippyPin.source == rustPin.source",
+            "rustfmtPin.source == rustPin.source",
+            "TOOLCHAIN_RUST_COMPONENT_SELF_TEST_FAILED",
             "TOOLCHAIN_PACKAGE_SOURCE_URL_MISMATCH",
             "TOOLCHAIN_PACKAGE_SOURCE_DIGEST_MISMATCH",
         ):

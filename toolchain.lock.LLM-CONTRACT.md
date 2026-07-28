@@ -1,8 +1,8 @@
 # LLM-CONTRACT
 # id: agent-work-governor.repository-toolchain-lock
-# state: TOOL_REQUIREMENTS -> UNIQUE_TYPED_PINS -> VALIDATED_CATALOG | LOCK_REJECTED
+# state: TOOL_REQUIREMENTS -> UNIQUE_TYPED_CONSISTENT_PINS -> VALIDATED_CATALOG | LOCK_REJECTED
 # preconditions: the schema version and complete required-ID set are explicit
-# invariant: duplicate, unsupported, range-versioned, or mutable pins never validate
+# invariant: duplicate, unsupported, floating, or contradictory component pins never validate
 # failure: catalog validation emits sorted stable findings and returns non-zero
 # source: repo:toolchain.lock.json
 # knowledge: repo:knowledge/policies/work-governor.md

@@ -112,6 +112,20 @@
           entry = pin toolId;
         in
         if entry.language == language then entry else fail "TOOLCHAIN_LANGUAGE_MISMATCH" toolId;
+      validateRustComponents =
+        rustPin: cargoPin: clippyPin: rustfmtPin:
+        # LLM contract: individually valid component pins -> one consistent Rust release or failure.
+        # Source: https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/src/tools/build-manifest/src/main.rs
+        if
+          cargoPin.version == rustPin.version
+          && clippyPin.source == rustPin.source
+          && clippyPin.source_digest == rustPin.source_digest
+          && rustfmtPin.source == rustPin.source
+          && rustfmtPin.source_digest == rustPin.source_digest
+        then
+          true
+        else
+          fail "TOOLCHAIN_RUST_COMPONENT_MISMATCH" "";
       gitCommit =
         language: toolId:
         let
@@ -291,15 +305,24 @@
           cargoPin = pinFor "rust" "cargo";
           clippyPin = pinFor "rust" "clippy";
           rustfmtPin = pinFor "rust" "rustfmt";
-          rustComponentsValid =
+          rustComponentSelfTest =
+            let
+              rejects =
+                cargoCandidate: clippyCandidate: rustfmtCandidate:
+                !(builtins.tryEval (validateRustComponents rustPin cargoCandidate clippyCandidate rustfmtCandidate))
+                .success;
+            in
             if
-              cargoPin.version == rustPin.version
-              && clippyPin.source_digest == rustPin.source_digest
-              && rustfmtPin.source_digest == rustPin.source_digest
+              rejects (cargoPin // { version = "0.0.0"; }) clippyPin rustfmtPin
+              && rejects cargoPin (clippyPin // { source = "https://example.invalid/clippy"; }) rustfmtPin
+              && rejects cargoPin clippyPin (rustfmtPin // { source = "https://example.invalid/rustfmt"; })
             then
               true
             else
-              fail "TOOLCHAIN_RUST_COMPONENT_MISMATCH" "";
+              fail "TOOLCHAIN_RUST_COMPONENT_SELF_TEST_FAILED" "";
+          rustComponentsValid = builtins.seq rustComponentSelfTest (
+            validateRustComponents rustPin cargoPin clippyPin rustfmtPin
+          );
           rustRelease =
             if builtins.hasAttr rustPin.version pkgs.rust-bin.stable then
               pkgs.rust-bin.stable.${rustPin.version}

@@ -296,13 +296,24 @@ class PortableBundleTests(unittest.TestCase):
         workflow = repository_workflow_path().read_text(encoding="utf-8")
 
         self.assertLess(
+            workflow.index("Validate Nix bootstrap identity"),
+            workflow.index("uses: cachix/install-nix-action@"),
+        )
+        self.assertLess(
             workflow.index("uses: cachix/install-nix-action@"),
             workflow.index("python .agent-work-governor/validate.py"),
         )
-        self.assertIn(
+        for evidence in (
+            "--tool-source nix",
+            "--tool-source cachix/install-nix-action",
+            "TOOLCHAIN_ACTION_IDENTITY_MISMATCH",
+            "TOOLCHAIN_NIX_PREINSTALLED",
+            "sha256sum --check --strict",
+            "install_url: file://${{ runner.temp }}/nix-install",
+            "TOOLCHAIN_VERSION_MISMATCH::nix",
             "nix develop --no-update-lock-file --no-write-lock-file --command",
-            workflow,
-        )
+        ):
+            self.assertIn(evidence, workflow)
         self.assertNotIn("run: python3 .agent-work-governor/validate.py", workflow)
 
     def test_catalog_accepts_valid_python_rust_and_artifacts(self) -> None:
