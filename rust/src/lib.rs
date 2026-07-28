@@ -2,6 +2,7 @@
 
 mod bootstrap;
 mod contract;
+mod governance_ir;
 mod model;
 mod okf;
 mod policy;
