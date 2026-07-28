@@ -6,6 +6,7 @@ mod governance_ir;
 mod model;
 mod okf;
 mod policy;
+mod python_adapter;
 mod reference;
 
 use std::path::{Path, PathBuf};

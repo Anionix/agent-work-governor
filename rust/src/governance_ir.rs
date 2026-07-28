@@ -4,7 +4,7 @@
     reason = "Issue #2 defines the private IR before the adapters in Issues #4 and #5 consume it"
 )]
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{error::Error, fmt};
 
 // LLM-CONTRACT
@@ -20,14 +20,14 @@ use std::{error::Error, fmt};
 
 const SCHEMA_VERSION: &str = "0.1";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Language {
     Python,
     Rust,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CheckKind {
     Dependency,
