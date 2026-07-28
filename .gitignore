@@ -1,0 +1,23 @@
+# LLM contract: generated or runtime state -> ignored; source evidence -> tracked.
+.DS_Store
+.direnv/
+.devenv/
+result
+result-*
+target/
+rust/target/
+bin/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+.governance/
+**/.governance/
+run-receipt*.json
+*.receipt.json
+.cache/
+node_modules/
