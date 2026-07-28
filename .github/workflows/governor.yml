@@ -44,6 +44,53 @@ jobs:
           fetch-depth: 0
           ref: ${{ env.EXPECTED_HEAD_SHA }}
 
+      - name: Validate unified toolchain catalog
+        shell: bash
+        run: |
+          # LLM contract: catalog bytes -> VALIDATED_UNIFIED_LOCK or stable rejection.
+          # Primary source: https://github.com/Anionix/agent-work-governor/issues/3
+          set -euo pipefail
+          python3 scripts/toolchain_catalog.py toolchain.lock.json
+          nix_version="$(
+            python3 scripts/toolchain_catalog.py toolchain.lock.json --tool-version nix
+          )"
+          if [[ "$nix_version" != "2.34.7" ]]; then
+            echo "::error title=TOOLCHAIN_NIX_INSTALLER_PIN_MISMATCH::expected=2.34.7 actual=$nix_version"
+            exit 1
+          fi
+          if command -v nix >/dev/null 2>&1; then
+            echo "::error title=TOOLCHAIN_NIX_PREINSTALLED::refusing an installer bypass"
+            exit 1
+          fi
+          IFS=$'\t' read -r nix_source nix_digest < <(
+            python3 scripts/toolchain_catalog.py toolchain.lock.json --tool-source nix
+          )
+          IFS=$'\t' read -r _ action_digest < <(
+            python3 scripts/toolchain_catalog.py toolchain.lock.json \
+              --tool-source cachix/install-nix-action
+          )
+          mapfile -t action_pins < <(
+            sed -nE \
+              's|^[[:space:]]*uses:[[:space:]]+cachix/install-nix-action@([0-9a-f]{40})([[:space:]]*(#.*)?)$|\1|p' \
+              .github/workflows/governor.yml
+          )
+          if [[ "${#action_pins[@]}" -ne 1 ||
+            "git:${action_pins[0]:-}" != "$action_digest" ]]; then
+            echo "::error title=TOOLCHAIN_ACTION_IDENTITY_MISMATCH::cachix/install-nix-action"
+            exit 1
+          fi
+          expected_source="https://releases.nixos.org/nix/nix-${nix_version}/install"
+          if [[ "$nix_source" != "$expected_source" ]]; then
+            echo "::error title=TOOLCHAIN_NIX_SOURCE_MISMATCH::expected=$expected_source actual=$nix_source"
+            exit 1
+          fi
+          nix_digest="${nix_digest#sha256:}"
+          nix_installer="$RUNNER_TEMP/nix-install"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output "$nix_installer" "$nix_source"
+          printf '%s  %s\n' "$nix_digest" "$nix_installer" |
+            sha256sum --check --strict
+
       # LLM contract: pinned flake -> Nix environment or job failure.
       # Source: https://github.com/cachix/install-nix-action/releases/tag/v31.11.0
       - name: Install Nix
@@ -51,6 +98,24 @@ jobs:
         with:
           enable_kvm: false
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          # The preceding step verifies the catalog-bound installer bytes.
+          install_url: file://${{ runner.temp }}/nix-install
+
+      - name: Assert installed Nix identity
+        shell: bash
+        run: |
+          # LLM contract: installed executable -> EXACT_NIX or job failure.
+          set -euo pipefail
+          expected="$(
+            nix develop --no-update-lock-file --no-write-lock-file --command \
+              python scripts/toolchain_catalog.py toolchain.lock.json \
+              --tool-version nix
+          )"
+          actual="$(nix --version)"
+          if [[ "$actual" != "nix (Nix) $expected" ]]; then
+            echo "::error title=TOOLCHAIN_VERSION_MISMATCH::nix expected=$expected actual=$actual"
+            exit 1
+          fi
 
       - name: Validate repository contract
         shell: bash
@@ -85,15 +150,35 @@ jobs:
       - name: Check locked Rust dependency policy
         shell: bash
         run: |
-          # LLM contract: Cargo.lock + deny.toml -> PINNED_AUDITS -> PASS or non-zero exit.
+          # LLM contract: unified catalog + Cargo.lock -> EXACT_RUST_CHECKS -> PASS or failure.
           set -euo pipefail
-          lock_version() {
-            python3 -c 'import json,sys; print(json.load(open("rust/toolchain.lock.json"))[sys.argv[1]]["version"])' "$1"
+          locked_version() {
+            nix develop --no-update-lock-file --no-write-lock-file --command \
+              python scripts/toolchain_catalog.py \
+                toolchain.lock.json --tool-version "$1"
           }
+          assert_version() {
+            local tool="$1"
+            local actual="$2"
+            local expected
+            expected="$(locked_version "$tool")"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error title=TOOLCHAIN_VERSION_MISMATCH::$tool expected=$expected actual=$actual"
+              exit 1
+            fi
+          }
+          rust_version="$(nix develop --no-update-lock-file --no-write-lock-file --command rustc --version | awk '{print $2}')"
+          cargo_version="$(nix develop --no-update-lock-file --no-write-lock-file --command cargo --version | awk '{print $2}')"
+          clippy_version="$(nix develop --no-update-lock-file --no-write-lock-file --command cargo-clippy --version | awk '{print $2}')"
+          rustfmt_version="$(nix develop --no-update-lock-file --no-write-lock-file --command rustfmt --version | awk '{split($2, parts, "-"); print parts[1]}')"
           audit_version="$(nix develop --no-update-lock-file --no-write-lock-file --command cargo audit --version | awk '{print $NF}')"
           deny_version="$(nix develop --no-update-lock-file --no-write-lock-file --command cargo deny --version | awk '{print $NF}')"
-          test "$audit_version" = "$(lock_version cargo-audit)"
-          test "$deny_version" = "$(lock_version cargo-deny)"
+          assert_version rust "$rust_version"
+          assert_version cargo "$cargo_version"
+          assert_version clippy "$clippy_version"
+          assert_version rustfmt "$rustfmt_version"
+          assert_version cargo-audit "$audit_version"
+          assert_version cargo-deny "$deny_version"
           nix develop --no-update-lock-file --no-write-lock-file --command \
             cargo audit --file rust/Cargo.lock
           nix develop --no-update-lock-file --no-write-lock-file --command \
@@ -110,23 +195,38 @@ jobs:
         run: |
           # LLM contract: toolchain.lock + uv.lock -> EXACT_CHECKS -> PASS or non-zero exit.
           set -euo pipefail
-          uv_version="$(python3 -c 'import json; print(json.load(open("toolchain.lock.json"))["uv"]["version"])')"
-          nix develop --no-update-lock-file --no-write-lock-file --command \
-            uvx --from "uv==$uv_version" uv sync --frozen
-          lock_version() {
-            python3 -c 'import json,sys; print(json.load(open("toolchain.lock.json"))[sys.argv[1]]["version"])' "$1"
+          run_locked() {
+            nix develop --no-update-lock-file --no-write-lock-file --command "$@"
           }
-          test "$(.venv/bin/ruff --version | awk '{print $2}')" = "$(lock_version ruff)"
-          test "$(.venv/bin/ty --version | awk '{print $2}')" = "$(lock_version ty)"
-          test "$(.venv/bin/pip-audit --version | awk '{print $2}')" = "$(lock_version pip-audit)"
-          .venv/bin/ruff format --check .
-          .venv/bin/ruff check .
-          .venv/bin/ty check
-          PYTHONDONTWRITEBYTECODE=1 .venv/bin/python -m unittest discover -s tests
-          .venv/bin/python scripts/validate_canonical.py --fetch-missing .
-          nix develop --no-update-lock-file --no-write-lock-file --command \
-            uvx --from "uv==$uv_version" uv export --quiet --locked \
+          locked_version() {
+            run_locked python scripts/toolchain_catalog.py \
+              toolchain.lock.json --tool-version "$1"
+          }
+          assert_version() {
+            local tool="$1"
+            local actual="$2"
+            local expected
+            expected="$(locked_version "$tool")"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "::error title=TOOLCHAIN_VERSION_MISMATCH::$tool expected=$expected actual=$actual"
+              exit 1
+            fi
+          }
+          run_locked python scripts/toolchain_catalog.py toolchain.lock.json
+          assert_version uv "$(run_locked uv --version | awk '{print $2}')"
+          assert_version python "$(run_locked python --version | awk '{print $2}')"
+          assert_version ruff "$(run_locked ruff --version | awk '{print $2}')"
+          assert_version ty "$(run_locked ty --version | awk '{print $2}')"
+          assert_version pip-audit \
+            "$(run_locked pip-audit --version | awk '{print $2}')"
+          run_locked uv lock --check
+          run_locked ruff format --check .
+          run_locked ruff check .
+          run_locked ty check
+          run_locked python -B -m unittest discover -s tests
+          run_locked python scripts/validate_canonical.py --fetch-missing .
+          run_locked uv export --quiet --locked \
             --format requirements.txt \
             --output-file "$AUDIT_REQUIREMENTS"
-          .venv/bin/pip-audit --cache-dir "$PIP_AUDIT_CACHE" --disable-pip \
+          run_locked pip-audit --cache-dir "$PIP_AUDIT_CACHE" --disable-pip \
             --require-hashes --requirement "$AUDIT_REQUIREMENTS"

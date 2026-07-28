@@ -51,6 +51,10 @@ def build_plan(repo: Path, preset: str) -> tuple[list[PlanItem], list[str]]:
                 Path(".agent-work-governor/contract_blocks.py"),
             ),
             (
+                plugin_root / "scripts" / "toolchain_catalog.py",
+                Path(".agent-work-governor/toolchain_catalog.py"),
+            ),
+            (
                 plugin_root / "toolchain.lock.json",
                 Path(".agent-work-governor/toolchain.lock.json"),
             ),

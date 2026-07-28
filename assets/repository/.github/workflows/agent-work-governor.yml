@@ -2,8 +2,8 @@ name: Agent Work Governor
 
 # LLM-CONTRACT
 # id: agent-work-governor.repository-workflow-template
-# state: CHANGE -> POLICY_CHECKED -> REPRODUCIBLE_CHECKS | JOB_FAILURE
-# preconditions: repository bootstrap materialized the pinned policy helpers
+# state: CHANGE -> PINNED_RUNTIME -> POLICY_CHECKED -> REPRODUCIBLE_CHECKS | JOB_FAILURE
+# preconditions: repository bootstrap materialized the pinned policy and Nix helpers
 # invariant: policy or Nix failure never produces a successful workflow
 # failure: GitHub Actions reports the failing validation step
 # source: bundle:knowledge/policies/work-governor.md
@@ -28,12 +28,73 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      - name: Validate Nix bootstrap identity
+        shell: bash
+        run: |
+          # LLM contract: catalog + workflow -> VERIFIED_INSTALLER | JOB_FAILURE.
+          # Source: https://github.com/cachix/install-nix-action/blob/630ae543ea3a38a9a4166f03376c02c50f408342/install-nix.sh
+          set -euo pipefail
+          catalog=".agent-work-governor/toolchain.lock.json"
+          query=".agent-work-governor/toolchain_catalog.py"
+          workflow=".github/workflows/agent-work-governor.yml"
+          python3 "$query" "$catalog"
+          if command -v nix >/dev/null 2>&1; then
+            echo "::error title=TOOLCHAIN_NIX_PREINSTALLED::refusing an installer bypass"
+            exit 1
+          fi
+          nix_version="$(python3 "$query" "$catalog" --tool-version nix)"
+          IFS=$'\t' read -r nix_source nix_digest < <(
+            python3 "$query" "$catalog" --tool-source nix
+          )
+          IFS=$'\t' read -r _ action_digest < <(
+            python3 "$query" "$catalog" --tool-source cachix/install-nix-action
+          )
+          mapfile -t action_pins < <(
+            sed -nE \
+              's|^[[:space:]]*uses:[[:space:]]+cachix/install-nix-action@([0-9a-f]{40})([[:space:]]*(#.*)?)$|\1|p' \
+              "$workflow"
+          )
+          if [[ "${#action_pins[@]}" -ne 1 ||
+            "git:${action_pins[0]:-}" != "$action_digest" ]]; then
+            echo "::error title=TOOLCHAIN_ACTION_IDENTITY_MISMATCH::cachix/install-nix-action"
+            exit 1
+          fi
+          expected_source="https://releases.nixos.org/nix/nix-${nix_version}/install"
+          if [[ "$nix_source" != "$expected_source" ]]; then
+            echo "::error title=TOOLCHAIN_NIX_SOURCE_MISMATCH::expected=$expected_source actual=$nix_source"
+            exit 1
+          fi
+          nix_installer="$RUNNER_TEMP/nix-install"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output "$nix_installer" "$nix_source"
+          printf '%s  %s\n' "${nix_digest#sha256:}" "$nix_installer" |
+            sha256sum --check --strict
+      - name: Install pinned Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          enable_kvm: false
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          install_url: file://${{ runner.temp }}/nix-install
+      - name: Assert installed Nix identity
+        shell: bash
+        run: |
+          # LLM contract: installed executable -> EXACT_NIX | JOB_FAILURE.
+          set -euo pipefail
+          expected="$(
+            python3 .agent-work-governor/toolchain_catalog.py \
+              .agent-work-governor/toolchain.lock.json --tool-version nix
+          )"
+          actual="$(nix --version)"
+          if [[ "$actual" != "nix (Nix) $expected" ]]; then
+            echo "::error title=TOOLCHAIN_VERSION_MISMATCH::nix expected=$expected actual=$actual"
+            exit 1
+          fi
       - name: Validate repository governance
         env:
           PYTHONDONTWRITEBYTECODE: "1"
           GOVERNOR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 .agent-work-governor/validate.py
-      - name: Install pinned Nix
-        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        run: >-
+          nix develop --no-update-lock-file --no-write-lock-file --command
+          python .agent-work-governor/validate.py
       - name: Run reproducible repository checks
         run: nix flake check --no-update-lock-file --no-write-lock-file
