@@ -273,6 +273,14 @@
                 name = wheelName;
                 inherit (artifact) url sha256;
               };
+              # LLM contract: manylinux wheel -> Nix-native ELF or build failure.
+              # Primary source: pinned nixpkgs python/manylinux/default.nix.
+              nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+                pkgs.autoPatchelfHook
+              ];
+              buildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+                pkgs.pythonManylinuxPackages.manylinux2014
+              );
               doCheck = false;
             }
           );

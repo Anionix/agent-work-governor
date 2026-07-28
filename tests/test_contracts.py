@@ -1334,6 +1334,8 @@ class SourceHygieneTests(unittest.TestCase):
         flake = (PLUGIN_ROOT / "flake.nix").read_text(encoding="utf-8")
         for evidence in (
             "bindNixPackage",
+            "pkgs.autoPatchelfHook",
+            "pkgs.pythonManylinuxPackages.manylinux2014",
             "TOOLCHAIN_PACKAGE_SOURCE_URL_MISMATCH",
             "TOOLCHAIN_PACKAGE_SOURCE_DIGEST_MISMATCH",
         ):
