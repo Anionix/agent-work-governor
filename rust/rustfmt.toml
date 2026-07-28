@@ -1,0 +1,16 @@
+# LLM-CONTRACT
+# id: agent-work-governor.rustfmt-policy
+# state: RUST_SOURCE -> CANONICAL_FORMAT -> CLEAN | FORMAT_FAILURE
+# preconditions: rustfmt is supplied by the pinned Rust toolchain
+# invariant: formatting uses the declared edition and stable repository style
+# failure: cargo fmt --check exits non-zero
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: edition
+# test: bundle:rust/tests/interface.rs
+
+edition = "2024"
+max_width = 100
+newline_style = "Unix"
+use_field_init_shorthand = true
+use_small_heuristics = "Default"

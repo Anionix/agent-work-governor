@@ -1,0 +1,12 @@
+# LLM-CONTRACT
+# id: agent-work-governor.clippy-policy
+# state: RUST_SOURCE -> MSRV_AWARE_LINT -> CLEAN | LINT_FAILURE
+# preconditions: Cargo.toml declares a compatible minimum Rust version
+# invariant: lint evaluation uses the repository MSRV boundary
+# failure: Clippy exits non-zero on a denied diagnostic
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: msrv
+# test: bundle:rust/tests/interface.rs
+
+msrv = "1.93"

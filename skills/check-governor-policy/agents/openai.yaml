@@ -1,0 +1,15 @@
+# LLM-CONTRACT
+# id: agent-work-governor.policy-skill-interface
+# state: USER_REQUEST -> POLICY_AUDIT_PROMPT -> READ_ONLY_REPORT | TOOL_FAILURE
+# preconditions: the check-governor-policy Skill is installed
+# invariant: the default prompt never requests repository mutation
+# failure: the Skill returns a bounded diagnostic instead of applying changes
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: default_prompt
+# test: bundle:tests/test_contracts.py
+
+interface:
+  display_name: "Check Governor Policy"
+  short_description: "Audit repository policy without modifying files"
+  default_prompt: "Use $check-governor-policy to audit this repository policy and report any gaps without changing files."

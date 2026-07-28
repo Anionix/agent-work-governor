@@ -1,0 +1,22 @@
+{
+  "name": "agent-work-governor",
+  "version": "0.1.0+codex.20260728103622",
+  "description": "Bounded policy, context, and evidence gates for explicitly selected agent workflows.",
+  "author": {
+    "name": "Agent Work Governor contributors"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Agent Work Governor",
+    "shortDescription": "Govern selected agent workflows with bounded policy.",
+    "longDescription": "Applies explicit authority, budget, context, and terminal-evidence gates without replacing the user's workflow router or implementation skills.",
+    "developerName": "Agent Work Governor contributors",
+    "category": "Productivity",
+    "capabilities": [
+      "Policy validation",
+      "Read-only diagnostics",
+      "Workflow governance"
+    ],
+    "defaultPrompt": "Govern this explicitly selected workflow and require terminal evidence."
+  }
+}

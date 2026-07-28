@@ -1,0 +1,53 @@
+{
+  "schema_version": "0.1",
+  "locked_at": "2026-07-28",
+  "python": {
+    "minimum": "3.11",
+    "stdlib_only_runtime": true
+  },
+  "uv": {
+    "version": "0.11.33",
+    "source": "https://github.com/astral-sh/uv/releases/tag/0.11.33",
+    "source_digest": "git:fece32fc54b0e6fb6a031d3c80397cc4afb25737",
+    "purpose": "dependency and environment locking",
+    "command": "uv sync --frozen",
+    "update_checked_at": "2026-07-28"
+  },
+  "ruff": {
+    "version": "0.16.0",
+    "source": "https://github.com/astral-sh/ruff/releases/tag/0.16.0",
+    "source_digest": "git:a2635fd8f39e1d34ce8074cb486809426148f3e9",
+    "purpose": "Python formatting and linting",
+    "command": "ruff format --check . && ruff check .",
+    "update_checked_at": "2026-07-28"
+  },
+  "ty": {
+    "version": "0.0.64",
+    "source": "https://github.com/astral-sh/ty/releases/tag/0.0.64",
+    "source_digest": "git:5e64a131b436a4e1f40e6317c526f4fc73fab38b",
+    "purpose": "Python static type checking",
+    "command": "ty check",
+    "update_checked_at": "2026-07-28"
+  },
+  "pip-audit": {
+    "version": "2.10.1",
+    "source": "https://pypi.org/project/pip-audit/2.10.1/",
+    "source_digest": "git:8894eb8cee033531a1fbd9f2fb160892531c14e3",
+    "purpose": "known-vulnerability dependency audit",
+    "command": "uv export --locked --format requirements.txt --output-file /tmp/agent-work-governor-requirements.txt && pip-audit --disable-pip --require-hashes --requirement /tmp/agent-work-governor-requirements.txt",
+    "category": "security",
+    "update_checked_at": "2026-07-28"
+  },
+  "github_actions": {
+    "actions/checkout": {
+      "version": "v7.0.1",
+      "commit": "3d3c42e5aac5ba805825da76410c181273ba90b1",
+      "source": "https://github.com/actions/checkout/releases/tag/v7.0.1"
+    },
+    "cachix/install-nix-action": {
+      "version": "v31.11.0",
+      "commit": "630ae543ea3a38a9a4166f03376c02c50f408342",
+      "source": "https://github.com/cachix/install-nix-action/releases/tag/v31.11.0"
+    }
+  }
+}

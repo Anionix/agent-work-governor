@@ -1,4 +1,14 @@
-# LLM contract: issue entry -> TEMPLATE or PRIVATE_REPORT; blank entry -> rejected.
+# LLM-CONTRACT
+# id: agent-work-governor.issue-entry-policy
+# state: ISSUE_ENTRY -> TEMPLATE_OR_PRIVATE_CHANNEL -> ACCEPTED | REJECTED
+# preconditions: GitHub Issues and private security advisories are enabled
+# invariant: blank public issues stay disabled and security reports use a private channel
+# failure: GitHub rejects an unsupported issue entry path
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: blank_issues_enabled
+# test: bundle:tests/test_contracts.py
+
 blank_issues_enabled: false
 contact_links:
   - name: Private security report

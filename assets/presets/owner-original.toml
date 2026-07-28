@@ -1,0 +1,67 @@
+# LLM-CONTRACT
+# id: agent-work-governor.owner-policy-preset
+# state: OWNER_SCOPE_SELECTED -> POLICY_MATERIALIZED -> VALID | INVALID
+# preconditions: bootstrap received an explicit owner-original preset selection
+# invariant: the preset cannot grant destructive authority
+# failure: canonical policy validation rejects the materialized policy
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: repository_scope
+# test: bundle:tests/test_contracts.py
+
+schema_version = "0.1"
+policy_id = "owner-original-default"
+repository_scope = "owner_original"
+default_branch = "main"
+
+[authority]
+repository_write = true
+external_side_effects = true
+destructive_actions = false
+
+[budget]
+max_in_flight = 2
+max_delegation_depth = 1
+max_repair_rounds = 1
+
+[routing]
+authority = "ask-matt-or-explicit-user-selection"
+require_explicit_route = true
+allow_route_substitution = false
+implicit_ask_matt_invocation = false
+ask_matt_sha256 = "b1a134ada29cbfded84bc9a7f93356ab7a3d7f800edf1f541a2a964118ad45a7"
+
+[completion]
+require_terminal_evidence = true
+require_satisfied_postcondition = true
+require_current_artifact_review = true
+
+[knowledge]
+okf_version = "0.2"
+bundle = "plugin://agent-work-governor/knowledge"
+
+[receipts]
+directory = ".governance/receipts"
+include_in_okf_bundle = false
+
+[github]
+branch_base = "origin/main"
+one_pr_one_task = true
+product_diff_soft_target = 200
+require_review_closeout = true
+require_bug_issue_for_merged_finding = true
+
+[quality]
+require_llm_contract = true
+require_primary_sources = true
+require_code_review_skill = true
+code_review_skill_sha256 = "6a65cc61114f96db07ec41e3920e67c9c5bf70dd6e0901eb9460ebcb2bdc209f"
+require_type_check = true
+require_security_check = true
+
+[environment]
+require_nix_flake = true
+require_nix_lock = true
+require_pinned_toolchain = true
+toolchain_lock = ".agent-work-governor/toolchain.lock.json"
+required_tools = ["uv", "ruff", "ty", "pip-audit"]

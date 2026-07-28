@@ -1,0 +1,175 @@
+{
+  "schema_version": "0.1",
+  "adapter_id": "ask-matt-v1.1-compatible",
+  "source": {
+    "repository": "https://github.com/mattpocock/skills",
+    "path": "skills/engineering/ask-matt/SKILL.md",
+    "commit": "7d694b7ae981ca221a8f759b15273fe7b5dc393e",
+    "sha256": "b1a134ada29cbfded84bc9a7f93356ab7a3d7f800edf1f541a2a964118ad45a7"
+  },
+  "authority": {
+    "routing": "ask-matt-or-explicit-user-selection",
+    "execution": "agent-work-governor",
+    "route_substitution": false,
+    "implicit_ask_matt_invocation": false
+  },
+  "missing_route_result": "ROUTE_DECISION_REQUIRED",
+  "stale_source_result": "ROUTER_CONTRACT_STALE",
+  "preconditions": {
+    "engineering_flow": {
+      "required_receipt": "setup-matt-pocock-skills",
+      "missing_result": "SETUP_REQUIRED",
+      "source_lines": "76-78"
+    }
+  },
+  "routes": [
+    {
+      "route_id": "idea-to-ship-codebase-multi-session",
+      "selected_flow": ["grill-with-docs", "to-spec", "to-tickets", "implement"],
+      "source_lines": "17-30",
+      "selection_receipt": {
+        "multi_session": true
+      },
+      "context_contract": "shape-and-plan-same-context; fresh-context-per-implement-ticket"
+    },
+    {
+      "route_id": "idea-to-ship-codebase-single-session",
+      "selected_flow": ["grill-with-docs", "implement"],
+      "source_lines": "17-30",
+      "selection_receipt": {
+        "multi_session": false
+      },
+      "context_contract": "shape-and-implement-in-current-context"
+    },
+    {
+      "route_id": "idea-without-codebase",
+      "selected_flow": ["grill-me"],
+      "source_lines": "17,70",
+      "context_contract": "stateless-no-repository-artifacts"
+    },
+    {
+      "route_id": "runnable-design-question",
+      "selected_flow": ["handoff", "prototype", "handoff"],
+      "source_lines": "18-21,63,71",
+      "context_contract": "disposable-prototype-run; outbound-and-inbound-handoff"
+    },
+    {
+      "route_id": "incoming-issues",
+      "selected_flow": ["triage"],
+      "source_lines": "38-40",
+      "context_contract": "raw-external-issues-only"
+    },
+    {
+      "route_id": "difficult-bug",
+      "selected_flow": ["diagnosing-bugs"],
+      "source_lines": "42",
+      "context_contract": "require-red-reproducer-before-repair"
+    },
+    {
+      "route_id": "huge-foggy-effort-mapped",
+      "selected_flow": ["wayfinder", "to-spec", "to-tickets", "implement"],
+      "source_lines": "44-46",
+      "selection_receipt": {
+        "wayfinder_outcome": "multi-session-map"
+      },
+      "context_contract": "decision-map-then-main-flow"
+    },
+    {
+      "route_id": "huge-foggy-effort-genuinely-small",
+      "selected_flow": ["wayfinder", "implement"],
+      "source_lines": "44-46",
+      "selection_receipt": {
+        "wayfinder_outcome": "genuinely-small"
+      },
+      "context_contract": "direct-implement-only-after-wayfinder-small-verdict"
+    },
+    {
+      "route_id": "codebase-health",
+      "selected_flow": ["improve-codebase-architecture", "grill-with-docs"],
+      "source_lines": "48-52",
+      "context_contract": "produce-idea-before-main-flow"
+    },
+    {
+      "route_id": "fixed-point-review",
+      "selected_flow": ["code-review"],
+      "source_lines": "26",
+      "context_contract": "review-current-fixed-point"
+    },
+    {
+      "route_id": "concrete-behavior-tdd",
+      "selected_flow": ["tdd"],
+      "source_lines": "26",
+      "context_contract": "one-red-green-slice-at-a-time"
+    },
+    {
+      "route_id": "agent-ready-implementation",
+      "selected_flow": ["implement"],
+      "source_lines": "24-26,39",
+      "context_contract": "fresh-context-for-one-agent-ready-ticket"
+    },
+    {
+      "route_id": "domain-language",
+      "selected_flow": ["domain-modeling"],
+      "source_lines": "54-57",
+      "context_contract": "vocabulary-layer-under-selected-work"
+    },
+    {
+      "route_id": "module-shape",
+      "selected_flow": ["codebase-design"],
+      "source_lines": "58-59",
+      "context_contract": "deep-module-vocabulary-layer"
+    },
+    {
+      "route_id": "session-handoff",
+      "selected_flow": ["handoff"],
+      "source_lines": "63-64",
+      "context_contract": "new-session; preserve-file; revoke-old-write-lease"
+    },
+    {
+      "route_id": "same-conversation-compact",
+      "selected_flow": ["compact"],
+      "source_lines": "65-66",
+      "context_contract": "same-session; new-context-revision"
+    },
+    {
+      "route_id": "standalone-prototype",
+      "selected_flow": ["prototype"],
+      "source_lines": "71",
+      "context_contract": "disposable-code; retain-answer-only"
+    },
+    {
+      "route_id": "primary-source-research",
+      "selected_flow": ["research"],
+      "source_lines": "72",
+      "context_contract": "produce-cited-artifact; no-build-effect"
+    },
+    {
+      "route_id": "multi-session-learning",
+      "selected_flow": ["teach"],
+      "source_lines": "73",
+      "context_contract": "stateful-learning-workspace"
+    },
+    {
+      "route_id": "skill-authoring-reference",
+      "selected_flow": ["writing-great-skills"],
+      "source_lines": "74",
+      "context_contract": "reference-only"
+    },
+    {
+      "route_id": "engineering-flow-setup",
+      "selected_flow": ["setup-matt-pocock-skills"],
+      "source_lines": "76-78",
+      "context_contract": "repository-setup-receipt"
+    }
+  ],
+  "invariants": [
+    "exactly-one-route",
+    "governor-may-deny-but-never-substitute-route",
+    "grill-spec-tickets-share-context",
+    "each-implement-ticket-uses-fresh-context",
+    "handoff-revokes-old-write-lease",
+    "compact-keeps-run-and-session",
+    "implement-owned-tdd-and-code-review-are-not-reinvoked",
+    "to-tickets-output-is-never-triaged"
+  ]
+}

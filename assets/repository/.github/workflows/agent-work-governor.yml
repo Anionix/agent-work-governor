@@ -1,0 +1,39 @@
+name: Agent Work Governor
+
+# LLM-CONTRACT
+# id: agent-work-governor.repository-workflow-template
+# state: CHANGE -> POLICY_CHECKED -> REPRODUCIBLE_CHECKS | JOB_FAILURE
+# preconditions: repository bootstrap materialized the pinned policy helpers
+# invariant: policy or Nix failure never produces a successful workflow
+# failure: GitHub Actions reports the failing validation step
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: policy
+# test: bundle:tests/test_repo_bundle.py
+# Primary source: https://docs.github.com/actions/using-workflows/workflow-syntax-for-github-actions
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Validate repository governance
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+          GOVERNOR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: python3 .agent-work-governor/validate.py
+      - name: Install pinned Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+      - name: Run reproducible repository checks
+        run: nix flake check --no-update-lock-file --no-write-lock-file

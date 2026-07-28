@@ -1,0 +1,49 @@
+# LLM-CONTRACT
+# id: agent-work-governor.source-baseline-provenance
+# state: DISTRIBUTION_BUNDLE -> SOURCE_SELECTION -> TRACEABLE_BASELINE | IMPORT_REJECTED
+# preconditions: the observed bundle digest and exclusion sets are explicit
+# invariant: generated artifacts, release binaries, and runtime receipts are never source inputs
+# failure: source-only validation rejects an unlisted artifact or missing provenance field
+# source: bundle:knowledge/policies/work-governor.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: source_bundle_sha256
+# test: bundle:tests/test_contracts.py
+
+schema_version = "0.1"
+source_bundle_sha256 = "27862b406fffa58ac92b395f83ca970d08ef76b7d2220f63876b1c7113b63926"
+source_bundle_file_count = 67
+source_only_file_count = 65
+digest_scope = "SHA-256 of sorted per-file SHA-256 records; rust/target excluded"
+
+excluded_from_import = [
+  ".governance/**",
+  "**/.pytest_cache/**",
+  "**/.venv/**",
+  "**/__pycache__/**",
+  "**/*.pyc",
+  "bin/**",
+  "rust/target/**",
+]
+
+normalization_reasons = [
+  "activate the owner-original repository policy",
+  "bind current stable tool releases",
+  "make clean-checkout Python and plugin checks reproducible",
+  "preserve Apache-2.0 as the repository license",
+  "bind executable configuration to LLM contracts",
+  "run digest-pinned canonical Plugin and Skill validation in a clean checkout",
+  "run locked Rust advisory, license, ban, and source policy checks in CI",
+  "skip release-artifact-only tests only in a source checkout",
+]
+
+schema_bound_json_contracts = [
+  ".agent-work-governor/toolchain.lock.json=.agent-work-governor/LLM-CONTRACT.md",
+  ".codex-plugin/plugin.json=.codex-plugin/LLM-CONTRACT.md",
+  "adapters/ask-matt-routes.json=adapters/LLM-CONTRACT.md",
+  "references/ask-matt.lock.json=references/LLM-CONTRACT.md",
+  "references/canonical-validators.lock.json=references/LLM-CONTRACT.md",
+  "references/code-review.lock.json=references/LLM-CONTRACT.md",
+  "references/okf-v0.2.lock.json=references/LLM-CONTRACT.md",
+  "rust/toolchain.lock.json=rust/toolchain.lock.LLM-CONTRACT.md",
+  "toolchain.lock.json=toolchain.lock.LLM-CONTRACT.md",
+]

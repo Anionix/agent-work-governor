@@ -6,6 +6,8 @@ These rules apply to this owner-original repository.
 
 - Hand-written code and executable config require an LLM contract comment:
   allowed state transition plus fail-closed outcome.
+- Schema-constrained JSON uses an adjacent `LLM-CONTRACT.md` because JSON has
+  no comment syntax; tests bind every declared sidecar to its JSON file.
 - GitHub Issues are task specifications; the linked Project is only a view.
 - Cite primary sources. Generated lockfiles evidence environment resolution.
 - Make invalid states unrepresentable. Kani covers Rust behavior; Lean covers
