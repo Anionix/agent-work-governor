@@ -1,0 +1,346 @@
+//! Canonical, digest-bound execution plans derived from resolved governance IR.
+
+use super::{
+    CheckId, CheckKind, Dependency, GovernanceIr, Language, ResolvedCheck,
+    execution_recipe::{ExecutionRecipe, RecipeArg},
+};
+use serde::Serialize;
+use std::collections::BTreeSet;
+use thiserror::Error;
+
+const PLAN_SCHEMA_VERSION: &str = "0.1";
+
+// LLM-CONTRACT
+// id: agent-work-governor.canonical-execution-plan
+// state: RESOLVED_GOVERNANCE_IR -> CANONICAL_EXECUTION_PLAN | PLAN_REJECTED
+// preconditions: the typed IR and digest-bound adapter recipes are complete and explicit
+// invariant: emit joins exact recipe data and emits canonical bytes without inference or execution
+// failure: emit returns one stable PLAN reason code without bytes or a digest
+// source: https://github.com/cyberphone/json-canonicalization/blob/19d51d7fe467d4706a3ff08adf8a748f29fc21e0/README.md
+// knowledge: bundle:knowledge/policies/work-governor.md
+// enforced_by: emit
+// test: bundle:rust/src/governance_ir/execution_plan.rs
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CanonicalExecutionPlan {
+    pub(crate) canonical_json: Vec<u8>,
+    pub(crate) sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("{0}")]
+pub(crate) struct PlanError(&'static str);
+
+impl PlanError {
+    const EMPTY: Self = Self("PLAN_EMPTY");
+    const CYCLE: Self = Self("PLAN_CYCLE");
+    const CATALOG_INVALID: Self = Self("PLAN_CATALOG_INVALID");
+    const UNKNOWN_CHECK: Self = Self("PLAN_UNKNOWN_CHECK");
+    const RECIPE_MISMATCH: Self = Self("PLAN_RECIPE_MISMATCH");
+    const ENCODING_FAILED: Self = Self("PLAN_ENCODING_FAILED");
+
+    pub(crate) const fn code(self) -> &'static str {
+        self.0
+    }
+}
+
+pub(crate) struct PlanEmitter;
+
+impl PlanEmitter {
+    pub(crate) fn emit(ir: &GovernanceIr) -> Result<CanonicalExecutionPlan, PlanError> {
+        if ir.checks.is_empty() {
+            return Err(PlanError::EMPTY);
+        }
+        let recipes = closed_recipes()?;
+        let checks = topological_checks(ir)?
+            .into_iter()
+            .map(|check| bind(check, &recipes).map(PlanCheck::from))
+            .collect::<Result<Vec<_>, _>>()?;
+        let canonical_json = serde_json::to_vec(&PlanDocument {
+            checks,
+            schema_version: PLAN_SCHEMA_VERSION,
+        })
+        .map_err(|_| PlanError::ENCODING_FAILED)?;
+        Ok(CanonicalExecutionPlan {
+            sha256: crate::adapter_catalog::sha256_hex(&canonical_json),
+            canonical_json,
+        })
+    }
+}
+
+fn topological_checks(ir: &GovernanceIr) -> Result<Vec<&ResolvedCheck>, PlanError> {
+    let mut emitted = BTreeSet::<&CheckId>::new();
+    let mut ordered = Vec::with_capacity(ir.checks.len());
+    while ordered.len() < ir.checks.len() {
+        let Some(check) = ir.checks.iter().find(|check| {
+            !emitted.contains(&check.identifier)
+                && check
+                    .dependencies
+                    .iter()
+                    .all(|dependency| emitted.contains(&dependency.0))
+        }) else {
+            return Err(PlanError::CYCLE);
+        };
+        emitted.insert(&check.identifier);
+        ordered.push(check);
+    }
+    Ok(ordered)
+}
+
+fn closed_recipes() -> Result<Vec<ExecutionRecipe>, PlanError> {
+    let mut recipes =
+        crate::python_adapter::execution_recipes().map_err(|_| PlanError::CATALOG_INVALID)?;
+    recipes
+        .extend(crate::rust_adapter::execution_recipes().map_err(|_| PlanError::CATALOG_INVALID)?);
+    for recipe in &mut recipes {
+        recipe.dependencies.sort();
+        recipe.input_artifacts.sort();
+        recipe.output_artifacts.sort();
+        let metadata = recipe
+            .dependencies
+            .iter()
+            .chain(&recipe.input_artifacts)
+            .chain(&recipe.output_artifacts);
+        let args_are_ascii = recipe.argv.iter().all(|arg| match arg {
+            RecipeArg::Literal(value) | RecipeArg::Artifact { artifact: value } => {
+                !value.is_empty() && value.is_ascii()
+            }
+        });
+        let unique = [
+            &recipe.dependencies,
+            &recipe.input_artifacts,
+            &recipe.output_artifacts,
+        ]
+        .iter()
+        .all(|values| values.windows(2).all(|pair| pair[0] != pair[1]));
+        if recipe.argv.is_empty()
+            || recipe.timeout_seconds == 0
+            || !metadata
+                .into_iter()
+                .all(|value| !value.is_empty() && value.is_ascii())
+            || !args_are_ascii
+            || !unique
+        {
+            return Err(PlanError::CATALOG_INVALID);
+        }
+    }
+    recipes.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+    if recipes
+        .windows(2)
+        .any(|pair| pair[0].identifier == pair[1].identifier)
+    {
+        Err(PlanError::CATALOG_INVALID)
+    } else {
+        Ok(recipes)
+    }
+}
+
+fn bind<'a>(
+    check: &'a ResolvedCheck,
+    recipes: &'a [ExecutionRecipe],
+) -> Result<(&'a ResolvedCheck, &'a ExecutionRecipe), PlanError> {
+    let recipe = recipes
+        .binary_search_by(|recipe| recipe.identifier.as_str().cmp(&check.identifier.0))
+        .map(|index| &recipes[index])
+        .map_err(|_| PlanError::UNKNOWN_CHECK)?;
+    let dependencies_match = recipe.dependencies.iter().map(String::as_str).eq(check
+        .dependencies
+        .iter()
+        .map(|dependency| dependency.0.0.as_str()));
+    if recipe.language == check.language
+        && recipe.kind == check.kind
+        && recipe.tool_identity == check.tool.identity
+        && dependencies_match
+    {
+        Ok((check, recipe))
+    } else {
+        Err(PlanError::RECIPE_MISMATCH)
+    }
+}
+
+#[derive(Serialize)]
+struct PlanDocument<'a> {
+    checks: Vec<PlanCheck<'a>>,
+    schema_version: &'static str,
+}
+
+#[derive(Serialize)]
+struct PlanCheck<'a> {
+    argv: &'a [RecipeArg],
+    dependencies: &'a [Dependency],
+    identifier: &'a CheckId,
+    input_artifacts: &'a [String],
+    kind: CheckKind,
+    language: Language,
+    output_artifacts: &'a [String],
+    path: &'a str,
+    timeout_seconds: u16,
+    tool: PlanTool<'a>,
+}
+
+impl<'a> From<(&'a ResolvedCheck, &'a ExecutionRecipe)> for PlanCheck<'a> {
+    fn from((check, recipe): (&'a ResolvedCheck, &'a ExecutionRecipe)) -> Self {
+        Self {
+            argv: &recipe.argv,
+            dependencies: &check.dependencies,
+            identifier: &check.identifier,
+            input_artifacts: &recipe.input_artifacts,
+            kind: check.kind,
+            language: check.language,
+            output_artifacts: &recipe.output_artifacts,
+            path: &check.path,
+            timeout_seconds: recipe.timeout_seconds,
+            tool: PlanTool {
+                identity: &check.tool.identity,
+                version: &check.tool.version,
+            },
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct PlanTool<'a> {
+    identity: &'a str,
+    version: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::CheckDraft;
+    use super::*;
+    use std::error::Error as StdError;
+
+    fn draft(
+        id: &str,
+        language: Language,
+        kind: CheckKind,
+        tool: &str,
+        path: &str,
+        dependencies: &[&str],
+    ) -> CheckDraft {
+        CheckDraft {
+            identifier: Some(id.into()),
+            language: Some(language),
+            kind: Some(kind),
+            tool_identity: Some(tool.into()),
+            tool_version: Some(
+                if language == Language::Python {
+                    "0.11.33"
+                } else {
+                    "1.97.1"
+                }
+                .into(),
+            ),
+            path: Some(path.into()),
+            dependencies: Some(dependencies.iter().map(|value| (*value).into()).collect()),
+        }
+    }
+
+    fn fixtures() -> Vec<CheckDraft> {
+        vec![
+            draft(
+                "rust.tests",
+                Language::Rust,
+                CheckKind::Test,
+                "cargo",
+                "rust",
+                &[],
+            ),
+            draft(
+                "python.uv-export",
+                Language::Python,
+                CheckKind::Dependency,
+                "uv",
+                ".",
+                &["python.uv-lock"],
+            ),
+            draft(
+                "python.uv-lock",
+                Language::Python,
+                CheckKind::Dependency,
+                "uv",
+                ".",
+                &[],
+            ),
+        ]
+    }
+
+    fn assert_error(result: Result<CanonicalExecutionPlan, PlanError>, expected: &str) {
+        assert_eq!(expected, result.err().map_or("planned", PlanError::code));
+    }
+
+    #[test]
+    fn mixed_golden_is_canonical_and_digest_bound() -> Result<(), Box<dyn StdError>> {
+        let plan = PlanEmitter::emit(&GovernanceIr::resolve(fixtures())?)?;
+        assert_eq!(
+            br#"{"checks":[{"argv":["uv","lock","--check"],"dependencies":[],"identifier":"python.uv-lock","input_artifacts":[],"kind":"dependency","language":"python","output_artifacts":[],"path":".","timeout_seconds":60,"tool":{"identity":"uv","version":"0.11.33"}},{"argv":["uv","export","--quiet","--locked","--all-extras","--all-groups","--no-emit-workspace","--format","requirements.txt","--output-file",{"artifact":"python-audit-requirements"}],"dependencies":["python.uv-lock"],"identifier":"python.uv-export","input_artifacts":[],"kind":"dependency","language":"python","output_artifacts":["python-audit-requirements"],"path":".","timeout_seconds":60,"tool":{"identity":"uv","version":"0.11.33"}},{"argv":["cargo","test","--workspace","--all-features","--locked","--offline"],"dependencies":[],"identifier":"rust.tests","input_artifacts":[],"kind":"test","language":"rust","output_artifacts":[],"path":"rust","timeout_seconds":600,"tool":{"identity":"cargo","version":"1.97.1"}}],"schema_version":"0.1"}"#,
+            plan.canonical_json.as_slice()
+        );
+        assert_eq!(
+            "853f8cf3d4ef642e0be5d4f0724f947f0326e8c3ee14201d62d45ce3ce7b215f",
+            plan.sha256
+        );
+        let encoded = String::from_utf8(plan.canonical_json)?;
+        assert!(
+            ["command", "authority", "capability", "verdict", "receipt"]
+                .iter()
+                .all(|forbidden| !encoded.contains(forbidden))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn equivalent_ir_is_byte_identical() -> Result<(), Box<dyn StdError>> {
+        let expected = PlanEmitter::emit(&GovernanceIr::resolve(fixtures())?)?;
+        let mut reversed = fixtures();
+        reversed.reverse();
+        assert_eq!(
+            expected,
+            PlanEmitter::emit(&GovernanceIr::resolve(reversed)?)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn empty_cycle_unknown_and_mismatch_fail_closed() -> Result<(), Box<dyn StdError>> {
+        assert_error(
+            PlanEmitter::emit(&GovernanceIr::resolve(Vec::new())?),
+            "PLAN_EMPTY",
+        );
+        let cycle = GovernanceIr::resolve(vec![
+            draft(
+                "check.a",
+                Language::Rust,
+                CheckKind::Test,
+                "cargo",
+                ".",
+                &["check.b"],
+            ),
+            draft(
+                "check.b",
+                Language::Rust,
+                CheckKind::Test,
+                "cargo",
+                ".",
+                &["check.a"],
+            ),
+        ])?;
+        assert_error(PlanEmitter::emit(&cycle), "PLAN_CYCLE");
+        let unknown = GovernanceIr::resolve(vec![draft(
+            "rust.unknown",
+            Language::Rust,
+            CheckKind::Test,
+            "cargo",
+            ".",
+            &[],
+        )])?;
+        assert_error(PlanEmitter::emit(&unknown), "PLAN_UNKNOWN_CHECK");
+        let mut mismatch = fixtures().pop().ok_or("missing fixture")?;
+        mismatch.kind = Some(CheckKind::Lint);
+        assert_error(
+            PlanEmitter::emit(&GovernanceIr::resolve(vec![mismatch])?),
+            "PLAN_RECIPE_MISMATCH",
+        );
+        Ok(())
+    }
+}
