@@ -12,9 +12,9 @@ from typing import Any, TypedDict, cast
 
 # LLM-CONTRACT
 # id: agent-work-governor.toolchain-catalog
-# state: CATALOG_BYTES -> UNIQUE_TYPED_PINS -> VALIDATED_CATALOG | LOCK_REJECTED
+# state: CATALOG_BYTES -> UNIQUE_TYPED_CONSISTENT_PINS -> VALIDATED_CATALOG | LOCK_REJECTED
 # preconditions: the caller supplies one explicit catalog and required-ID set
-# invariant: no duplicate, unsupported language, range version, or mutable Git pin resolves
+# invariant: no duplicate, unsupported, floating, or contradictory component identity resolves
 # failure: return sorted stable findings without executing any catalogued tool
 # source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/json.rst
 # knowledge: bundle:knowledge/policies/work-governor.md
@@ -56,6 +56,50 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _finding(code: str, tool_id: str = "", field: str = "") -> Finding:
     return {"code": code, "tool_id": tool_id, "field": field}
+
+
+def _rust_component_findings(pins: dict[str, dict[str, Any]]) -> list[Finding]:
+    # LLM-CONTRACT
+    # id: agent-work-governor.rust-component-catalog
+    # state: INDIVIDUAL_RUST_PINS -> CONSISTENT_COMPONENT_SET | COMPONENT_REJECTED
+    # preconditions: generic catalog shape and exact-pin checks have run
+    # invariant: present Rust components share the release identities consumed by Nix
+    # failure: emit stable component/field evidence without executing the toolchain
+    # source: https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/src/tools/build-manifest/src/main.rs
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: validate_catalog
+    # test: bundle:tests/test_repo_bundle.py
+    rust = pins.get("rust")
+    if rust is None:
+        return []
+
+    findings: list[Finding] = []
+    components = {
+        tool_id: pins[tool_id]
+        for tool_id in ("cargo", "clippy", "rust", "rustfmt")
+        if tool_id in pins
+    }
+    for tool_id, pin in components.items():
+        if pin.get("language") != "rust":
+            findings.append(
+                _finding("TOOLCHAIN_RUST_COMPONENT_MISMATCH", tool_id, "language")
+            )
+
+    cargo = components.get("cargo")
+    if cargo is not None and cargo.get("version") != rust.get("version"):
+        findings.append(
+            _finding("TOOLCHAIN_RUST_COMPONENT_MISMATCH", "cargo", "version")
+        )
+    for tool_id in ("clippy", "rustfmt"):
+        pin = components.get(tool_id)
+        if pin is None:
+            continue
+        for field in ("source", "source_digest"):
+            if pin.get(field) != rust.get(field):
+                findings.append(
+                    _finding("TOOLCHAIN_RUST_COMPONENT_MISMATCH", tool_id, field)
+                )
+    return findings
 
 
 def _valid_artifacts(value: object) -> bool:
@@ -174,6 +218,7 @@ def validate_catalog(
     for tool_id in sorted(required_ids):
         if tool_id not in pins:
             findings.append(_finding("REQUIRED_TOOL_NOT_LOCKED", tool_id))
+    findings.extend(_rust_component_findings(pins))
 
     findings.sort(key=lambda item: (item["code"], item["tool_id"], item["field"]))
     return ({}, findings) if findings else (pins, [])

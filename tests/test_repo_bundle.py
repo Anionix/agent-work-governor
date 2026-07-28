@@ -143,6 +143,41 @@ class PortableBundleTests(unittest.TestCase):
             ],
         }
 
+    @classmethod
+    def rust_component_catalog(cls) -> dict[str, object]:
+        document = cls.minimal_catalog()
+        tools = cls.catalog_tools(document)
+        rust = next(tool for tool in tools if tool["id"] == "rust")
+        cargo_sha = "c" * 40
+        tools.extend(
+            (
+                {
+                    "id": "cargo",
+                    "language": "rust",
+                    "version": rust["version"],
+                    "source": f"https://github.com/rust-lang/cargo/commit/{cargo_sha}",
+                    "source_digest": f"git:{cargo_sha}",
+                },
+                {
+                    "id": "clippy",
+                    "language": "rust",
+                    "version": "0.1.97",
+                    "source": rust["source"],
+                    "source_digest": rust["source_digest"],
+                },
+                {
+                    "id": "rustfmt",
+                    "language": "rust",
+                    "version": "1.9.0",
+                    "source": rust["source"],
+                    "source_digest": rust["source_digest"],
+                },
+            )
+        )
+        tools.sort(key=lambda tool: cast(str, tool["id"]))
+        document["required"] = sorted(cast(str, tool["id"]) for tool in tools)
+        return document
+
     @staticmethod
     def catalog_tools(
         document: dict[str, object],
@@ -352,6 +387,47 @@ class PortableBundleTests(unittest.TestCase):
                 self.assertIn(
                     "TOOLCHAIN_ENTRY_INVALID",
                     self.finding_codes(document),
+                )
+
+    def test_catalog_rejects_inconsistent_rust_components(self) -> None:
+        valid = self.rust_component_catalog()
+        pins, findings = self.validate_catalog_fixture(valid)
+        self.assertEqual([], findings)
+        self.assertEqual("1.97.1", pins["cargo"]["version"])
+
+        cases = (
+            ("cargo", "version"),
+            ("clippy", "source_identity"),
+            ("rustfmt", "source_identity"),
+            ("cargo", "language"),
+        )
+        for tool_id, mutation in cases:
+            with self.subTest(tool=tool_id, mutation=mutation):
+                document = cast(
+                    dict[str, object],
+                    json.loads(json.dumps(valid)),
+                )
+                tool = next(
+                    item
+                    for item in self.catalog_tools(document)
+                    if item["id"] == tool_id
+                )
+                if mutation == "version":
+                    tool["version"] = "1.96.0"
+                elif mutation == "language":
+                    tool["language"] = "python"
+                else:
+                    other_sha = "d" * 40
+                    tool["source"] = (
+                        f"https://github.com/rust-lang/rust/commit/{other_sha}"
+                    )
+                    tool["source_digest"] = f"git:{other_sha}"
+
+                _, rejected = self.validate_catalog_fixture(document)
+
+                self.assertIn(
+                    ("TOOLCHAIN_RUST_COMPONENT_MISMATCH", tool_id),
+                    {(item["code"], item["tool_id"]) for item in rejected},
                 )
 
     def test_catalog_rejects_mutable_or_malformed_provenance(self) -> None:
