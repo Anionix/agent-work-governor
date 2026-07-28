@@ -4,16 +4,17 @@
     reason = "Issue #4 defines the private adapter before Issue #7 exposes planning"
 )]
 
-use crate::governance_ir::{CheckDraft, CheckKind, GovernanceIr, Language};
+use crate::{
+    adapter_catalog::{closed_id, sha256_hex, tool_version},
+    governance_ir::{CheckDraft, CheckKind, GovernanceIr, Language},
+};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 const RECIPE_BYTES: &str = include_str!("../../adapters/check-recipes.v1.json");
 const RECIPE_SCHEMA: &str = "0.2";
 const RECIPE_SHA256: &str = "35dd14bb851cc822d50327db3f5bb3ccb89b2e5f8a958d35f19d27166a302333";
 const TOOLCHAIN_BYTES: &str = include_str!("../../toolchain.lock.json");
-const TOOLCHAIN_SCHEMA: &str = "0.2";
 
 // LLM-CONTRACT
 // id: agent-work-governor.deterministic-python-adapter
@@ -44,22 +45,6 @@ pub(crate) struct PythonProjectDraft {
     pub(crate) repository_kind: Option<RepositoryKind>,
     pub(crate) layout: Option<PythonLayout>,
     pub(crate) working_directory: Option<String>,
-}
-
-macro_rules! closed_id {
-    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
-        #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
-        enum $name {
-            $(#[serde(rename = $wire)] $variant),+
-        }
-        impl $name {
-            const fn as_str(self) -> &'static str {
-                match self {
-                    $(Self::$variant => $wire),+
-                }
-            }
-        }
-    };
 }
 
 closed_id!(PythonCheckId {
@@ -99,47 +84,6 @@ struct RecipeCatalogDraft {
     schema_version: String,
     language: Language,
     recipes: Vec<Recipe>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolchainCatalogDraft {
-    schema_version: String,
-    tools: Vec<ToolchainPinDraft>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ToolchainPinDraft {
-    id: String,
-    language: String,
-    version: String,
-}
-
-impl ToolchainCatalogDraft {
-    fn parse(bytes: &str) -> Result<Self, PythonAdapterError> {
-        let catalog: Self = serde_json::from_str(bytes)
-            .map_err(|_| PythonAdapterError::TOOLCHAIN_CATALOG_INVALID)?;
-        if catalog.schema_version == TOOLCHAIN_SCHEMA {
-            Ok(catalog)
-        } else {
-            Err(PythonAdapterError::TOOLCHAIN_CATALOG_INVALID)
-        }
-    }
-
-    fn version(&self, tool: PythonToolId) -> Result<String, PythonAdapterError> {
-        let mut matches = self.tools.iter().filter(|pin| pin.id == tool.as_str());
-        let pin = matches
-            .next()
-            .ok_or(PythonAdapterError::TOOLCHAIN_CATALOG_INVALID)?;
-        let numeric = pin
-            .version
-            .split('.')
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
-        if matches.next().is_none() && pin.language == "python" && numeric {
-            Ok(pin.version.clone())
-        } else {
-            Err(PythonAdapterError::TOOLCHAIN_CATALOG_INVALID)
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -199,16 +143,6 @@ fn parse_recipe_catalog(bytes: &str) -> Result<Vec<Recipe>, PythonAdapterError> 
     Ok(draft.recipes)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
 pub(crate) fn adapt_python(
     project: PythonProjectDraft,
 ) -> Result<PythonCheckSet, PythonAdapterError> {
@@ -230,11 +164,11 @@ pub(crate) fn adapt_python(
         .working_directory
         .ok_or(PythonAdapterError::PROJECT_INCOMPLETE)?;
     let recipes = parse_recipe_catalog(RECIPE_BYTES)?;
-    let toolchain = ToolchainCatalogDraft::parse(TOOLCHAIN_BYTES)?;
     let mut drafts = Vec::with_capacity(recipes.len());
 
     for recipe in recipes {
-        let version = toolchain.version(recipe.tool)?;
+        let version = tool_version(TOOLCHAIN_BYTES, "python", recipe.tool.as_str())
+            .map_err(|_| PythonAdapterError::TOOLCHAIN_CATALOG_INVALID)?;
         let recipe_workdir = match recipe.working_directory {
             WorkingDirectory::ProjectRoot => working_directory.clone(),
         };
@@ -456,7 +390,6 @@ mod tests {
     #[test]
     fn embedded_toolchain_projection_is_exact_and_fail_closed()
     -> Result<(), Box<dyn std::error::Error>> {
-        let catalog = ToolchainCatalogDraft::parse(TOOLCHAIN_BYTES)?;
         for (tool, version) in [
             (PythonToolId::PipAudit, "2.10.1"),
             (PythonToolId::Python, "3.14.6"),
@@ -464,24 +397,23 @@ mod tests {
             (PythonToolId::Ty, "0.0.64"),
             (PythonToolId::Uv, "0.11.33"),
         ] {
-            assert_eq!(version, catalog.version(tool)?);
+            assert_eq!(
+                version,
+                tool_version(TOOLCHAIN_BYTES, "python", tool.as_str())?
+            );
         }
         let wrong_schema = TOOLCHAIN_BYTES.replacen(
             "\"schema_version\": \"0.2\"",
             "\"schema_version\": \"0.3\"",
             1,
         );
-        assert!(ToolchainCatalogDraft::parse(&wrong_schema).is_err());
+        assert!(tool_version(&wrong_schema, "python", PythonToolId::Ruff.as_str()).is_err());
         let wrong_language = TOOLCHAIN_BYTES.replacen(
             "\"id\": \"ruff\", \"language\": \"python\"",
             "\"id\": \"ruff\", \"language\": \"rust\"",
             1,
         );
-        assert!(
-            ToolchainCatalogDraft::parse(&wrong_language)?
-                .version(PythonToolId::Ruff)
-                .is_err()
-        );
+        assert!(tool_version(&wrong_language, "python", PythonToolId::Ruff.as_str()).is_err());
         Ok(())
     }
 }

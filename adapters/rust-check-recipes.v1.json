@@ -1,0 +1,11 @@
+{
+  "schema_version": "0.1",
+  "language": "rust",
+  "recipes": [
+    {"id": "rust.cargo-audit", "kind": "security", "tool": "cargo-audit", "argv": ["cargo", "audit", "--no-fetch", "--deny", "warnings", "--file", "Cargo.lock"], "dependencies": [], "working_directory": "project_root", "timeout_seconds": 180},
+    {"id": "rust.cargo-deny", "kind": "security", "tool": "cargo-deny", "argv": ["cargo", "deny", "--manifest-path", "Cargo.toml", "--config", "deny.toml", "--workspace", "--locked", "--offline", "--all-features", "check", "advisories", "bans", "licenses", "sources"], "dependencies": [], "working_directory": "project_root", "timeout_seconds": 300},
+    {"id": "rust.clippy", "kind": "lint", "tool": "clippy", "argv": ["cargo", "clippy", "--workspace", "--all-targets", "--all-features", "--locked", "--offline", "--", "-D", "warnings"], "dependencies": [], "working_directory": "project_root", "timeout_seconds": 300},
+    {"id": "rust.rustfmt", "kind": "format", "tool": "rustfmt", "argv": ["cargo", "fmt", "--all", "--check"], "dependencies": [], "working_directory": "project_root", "timeout_seconds": 60},
+    {"id": "rust.tests", "kind": "test", "tool": "cargo", "argv": ["cargo", "test", "--workspace", "--all-targets", "--all-features", "--locked", "--offline"], "dependencies": [], "working_directory": "project_root", "timeout_seconds": 600}
+  ]
+}
