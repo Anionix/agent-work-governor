@@ -13,7 +13,7 @@ use thiserror::Error;
 
 const RECIPE_BYTES: &str = include_str!("../../adapters/rust-check-recipes.v1.json");
 const RECIPE_SCHEMA: &str = "0.1";
-const RECIPE_SHA256: &str = "98900ad746fff400653a828d1ada7812b9cd60e9f5fdb6372674d27fd875233c";
+const RECIPE_SHA256: &str = "490d065a8e981a347f287b44eace3ce481a5f2e7c019536f1cd8f8c89bdc8b8c";
 const TOOLCHAIN_BYTES: &str = include_str!("../../toolchain.lock.json");
 
 // LLM-CONTRACT
@@ -362,7 +362,6 @@ mod tests {
                     "cargo",
                     "test",
                     "--workspace",
-                    "--all-targets",
                     "--all-features",
                     "--locked",
                     "--offline",
