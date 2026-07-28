@@ -2,6 +2,9 @@ name: governor
 
 on:
   pull_request:
+    # LLM contract: PR evidence change -> revalidation; stale evidence -> failure.
+    # Source: https://docs.github.com/actions/using-workflows/events-that-trigger-workflows#pull_request
+    types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
 
@@ -18,6 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
       EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       PR_BODY: ${{ github.event.pull_request.body || '' }}
     steps:
@@ -25,6 +29,9 @@ jobs:
       # implicit allow path. Source: https://github.com/actions/checkout/releases/tag/v7.0.1
       - name: Check out the reviewed revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ env.EXPECTED_HEAD_SHA }}
 
       # LLM contract: pinned flake -> Nix environment or job failure.
       # Source: https://github.com/cachix/install-nix-action/releases/tag/v31.11.0
@@ -59,7 +66,7 @@ jobs:
             grep -Fqx -- "- Reviewed commit: $EXPECTED_HEAD_SHA" <<<"$PR_BODY" || { echo "::error::reviewed commit does not match PR head"; exit 1; }
             grep -Fqx -- "- Code-review skill digest: 6a65cc61114f96db07ec41e3920e67c9c5bf70dd6e0901eb9460ebcb2bdc209f" <<<"$PR_BODY" || { echo "::error::unexpected code-review skill"; exit 1; }
           fi
-          git show --check --format= --no-renames HEAD
+          git diff --check "$BASE_SHA...HEAD"
 
       - name: Check reproducible environment
         run: nix flake check --no-update-lock-file --no-write-lock-file --print-build-logs
