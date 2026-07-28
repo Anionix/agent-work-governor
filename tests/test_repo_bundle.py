@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Any, Protocol, cast
 
 BUNDLE_ROOT = Path(__file__).resolve().parents[1]
 MODULE_ROOT = BUNDLE_ROOT / "scripts"
@@ -35,6 +35,18 @@ import validate_policy
 
 
 class RepositoryGate(Protocol):
+    def validate_python_runtime(
+        self,
+        pins: dict[str, dict[str, object]],
+        actual_version: tuple[int, int, int],
+    ) -> list[dict[str, Any]]: ...
+
+    def validate_toolchain(
+        self,
+        root: Path,
+        environment: dict[str, object],
+    ) -> list[dict[str, Any]]: ...
+
     def is_governed_source(self, path: Path) -> bool: ...
 
     def contract_source_path(self, path: Path) -> Path: ...
@@ -79,6 +91,17 @@ def toolchain_contract_path() -> Path:
 
 def toolchain_catalog_path() -> Path:
     return BUNDLE_ROOT / "toolchain.lock.json"
+
+
+def repository_workflow_path() -> Path:
+    source_path = (
+        BUNDLE_ROOT / "assets/repository/.github/workflows/agent-work-governor.yml"
+    )
+    return (
+        source_path
+        if source_path.is_file()
+        else BUNDLE_ROOT.parent / ".github/workflows/agent-work-governor.yml"
+    )
 
 
 def load_gate() -> RepositoryGate:
@@ -198,6 +221,54 @@ class PortableBundleTests(unittest.TestCase):
         self.assertEqual([], findings)
         self.assertEqual("python", pins["python"]["language"])
         self.assertEqual("rust", pins["rust"]["language"])
+
+    def test_repository_gate_requires_exact_python_runtime_and_pin(self) -> None:
+        gate = load_gate()
+        document = self.minimal_catalog()
+        pins, catalog_findings = self.validate_catalog_fixture(
+            document,
+            ("python", "rust"),
+        )
+        self.assertEqual([], catalog_findings)
+        self.assertEqual([], gate.validate_python_runtime(pins, (3, 14, 6)))
+        runtime_findings = gate.validate_python_runtime(pins, (3, 14, 5))
+        self.assertEqual(
+            ["TOOLCHAIN_PYTHON_VERSION_MISMATCH"],
+            [finding["code"] for finding in runtime_findings],
+        )
+        self.assertEqual("3.14.6", runtime_findings[0]["evidence"]["expected"])
+        self.assertEqual("3.14.5", runtime_findings[0]["evidence"]["actual"])
+
+        tools = self.catalog_tools(document)
+        python_pin = next(tool for tool in tools if tool["id"] == "python")
+        python_pin["id"] = "ruff"
+        document["required"] = ["ruff", "rust"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_path = root / "toolchain.lock.json"
+            lock_path.write_text(json.dumps(document), encoding="utf-8")
+            findings = gate.validate_toolchain(
+                root,
+                {
+                    "toolchain_lock": "toolchain.lock.json",
+                    "required_tools": ["rust"],
+                },
+            )
+
+        self.assertIn("REQUIRED_TOOL_NOT_LOCKED", {item["code"] for item in findings})
+
+    def test_repository_workflow_uses_nix_python_for_policy_gate(self) -> None:
+        workflow = repository_workflow_path().read_text(encoding="utf-8")
+
+        self.assertLess(
+            workflow.index("uses: cachix/install-nix-action@"),
+            workflow.index("python .agent-work-governor/validate.py"),
+        )
+        self.assertIn(
+            "nix develop --no-update-lock-file --no-write-lock-file --command",
+            workflow,
+        )
+        self.assertNotIn("run: python3 .agent-work-governor/validate.py", workflow)
 
     def test_catalog_accepts_valid_python_rust_and_artifacts(self) -> None:
         document = self.minimal_catalog()

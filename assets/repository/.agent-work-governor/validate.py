@@ -147,6 +147,35 @@ def canonical_digest(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def validate_python_runtime(
+    pins: dict[str, dict[str, object]],
+    actual_version: tuple[int, int, int],
+) -> list[dict[str, Any]]:
+    # LLM-CONTRACT
+    # id: agent-work-governor.repository-gate-python-runtime
+    # state: VALIDATED_CATALOG -> EXACT_PYTHON_RUNTIME | RUNTIME_REJECTED
+    # preconditions: the unified catalog contains the required python identity
+    # invariant: repository policy never executes under an uncatalogued Python version
+    # failure: emit TOOLCHAIN_PYTHON_VERSION_MISMATCH before repository acceptance
+    # source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/sys.rst
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: validate_toolchain
+    # test: bundle:tests/test_repo_bundle.py
+    python_pin = pins.get("python")
+    expected = python_pin.get("version") if python_pin is not None else None
+    actual = ".".join(str(component) for component in actual_version)
+    if not isinstance(expected, str) or actual != expected:
+        return [
+            finding(
+                "TOOLCHAIN_PYTHON_VERSION_MISMATCH",
+                "repository gate must run with the catalogued Python version",
+                actual=actual,
+                expected=expected,
+            )
+        ]
+    return []
+
+
 def validate_toolchain(
     root: Path,
     environment: dict[str, Any],
@@ -166,8 +195,11 @@ def validate_toolchain(
         ]
 
     lock_path = root / relative
-    _, catalog_findings = toolchain_catalog.validate_catalog(lock_path, required)
-    return [
+    pins, catalog_findings = toolchain_catalog.validate_catalog(
+        lock_path,
+        sorted({*required, "python"}),
+    )
+    errors = [
         finding(
             item["code"],
             "unified toolchain catalog rejected",
@@ -177,6 +209,15 @@ def validate_toolchain(
         )
         for item in catalog_findings
     ]
+    if catalog_findings:
+        return errors
+
+    actual_version = (
+        sys.version_info.major,
+        sys.version_info.minor,
+        sys.version_info.micro,
+    )
+    return validate_python_runtime(pins, actual_version)
 
 
 def is_contract_sidecar(path: Path) -> bool:
