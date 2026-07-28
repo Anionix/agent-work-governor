@@ -13,7 +13,7 @@ const REQUIRED_REPOSITORY_ASSETS: [&str; 5] = [
     ".github/workflows/agent-work-governor.yml",
 ];
 
-const FIXED_SOURCE_MAPPINGS: [(&str, &str); 5] = [
+const FIXED_SOURCE_MAPPINGS: [(&str, &str); 6] = [
     (
         "scripts/validate_policy.py",
         ".agent-work-governor/validate_policy.py",
@@ -21,6 +21,10 @@ const FIXED_SOURCE_MAPPINGS: [(&str, &str); 5] = [
     (
         "scripts/contract_blocks.py",
         ".agent-work-governor/contract_blocks.py",
+    ),
+    (
+        "scripts/toolchain_catalog.py",
+        ".agent-work-governor/toolchain_catalog.py",
     ),
     (
         "toolchain.lock.json",

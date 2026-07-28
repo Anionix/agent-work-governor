@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -16,6 +19,7 @@ if not MODULE_ROOT.is_dir():
 sys.path.insert(0, str(MODULE_ROOT))
 
 import contract_blocks
+import toolchain_catalog
 import validate_policy
 
 # LLM-CONTRACT
@@ -73,6 +77,10 @@ def toolchain_contract_path() -> Path:
     )
 
 
+def toolchain_catalog_path() -> Path:
+    return BUNDLE_ROOT / "toolchain.lock.json"
+
+
 def load_gate() -> RepositoryGate:
     specification = importlib.util.spec_from_file_location(
         "agent_work_governor_repo_gate",
@@ -86,6 +94,58 @@ def load_gate() -> RepositoryGate:
 
 
 class PortableBundleTests(unittest.TestCase):
+    @staticmethod
+    def minimal_catalog() -> dict[str, object]:
+        python_sha = "a" * 40
+        rust_sha = "b" * 40
+        return {
+            "locked_at": "2026-07-29",
+            "required": ["python", "rust"],
+            "schema_version": "0.2",
+            "tools": [
+                {
+                    "id": "python",
+                    "language": "python",
+                    "version": "3.14.6",
+                    "source": f"https://github.com/python/cpython/commit/{python_sha}",
+                    "source_digest": f"git:{python_sha}",
+                },
+                {
+                    "id": "rust",
+                    "language": "rust",
+                    "version": "1.97.1",
+                    "source": f"https://github.com/rust-lang/rust/commit/{rust_sha}",
+                    "source_digest": f"git:{rust_sha}",
+                },
+            ],
+        }
+
+    @staticmethod
+    def catalog_tools(
+        document: dict[str, object],
+    ) -> list[dict[str, object]]:
+        tools = document["tools"]
+        if not isinstance(tools, list) or not all(
+            isinstance(tool, dict) for tool in tools
+        ):
+            raise AssertionError("catalog fixture tools must be objects")
+        return cast(list[dict[str, object]], tools)
+
+    def validate_catalog_fixture(
+        self,
+        document: dict[str, object],
+        required: tuple[str, ...] = (),
+    ) -> tuple[dict[str, dict[str, object]], list[toolchain_catalog.Finding]]:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "toolchain.lock.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            return toolchain_catalog.validate_catalog(path, required)
+
+    def finding_codes(self, document: dict[str, object]) -> set[str]:
+        pins, findings = self.validate_catalog_fixture(document)
+        self.assertEqual({}, pins)
+        return {finding["code"] for finding in findings}
+
     def test_executable_config_and_json_sidecars_are_governed(self) -> None:
         gate = load_gate()
         for relative in (
@@ -129,6 +189,157 @@ class PortableBundleTests(unittest.TestCase):
                 source,
             ),
         )
+
+    def test_bundled_catalog_has_required_python_and_rust_pins(self) -> None:
+        pins, findings = toolchain_catalog.validate_catalog(
+            toolchain_catalog_path(),
+            ("python", "rust"),
+        )
+        self.assertEqual([], findings)
+        self.assertEqual("python", pins["python"]["language"])
+        self.assertEqual("rust", pins["rust"]["language"])
+
+    def test_catalog_accepts_valid_python_rust_and_artifacts(self) -> None:
+        document = self.minimal_catalog()
+        artifacts = {
+            system: {
+                "url": f"https://example.invalid/python-{system}.whl",
+                "sha256": character * 64,
+            }
+            for system, character in (
+                ("aarch64-darwin", "1"),
+                ("aarch64-linux", "2"),
+                ("x86_64-linux", "3"),
+            )
+        }
+        tools = self.catalog_tools(document)
+        tools[0]["artifacts"] = artifacts
+
+        pins, findings = self.validate_catalog_fixture(
+            document,
+            ("python", "rust"),
+        )
+
+        self.assertEqual([], findings)
+        self.assertEqual(artifacts, pins["python"]["artifacts"])
+
+    def test_catalog_cli_exposes_exact_source_identity(self) -> None:
+        document = self.minimal_catalog()
+        tools = self.catalog_tools(document)
+        expected = f"{tools[0]['source']}\t{tools[0]['source_digest']}\n"
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "toolchain.lock.json"
+            path.write_text(json.dumps(document), encoding="utf-8")
+            output = io.StringIO()
+            with redirect_stdout(output):
+                result = toolchain_catalog.main([str(path), "--tool-source", "python"])
+
+        self.assertEqual(0, result)
+        self.assertEqual(expected, output.getvalue())
+
+    def test_catalog_rejects_duplicate_raw_json_key(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "toolchain.lock.json"
+            path.write_text(
+                '{"schema_version":"0.2","schema_version":"0.2"}',
+                encoding="utf-8",
+            )
+            pins, findings = toolchain_catalog.validate_catalog(path)
+
+        self.assertEqual({}, pins)
+        self.assertEqual(
+            ["TOOLCHAIN_DUPLICATE_JSON_KEY"],
+            [finding["code"] for finding in findings],
+        )
+
+    def test_catalog_rejects_duplicate_unknown_and_missing_tools(self) -> None:
+        duplicate = self.minimal_catalog()
+        duplicate_tools = self.catalog_tools(duplicate)
+        duplicate_tools.append(dict(duplicate_tools[-1]))
+
+        unknown = self.minimal_catalog()
+        unknown_tools = self.catalog_tools(unknown)
+        unknown_tools[0]["language"] = "javascript"
+
+        missing = self.minimal_catalog()
+        missing["required"] = ["cargo-deny", "python", "rust"]
+
+        for document, code in (
+            (duplicate, "TOOLCHAIN_DUPLICATE_ID"),
+            (unknown, "TOOLCHAIN_LANGUAGE_UNSUPPORTED"),
+            (missing, "REQUIRED_TOOL_NOT_LOCKED"),
+        ):
+            with self.subTest(code=code):
+                self.assertIn(code, self.finding_codes(document))
+
+    def test_catalog_rejects_non_exact_versions(self) -> None:
+        for version in ("", "latest", ">=3.11", "1.*", "1.x", "^1.2.3", "1 || 2"):
+            document = self.minimal_catalog()
+            tools = self.catalog_tools(document)
+            tools[0]["version"] = version
+            with self.subTest(version=version):
+                self.assertIn(
+                    "TOOLCHAIN_ENTRY_INVALID",
+                    self.finding_codes(document),
+                )
+
+    def test_catalog_rejects_mutable_or_malformed_provenance(self) -> None:
+        sha = "a" * 40
+        cases = (
+            ("source", "http://github.com/python/cpython/commit/" + sha),
+            ("source", "https://github.com/python/cpython/releases/latest"),
+            ("source_digest", "git:main"),
+            ("source_digest", "git:" + "b" * 40),
+            ("source_digest", "sha256:" + "0" * 63),
+        )
+        for field, value in cases:
+            document = self.minimal_catalog()
+            tools = self.catalog_tools(document)
+            tools[0][field] = value
+            with self.subTest(field=field, value=value):
+                self.assertIn(
+                    "TOOLCHAIN_ENTRY_INVALID",
+                    self.finding_codes(document),
+                )
+
+    def test_catalog_rejects_incomplete_or_malformed_artifacts(self) -> None:
+        valid = {
+            system: {
+                "url": f"https://example.invalid/python-{system}.whl",
+                "sha256": character * 64,
+            }
+            for system, character in (
+                ("aarch64-darwin", "1"),
+                ("aarch64-linux", "2"),
+                ("x86_64-linux", "3"),
+            )
+        }
+        invalid_artifacts = (
+            {key: value for key, value in valid.items() if key != "aarch64-darwin"},
+            {
+                **valid,
+                "aarch64-darwin": {
+                    "url": "http://example.invalid/python.whl",
+                    "sha256": "1" * 64,
+                },
+            },
+            {
+                **valid,
+                "aarch64-linux": {
+                    "url": "https://example.invalid/python.whl",
+                    "sha256": "not-a-digest",
+                },
+            },
+        )
+        for artifacts in invalid_artifacts:
+            document = self.minimal_catalog()
+            tools = self.catalog_tools(document)
+            tools[0]["artifacts"] = artifacts
+            with self.subTest(artifacts=artifacts):
+                self.assertIn(
+                    "TOOLCHAIN_ENTRY_INVALID",
+                    self.finding_codes(document),
+                )
 
     def test_changed_code_files_preserve_newlines(self) -> None:
         gate = load_gate()

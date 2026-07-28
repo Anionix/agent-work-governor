@@ -1,12 +1,12 @@
 # LLM-CONTRACT
 # id: agent-work-governor.repository-toolchain-lock
-# state: TOOL_REQUIREMENT -> IMMUTABLE_PIN -> CHECKED_COMMAND | LOCK_REJECTED
-# preconditions: each quality and CI tool has a version, source, digest, and command
-# invariant: only lock-consistent tools contribute evidence to the required check
-# failure: toolchain validation or a locked command returns a non-zero process status
+# state: TOOL_REQUIREMENTS -> UNIQUE_TYPED_PINS -> VALIDATED_CATALOG | LOCK_REJECTED
+# preconditions: the schema version and complete required-ID set are explicit
+# invariant: duplicate, unsupported, range-versioned, or mutable pins never validate
+# failure: catalog validation emits sorted stable findings and returns non-zero
 # source: repo:toolchain.lock.json
 # knowledge: repo:knowledge/policies/work-governor.md
-# enforced_by: inspect_toolchain_lock
-# test: repo:tests/test_contracts.py
+# enforced_by: validate_catalog
+# test: repo:tests/test_repo_bundle.py
 
-The repository doctor calls `inspect_toolchain_lock` before accepting toolchain evidence.
+The repository doctor calls `validate_catalog` before accepting toolchain evidence.

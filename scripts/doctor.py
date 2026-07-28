@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import re
 import subprocess
 import sys
 import tomllib
@@ -14,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import rust_dispatch
+import toolchain_catalog
 import validate_okf
 import validate_policy
 
@@ -122,27 +122,14 @@ def canonical_validator(
     return "FAIL", evidence or f"validator exited {process.returncode}"
 
 
-def inspect_toolchain_lock(path: Path, required: list[str]) -> tuple[str, str]:
-    try:
-        document = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
-        return "FAIL", str(error)
-    if not isinstance(document, dict) or document.get("schema_version") != "0.1":
-        return "FAIL", "toolchain lock root or schema_version is invalid"
-    missing = [
-        tool
-        for tool in required
-        if not isinstance(document.get(tool), dict)
-        or not all(
-            isinstance(document[tool].get(field), str)
-            for field in ("version", "source", "source_digest", "purpose", "command")
-        )
-        or not document[tool]["source"].startswith("https://")
-        or re.fullmatch(r"git:[0-9a-f]{40}", document[tool]["source_digest"]) is None
-    ]
-    if missing:
-        return "FAIL", f"unlocked tools: {', '.join(missing)}"
-    return "PASS", str(path)
+def inspect_toolchain_catalog(path: Path, required: list[str]) -> tuple[str, str]:
+    pins, findings = toolchain_catalog.validate_catalog(path, required)
+    if findings:
+        return "FAIL", json.dumps(findings, sort_keys=True)
+    return "PASS", json.dumps(
+        {"path": str(path), "tools": len(pins)},
+        sort_keys=True,
+    )
 
 
 def audit(repo: Path) -> dict[str, Any]:
@@ -191,7 +178,7 @@ def audit(repo: Path) -> dict[str, Any]:
     except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
         add("FAIL", "canonical_validator_lock", str(error))
 
-    status, evidence = inspect_toolchain_lock(
+    status, evidence = inspect_toolchain_catalog(
         plugin_root / "toolchain.lock.json",
         ["uv", "ruff", "ty", "pip-audit"],
     )
@@ -463,7 +450,7 @@ def audit(repo: Path) -> dict[str, Any]:
             lock_relative = None
             required_tools = None
         if isinstance(lock_relative, str) and isinstance(required_tools, list):
-            status, evidence = inspect_toolchain_lock(
+            status, evidence = inspect_toolchain_catalog(
                 repo / lock_relative,
                 [tool for tool in required_tools if isinstance(tool, str)],
             )

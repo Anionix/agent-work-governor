@@ -50,6 +50,7 @@ fn copy_required_plugin_sources(
         "assets/presets/owner-original.toml",
         "scripts/validate_policy.py",
         "scripts/contract_blocks.py",
+        "scripts/toolchain_catalog.py",
         "toolchain.lock.json",
         "knowledge/policies/work-governor.md",
         "tests/test_repo_bundle.py",
@@ -83,6 +84,43 @@ fn bootstrap_is_dry_run() -> Result<(), Box<dyn std::error::Error>> {
             .plan
             .iter()
             .all(|item| item.action == PlanAction::WouldCreate)
+    );
+    Ok(())
+}
+
+#[test]
+fn bootstrap_maps_the_catalog_and_validator_to_consumer_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempdir()?;
+    fs::create_dir(temporary.path().join(".git"))?;
+    let report = Governor.check(CheckRequest::Bootstrap {
+        repo: temporary.path().to_path_buf(),
+        plugin_root: plugin_root(),
+        preset: Preset::Safe,
+        allow_non_git: false,
+    })?;
+    let CheckReport::Bootstrap(report) = report else {
+        return Err("unexpected report variant".into());
+    };
+    for (source_suffix, target_suffix) in [
+        (
+            "scripts/toolchain_catalog.py",
+            ".agent-work-governor/toolchain_catalog.py",
+        ),
+        (
+            "toolchain.lock.json",
+            ".agent-work-governor/toolchain.lock.json",
+        ),
+    ] {
+        assert!(report.plan.iter().any(|item| {
+            std::path::Path::new(&item.source).ends_with(source_suffix)
+                && std::path::Path::new(&item.target).ends_with(target_suffix)
+        }));
+    }
+    assert!(
+        report.plan.iter().all(|item| {
+            !std::path::Path::new(&item.source).ends_with("rust/toolchain.lock.json")
+        })
     );
     Ok(())
 }

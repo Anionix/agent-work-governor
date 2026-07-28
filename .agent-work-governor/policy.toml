@@ -63,5 +63,5 @@ require_security_check = true
 require_nix_flake = true
 require_nix_lock = true
 require_pinned_toolchain = true
-toolchain_lock = ".agent-work-governor/toolchain.lock.json"
+toolchain_lock = "toolchain.lock.json"
 required_tools = ["uv", "ruff", "ty", "pip-audit"]

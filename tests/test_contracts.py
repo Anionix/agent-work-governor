@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -24,6 +26,7 @@ import contract_blocks
 import doctor
 import package_runtime
 import rust_dispatch
+import toolchain_catalog
 import validate_canonical
 import validate_okf
 import validate_policy
@@ -72,6 +75,117 @@ def bundled_runtime_or_skip(
             "source-only checkout intentionally excludes compiled release artifacts"
         )
     return rust_dispatch.resolve_binary(PLUGIN_ROOT)
+
+
+def workflow_run_block(workflow: str, step_name: str) -> str:
+    """Extract one literal GitHub Actions run block without a YAML dependency."""
+
+    lines = workflow.splitlines()
+    marker = f"      - name: {step_name}"
+    step_index = lines.index(marker)
+    run_index = next(
+        index
+        for index in range(step_index + 1, len(lines))
+        if lines[index] == "        run: |"
+    )
+    body: list[str] = []
+    for line in lines[run_index + 1 :]:
+        if line.startswith("          "):
+            body.append(line[10:])
+        elif not line:
+            body.append("")
+        else:
+            break
+    if not body:
+        raise AssertionError(f"workflow step has no run block: {step_name}")
+    return "\n".join(body) + "\n"
+
+
+def run_nix_bootstrap_fixture(
+    *,
+    downloaded_installer: bytes | None = None,
+    source_mismatch: bool = False,
+    action_mismatch: bool = False,
+    preinstalled_nix: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run the real pre-Nix workflow script with isolated fake transport."""
+
+    expected_installer = b"verified nix installer\n"
+    downloaded_installer = downloaded_installer or expected_installer
+    workflow = (PLUGIN_ROOT / ".github/workflows/governor.yml").read_text(
+        encoding="utf-8"
+    )
+    catalog = json.loads(
+        (PLUGIN_ROOT / "toolchain.lock.json").read_text(encoding="utf-8")
+    )
+    nix_pin = next(tool for tool in catalog["tools"] if tool["id"] == "nix")
+    nix_pin["source_digest"] = (
+        f"sha256:{hashlib.sha256(expected_installer).hexdigest()}"
+    )
+    if source_mismatch:
+        nix_pin["source"] = "https://example.invalid/nix-install"
+    if action_mismatch:
+        workflow = workflow.replace(
+            "uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342",
+            f"uses: cachix/install-nix-action@{'0' * 40}",
+        )
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        workflow_path = root / ".github/workflows/governor.yml"
+        workflow_path.parent.mkdir(parents=True)
+        workflow_path.write_text(workflow, encoding="utf-8")
+        scripts = root / "scripts"
+        scripts.mkdir()
+        shutil.copy2(PLUGIN_ROOT / "scripts/toolchain_catalog.py", scripts)
+        (root / "toolchain.lock.json").write_text(
+            json.dumps(catalog),
+            encoding="utf-8",
+        )
+        runner_temp = root / "runner"
+        runner_temp.mkdir()
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text(
+            (
+                f"#!{sys.executable}\n"
+                "import pathlib, sys\n"
+                "output = sys.argv[sys.argv.index('--output') + 1]\n"
+                f"pathlib.Path(output).write_bytes(bytes.fromhex("
+                f"'{downloaded_installer.hex()}'))\n"
+            ),
+            encoding="utf-8",
+        )
+        fake_curl.chmod(0o755)
+        for name, source in (
+            ("python3", Path(sys.executable)),
+            ("sed", Path(shutil.which("sed") or "")),
+            ("sha256sum", Path(shutil.which("sha256sum") or "")),
+        ):
+            if not source.is_file():
+                raise unittest.SkipTest(f"{name} is unavailable")
+            (fake_bin / name).symlink_to(source)
+        if preinstalled_nix:
+            fake_nix = fake_bin / "nix"
+            fake_nix.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_nix.chmod(0o755)
+        step = workflow_run_block(workflow, "Validate unified toolchain catalog")
+        bash = shutil.which("bash")
+        if bash is None:
+            raise unittest.SkipTest("bash is unavailable")
+        return subprocess.run(
+            [bash, "-c", step],
+            cwd=root,
+            env={
+                "PATH": str(fake_bin),
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "RUNNER_TEMP": str(runner_temp),
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
 
 class PolicyTests(unittest.TestCase):
@@ -734,6 +848,32 @@ class BootstrapTests(unittest.TestCase):
             conflicts,
         )
 
+    def test_plan_installs_the_unified_catalog_and_validator(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory).resolve()
+            (repo / ".git").mkdir()
+            plan, conflicts = bootstrap.build_plan(repo, "safe")
+
+        self.assertEqual([], conflicts)
+        sources_by_target = {
+            Path(item["target"]).relative_to(repo): Path(item["source"]).resolve()
+            for item in plan
+        }
+        self.assertEqual(
+            (PLUGIN_ROOT / "toolchain.lock.json").resolve(),
+            sources_by_target[Path(".agent-work-governor/toolchain.lock.json")],
+        )
+        self.assertEqual(
+            (PLUGIN_ROOT / "scripts/toolchain_catalog.py").resolve(),
+            sources_by_target[Path(".agent-work-governor/toolchain_catalog.py")],
+        )
+        stale_rust_lock = Path("rust") / ("toolchain" + ".lock.json")
+        self.assertNotIn(stale_rust_lock, sources_by_target)
+        self.assertNotIn(
+            (PLUGIN_ROOT / stale_rust_lock).resolve(),
+            set(sources_by_target.values()),
+        )
+
     def test_planned_bundle_is_portable_when_materialized_by_a_harness(
         self,
     ) -> None:
@@ -797,6 +937,10 @@ class RepositoryGateTests(unittest.TestCase):
             shutil.copy2(
                 PLUGIN_ROOT / "assets/repository/.agent-work-governor/validate.py",
                 gate / "validate.py",
+            )
+            shutil.copy2(
+                PLUGIN_ROOT / "scripts/toolchain_catalog.py",
+                gate / "toolchain_catalog.py",
             )
             shutil.copy2(
                 PLUGIN_ROOT / "toolchain.lock.json",
@@ -973,7 +1117,7 @@ class RepositoryGateTests(unittest.TestCase):
 class SourceHygieneTests(unittest.TestCase):
     @staticmethod
     def governed_source_files() -> list[Path]:
-        ignored_parts = {"__pycache__", ".direnv", ".venv", "target"}
+        ignored_parts = {"__pycache__", ".direnv", ".governance", ".venv", "target"}
         return sorted(
             path
             for path in PLUGIN_ROOT.rglob("*")
@@ -1026,7 +1170,11 @@ class SourceHygieneTests(unittest.TestCase):
         offenders: list[str] = []
         placeholder = "[TODO" + ":"
         for path in sorted(PLUGIN_ROOT.rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts:
+            if (
+                not path.is_file()
+                or "__pycache__" in path.parts
+                or ".governance" in path.parts
+            ):
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
@@ -1037,25 +1185,54 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertEqual([], offenders)
 
     def test_toolchain_has_a_pinned_security_checker(self) -> None:
-        lock = json.loads(
-            (PLUGIN_ROOT / "toolchain.lock.json").read_text(encoding="utf-8")
+        pins, findings = toolchain_catalog.validate_catalog(
+            PLUGIN_ROOT / "toolchain.lock.json",
+            ("pip-audit",),
         )
-        security = lock["pip-audit"]
-        self.assertEqual("security", security["category"])
+        self.assertEqual([], findings)
+        security = pins["pip-audit"]
+        self.assertEqual("python", security["language"])
         self.assertRegex(security["version"], r"^\d+\.\d+\.\d+$")
         self.assertTrue(security["source"].startswith("https://"))
-        self.assertRegex(security["source_digest"], r"^git:[0-9a-f]{40}$")
+        self.assertRegex(security["source_digest"], r"^sha256:[0-9a-f]{64}$")
 
-    def test_toolchain_locks_match_project_inputs_and_required_checks(self) -> None:
-        lock = json.loads(
-            (PLUGIN_ROOT / "toolchain.lock.json").read_text(encoding="utf-8")
+    def test_pre_nix_bootstrap_rejects_provenance_mutations(self) -> None:
+        accepted = run_nix_bootstrap_fixture()
+        self.assertEqual(0, accepted.returncode, accepted.stderr)
+
+        cases = (
+            (
+                run_nix_bootstrap_fixture(downloaded_installer=b"tampered installer\n"),
+                "FAILED",
+            ),
+            (
+                run_nix_bootstrap_fixture(source_mismatch=True),
+                "TOOLCHAIN_NIX_SOURCE_MISMATCH",
+            ),
+            (
+                run_nix_bootstrap_fixture(action_mismatch=True),
+                "TOOLCHAIN_ACTION_IDENTITY_MISMATCH",
+            ),
+            (
+                run_nix_bootstrap_fixture(preinstalled_nix=True),
+                "TOOLCHAIN_NIX_PREINSTALLED",
+            ),
         )
-        active_lock = json.loads(
-            (PLUGIN_ROOT / ".agent-work-governor/toolchain.lock.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(lock, active_lock)
+        for rejected, evidence in cases:
+            with self.subTest(evidence=evidence):
+                self.assertNotEqual(0, rejected.returncode)
+                self.assertIn(evidence, rejected.stdout + rejected.stderr)
+
+    def test_unified_toolchain_matches_project_and_environment_inputs(self) -> None:
+        catalog_path = PLUGIN_ROOT / "toolchain.lock.json"
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+        pins, findings = toolchain_catalog.validate_catalog(catalog_path)
+        self.assertEqual([], findings)
+        self.assertEqual("0.2", catalog["schema_version"])
+        self.assertEqual(sorted(catalog["required"]), catalog["required"])
+        self.assertLessEqual(set(catalog["required"]), set(pins))
+        self.assertIn("python", {pin["language"] for pin in pins.values()})
+        self.assertIn("rust", {pin["language"] for pin in pins.values()})
 
         project = tomllib.loads(
             (PLUGIN_ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -1063,6 +1240,7 @@ class SourceHygieneTests(unittest.TestCase):
         development_pins = dict(
             dependency.split("==", maxsplit=1)
             for dependency in project["dependency-groups"]["dev"]
+            if "==" in dependency
         )
         uv_document = tomllib.loads(
             (PLUGIN_ROOT / "uv.lock").read_text(encoding="utf-8")
@@ -1071,33 +1249,95 @@ class SourceHygieneTests(unittest.TestCase):
             package["name"]: package["version"] for package in uv_document["package"]
         }
         for tool in ("ruff", "ty", "pip-audit"):
-            self.assertEqual(lock[tool]["version"], development_pins[tool])
-            self.assertEqual(lock[tool]["version"], uv_versions[tool])
-            self.assertRegex(lock[tool]["source_digest"], r"^git:[0-9a-f]{40}$")
-            self.assertIn(lock[tool]["version"], lock[tool]["source"])
+            self.assertEqual(pins[tool]["version"], development_pins[tool])
+            self.assertEqual(pins[tool]["version"], uv_versions[tool])
         self.assertEqual(
-            f">={lock['python']['minimum']}",
             project["project"]["requires-python"],
+            uv_document["requires-python"],
         )
+        minimum_python = tuple(
+            int(part)
+            for part in project["project"]["requires-python"]
+            .removeprefix(">=")
+            .split(".")
+        )
+        locked_python = tuple(
+            int(part) for part in pins["python"]["version"].split(".")
+        )
+        self.assertGreaterEqual(locked_python, minimum_python)
 
-        rust_lock = json.loads(
-            (PLUGIN_ROOT / "rust/toolchain.lock.json").read_text(encoding="utf-8")
-        )
         rust_toolchain = tomllib.loads(
             (PLUGIN_ROOT / "rust/rust-toolchain.toml").read_text(encoding="utf-8")
         )
         self.assertEqual(
-            rust_lock["rust"]["version"],
+            pins["rust"]["version"],
             rust_toolchain["toolchain"]["channel"],
         )
-        rust_readme = (PLUGIN_ROOT / "rust/README.md").read_text(encoding="utf-8")
-        for tool in ("cargo-audit", "cargo-deny"):
-            self.assertIn(rust_lock[tool]["version"], rust_lock[tool]["source"])
-            self.assertIn(rust_lock[tool]["command"], rust_readme)
+
+        flake_lock = json.loads(
+            (PLUGIN_ROOT / "flake.lock").read_text(encoding="utf-8")
+        )
+        root_inputs = flake_lock["nodes"][flake_lock["root"]]["inputs"]
+        for tool in ("nixpkgs", "rust-overlay"):
+            input_node = flake_lock["nodes"][root_inputs[tool]]
+            locked = input_node["locked"]
+            original = input_node["original"]
+            self.assertEqual(pins[tool]["version"], locked["rev"])
+            self.assertEqual(locked["rev"], original["rev"])
+            self.assertEqual(locked["owner"], original["owner"])
+            self.assertEqual(locked["repo"], original["repo"])
+            self.assertEqual(
+                pins[tool]["source"],
+                (
+                    f"https://github.com/{locked['owner']}/{locked['repo']}"
+                    f"/commit/{locked['rev']}"
+                ),
+            )
+            nar_hash = base64.b64decode(locked["narHash"].removeprefix("sha256-")).hex()
+            self.assertEqual(pins[tool]["source_digest"], f"sha256:{nar_hash}")
 
         workflow = (PLUGIN_ROOT / ".github/workflows/governor.yml").read_text(
             encoding="utf-8"
         )
+        workflow_actions = dict(
+            re.findall(r"uses:\s+([^@\s]+)@([0-9a-f]{40})", workflow)
+        )
+        catalog_actions = {
+            tool_id: pin["source_digest"].removeprefix("git:")
+            for tool_id, pin in pins.items()
+            if pin["language"] == "github_actions"
+        }
+        self.assertEqual(catalog_actions, workflow_actions)
+        self.assertIn("scripts/toolchain_catalog.py", workflow)
+        self.assertIn("--tool-source nix", workflow)
+        self.assertIn("--tool-source cachix/install-nix-action", workflow)
+        self.assertIn("TOOLCHAIN_ACTION_IDENTITY_MISMATCH", workflow)
+        self.assertIn("sha256sum --check --strict", workflow)
+        self.assertIn("install_url: file://${{ runner.temp }}/nix-install", workflow)
+        self.assertIn("command -v nix >/dev/null 2>&1", workflow)
+        self.assertIn("--proto-redir '=https'", workflow)
+        self.assertNotIn(".venv/bin/", workflow)
+        self.assertIn("run_locked ruff format --check .", workflow)
+        self.assertIn("run_locked pip-audit", workflow)
+        self.assertLess(
+            workflow.index("command -v nix >/dev/null 2>&1"),
+            workflow.index("uses: cachix/install-nix-action@"),
+        )
+        self.assertLess(
+            workflow.index("TOOLCHAIN_ACTION_IDENTITY_MISMATCH"),
+            workflow.index("uses: cachix/install-nix-action@"),
+        )
+        self.assertLess(
+            workflow.index("sha256sum --check --strict"),
+            workflow.index("uses: cachix/install-nix-action@"),
+        )
+        flake = (PLUGIN_ROOT / "flake.nix").read_text(encoding="utf-8")
+        for evidence in (
+            "bindNixPackage",
+            "TOOLCHAIN_PACKAGE_SOURCE_URL_MISMATCH",
+            "TOOLCHAIN_PACKAGE_SOURCE_DIGEST_MISMATCH",
+        ):
+            self.assertIn(evidence, flake)
         for evidence in (
             "scripts/validate_canonical.py --fetch-missing",
             "cargo audit --file rust/Cargo.lock",
@@ -1107,6 +1347,32 @@ class SourceHygieneTests(unittest.TestCase):
             "ty --version",
         ):
             self.assertIn(evidence, workflow)
+
+    def test_split_rust_toolchain_lock_has_no_stale_references(self) -> None:
+        stale_lock = "rust/toolchain" + ".lock.json"
+        stale_contract = "rust/toolchain" + ".lock.LLM-CONTRACT.md"
+        self.assertFalse((PLUGIN_ROOT / stale_lock).exists())
+        self.assertFalse((PLUGIN_ROOT / stale_contract).exists())
+
+        ignored_parts = {
+            ".git",
+            "__pycache__",
+            ".direnv",
+            ".venv",
+            "target",
+            "tests",
+        }
+        offenders: list[str] = []
+        for path in sorted(PLUGIN_ROOT.rglob("*")):
+            if not path.is_file() or not ignored_parts.isdisjoint(path.parts):
+                continue
+            try:
+                source = path.read_text(encoding="utf-8")
+            except UnicodeDecodeError:
+                continue
+            if stale_lock in source or stale_contract in source:
+                offenders.append(str(path.relative_to(PLUGIN_ROOT)))
+        self.assertEqual([], offenders)
 
     def test_source_baseline_and_json_contract_sidecars_are_bound(self) -> None:
         baseline = tomllib.loads(

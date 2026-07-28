@@ -12,6 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import toolchain_catalog
 import validate_policy
 from contract_blocks import (
     contract_diagnostic,
@@ -150,10 +151,13 @@ def validate_toolchain(
     root: Path,
     environment: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    errors: list[dict[str, Any]] = []
     relative = environment.get("toolchain_lock")
     required = environment.get("required_tools")
-    if not isinstance(relative, str) or not isinstance(required, list):
+    if (
+        not isinstance(relative, str)
+        or not isinstance(required, list)
+        or not all(isinstance(tool, str) for tool in required)
+    ):
         return [
             finding(
                 "TOOLCHAIN_POLICY_INVALID",
@@ -162,45 +166,17 @@ def validate_toolchain(
         ]
 
     lock_path = root / relative
-    lock, parse_error = load_json(lock_path)
-    if lock is None:
-        return [
-            finding(
-                "TOOLCHAIN_LOCK_UNREADABLE",
-                parse_error or "unknown parse error",
-                path=str(lock_path),
-            )
-        ]
-    if lock.get("schema_version") != "0.1":
-        errors.append(
-            finding(
-                "TOOLCHAIN_SCHEMA_MISMATCH",
-                "toolchain lock schema_version must be 0.1",
-                path=str(lock_path),
-            )
+    _, catalog_findings = toolchain_catalog.validate_catalog(lock_path, required)
+    return [
+        finding(
+            item["code"],
+            "unified toolchain catalog rejected",
+            field=item["field"],
+            path=str(lock_path),
+            tool=item["tool_id"],
         )
-    for tool in required:
-        entry = lock.get(tool)
-        if (
-            not isinstance(tool, str)
-            or not isinstance(entry, dict)
-            or not isinstance(entry.get("version"), str)
-            or not isinstance(entry.get("source"), str)
-            or not entry["source"].startswith("https://")
-            or not isinstance(entry.get("source_digest"), str)
-            or re.fullmatch(r"git:[0-9a-f]{40}", entry["source_digest"]) is None
-            or not isinstance(entry.get("purpose"), str)
-            or not isinstance(entry.get("command"), str)
-        ):
-            errors.append(
-                finding(
-                    "REQUIRED_TOOL_NOT_LOCKED",
-                    "required tool needs version, source digest, purpose, and command",
-                    tool=tool,
-                    path=str(lock_path),
-                )
-            )
-    return errors
+        for item in catalog_findings
+    ]
 
 
 def is_contract_sidecar(path: Path) -> bool:

@@ -1,53 +1,50 @@
 {
-  "schema_version": "0.1",
-  "locked_at": "2026-07-28",
-  "python": {
-    "minimum": "3.11",
-    "stdlib_only_runtime": true
-  },
-  "uv": {
-    "version": "0.11.33",
-    "source": "https://github.com/astral-sh/uv/releases/tag/0.11.33",
-    "source_digest": "git:fece32fc54b0e6fb6a031d3c80397cc4afb25737",
-    "purpose": "dependency and environment locking",
-    "command": "uv sync --frozen",
-    "update_checked_at": "2026-07-28"
-  },
-  "ruff": {
-    "version": "0.16.0",
-    "source": "https://github.com/astral-sh/ruff/releases/tag/0.16.0",
-    "source_digest": "git:a2635fd8f39e1d34ce8074cb486809426148f3e9",
-    "purpose": "Python formatting and linting",
-    "command": "ruff format --check . && ruff check .",
-    "update_checked_at": "2026-07-28"
-  },
-  "ty": {
-    "version": "0.0.64",
-    "source": "https://github.com/astral-sh/ty/releases/tag/0.0.64",
-    "source_digest": "git:5e64a131b436a4e1f40e6317c526f4fc73fab38b",
-    "purpose": "Python static type checking",
-    "command": "ty check",
-    "update_checked_at": "2026-07-28"
-  },
-  "pip-audit": {
-    "version": "2.10.1",
-    "source": "https://pypi.org/project/pip-audit/2.10.1/",
-    "source_digest": "git:8894eb8cee033531a1fbd9f2fb160892531c14e3",
-    "purpose": "known-vulnerability dependency audit",
-    "command": "uv export --locked --format requirements.txt --output-file /tmp/agent-work-governor-requirements.txt && pip-audit --disable-pip --require-hashes --requirement /tmp/agent-work-governor-requirements.txt",
-    "category": "security",
-    "update_checked_at": "2026-07-28"
-  },
-  "github_actions": {
-    "actions/checkout": {
-      "version": "v7.0.1",
-      "commit": "3d3c42e5aac5ba805825da76410c181273ba90b1",
-      "source": "https://github.com/actions/checkout/releases/tag/v7.0.1"
-    },
-    "cachix/install-nix-action": {
-      "version": "v31.11.0",
-      "commit": "630ae543ea3a38a9a4166f03376c02c50f408342",
-      "source": "https://github.com/cachix/install-nix-action/releases/tag/v31.11.0"
-    }
-  }
+  "locked_at": "2026-07-29",
+  "required": [
+    "actionlint",
+    "actions/checkout",
+    "cachix/install-nix-action",
+    "cargo",
+    "cargo-audit",
+    "cargo-deny",
+    "clippy",
+    "git",
+    "gitleaks",
+    "nix",
+    "nixfmt",
+    "nixpkgs",
+    "pip-audit",
+    "python",
+    "ruff",
+    "rust",
+    "rust-overlay",
+    "rustfmt",
+    "treefmt",
+    "ty",
+    "uv"
+  ],
+  "schema_version": "0.2",
+  "tools": [
+    {"id": "actionlint", "language": "nix", "version": "1.7.12", "source": "https://github.com/rhysd/actionlint/archive/refs/tags/v1.7.12.tar.gz", "source_digest": "sha256:9800926f7b1842d9228f3935d263e2da7772df36a4a275b58e553b0ff0d5f923"},
+    {"id": "actions/checkout", "language": "github_actions", "version": "v7.0.1", "source": "https://github.com/actions/checkout/commit/3d3c42e5aac5ba805825da76410c181273ba90b1", "source_digest": "git:3d3c42e5aac5ba805825da76410c181273ba90b1"},
+    {"id": "cachix/install-nix-action", "language": "github_actions", "version": "v31.11.0", "source": "https://github.com/cachix/install-nix-action/commit/630ae543ea3a38a9a4166f03376c02c50f408342", "source_digest": "git:630ae543ea3a38a9a4166f03376c02c50f408342"},
+    {"id": "cargo", "language": "rust", "version": "1.97.1", "source": "https://github.com/rust-lang/cargo/commit/c980f4866141969fab6254a680546a277789d6f0", "source_digest": "git:c980f4866141969fab6254a680546a277789d6f0"},
+    {"id": "cargo-audit", "language": "rust", "version": "0.22.2", "source": "https://static.crates.io/crates/cargo-audit/0.22.2/download", "source_digest": "sha256:86b9240d126f5ded9f96d5a3116d80d3fb8a5455aafbd3bec11a61b098d3d6d1"},
+    {"id": "cargo-deny", "language": "rust", "version": "0.20.2", "source": "https://github.com/EmbarkStudios/cargo-deny/archive/refs/tags/0.20.2.tar.gz", "source_digest": "sha256:b18c5142f2556d59b36a31897401e7baf24310bbf47320c2094f1c454d14d284"},
+    {"id": "clippy", "language": "rust", "version": "0.1.97", "source": "https://github.com/rust-lang/rust/commit/8bab26f4f68e0e26f0bb7960be334d5b520ea452", "source_digest": "git:8bab26f4f68e0e26f0bb7960be334d5b520ea452"},
+    {"id": "git", "language": "nix", "version": "2.55.0", "source": "https://www.kernel.org/pub/software/scm/git/git-2.55.0.tar.xz", "source_digest": "sha256:457fdb04dc8728e007d4688695e6912e6f680727920f2a40bf11eacc17505357"},
+    {"id": "gitleaks", "language": "nix", "version": "8.30.1", "source": "https://github.com/gitleaks/gitleaks/archive/refs/tags/v8.30.1.tar.gz", "source_digest": "sha256:3e932ab98c9734de8a17037f79f639fa0afee0885228fa00cb633fadca9f5b99"},
+    {"id": "nix", "language": "nix", "version": "2.34.7", "source": "https://releases.nixos.org/nix/nix-2.34.7/install", "source_digest": "sha256:e9d447ce3d2ff62d7ff9cb6ef401de6fa8acb148839dd00f7271945d7b638b14"},
+    {"id": "nixfmt", "language": "nix", "version": "1.4.0", "source": "https://github.com/nixos/nixfmt/archive/v1.4.0.tar.gz", "source_digest": "sha256:e79bd84c0beb2b564815b3bce05e0a26a84ebe1345916a51ddf4014fc1617588"},
+    {"id": "nixpkgs", "language": "nix", "version": "624af665418d3c65d544145b4d34ad696439570e", "source": "https://github.com/NixOS/nixpkgs/commit/624af665418d3c65d544145b4d34ad696439570e", "source_digest": "sha256:9b4a43b91246ec40e8f6b8bee0ab2ef3756c23e3e5c4d0bd94d05fc9d7a371ee"},
+    {"id": "pip-audit", "language": "python", "version": "2.10.1", "source": "https://github.com/trailofbits/pip-audit/archive/refs/tags/v2.10.1.tar.gz", "source_digest": "sha256:f91f17eca210cfa1a6f3c22281998c6a0cf9975789d9b3bccc050d66aba7a2d2"},
+    {"id": "python", "language": "python", "version": "3.14.6", "source": "https://www.python.org/ftp/python/3.14.6/Python-3.14.6.tar.xz", "source_digest": "sha256:143b1dddefaec3bd2e21e3b839b34a2b7fb9842272883c576420d605e9f30c63"},
+    {"id": "ruff", "language": "python", "version": "0.16.0", "source": "https://github.com/astral-sh/ruff/commit/a2635fd8f39e1d34ce8074cb486809426148f3e9", "source_digest": "git:a2635fd8f39e1d34ce8074cb486809426148f3e9", "artifacts": {"aarch64-darwin": {"url": "https://files.pythonhosted.org/packages/42/ce/741cd197496a1abbf51352710fd15ed995d2a2be87189c1da26a450d6e83/ruff-0.16.0-py3-none-macosx_11_0_arm64.whl", "sha256": "e01c21d10eb1b29f47b7454e1f4056db9a3f0260c646aa88457c610291db9f81"}, "aarch64-linux": {"url": "https://files.pythonhosted.org/packages/52/2a/a2db8e88cade358f5cdcb05674a917751074109315d014eb6352d9a893f7/ruff-0.16.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", "sha256": "6e364e5ed22ed8dc05082fd78e35308618260907ac2d3c1d637b2e682415b6c9"}, "x86_64-linux": {"url": "https://files.pythonhosted.org/packages/91/66/6bd3cf90500653d55dc0ffc8507aa8300bd49d0214b2e8cb4d3fef2943ba/ruff-0.16.0-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "sha256": "4f11a8d11010301d0a398a2fdef67691feca7294da6aef55e2150e8fa2cd520b"}}},
+    {"id": "rust", "language": "rust", "version": "1.97.1", "source": "https://github.com/rust-lang/rust/commit/8bab26f4f68e0e26f0bb7960be334d5b520ea452", "source_digest": "git:8bab26f4f68e0e26f0bb7960be334d5b520ea452"},
+    {"id": "rust-overlay", "language": "nix", "version": "8ec8a5a41f8d8244e672829c9cd705416139d3f0", "source": "https://github.com/oxalica/rust-overlay/commit/8ec8a5a41f8d8244e672829c9cd705416139d3f0", "source_digest": "sha256:2ab1a294288557111039a043dd3383864959cc4eee20242faac0568327080010"},
+    {"id": "rustfmt", "language": "rust", "version": "1.9.0", "source": "https://github.com/rust-lang/rust/commit/8bab26f4f68e0e26f0bb7960be334d5b520ea452", "source_digest": "git:8bab26f4f68e0e26f0bb7960be334d5b520ea452"},
+    {"id": "treefmt", "language": "nix", "version": "2.5.0", "source": "https://github.com/numtide/treefmt/archive/v2.5.0.tar.gz", "source_digest": "sha256:699cdbc3975018b36abdf10d357e9db64c608e331e2f9de5e2621e569429a6b0"},
+    {"id": "ty", "language": "python", "version": "0.0.64", "source": "https://github.com/astral-sh/ty/commit/5e64a131b436a4e1f40e6317c526f4fc73fab38b", "source_digest": "git:5e64a131b436a4e1f40e6317c526f4fc73fab38b", "artifacts": {"aarch64-darwin": {"url": "https://files.pythonhosted.org/packages/4c/de/19f14357888a7198438926303753cf749428e3d62e8980ff1e9a72a78402/ty-0.0.64-py3-none-macosx_11_0_arm64.whl", "sha256": "4f6d1c7f897cca05d12bacbf1435150d5ffa496099515aa6ed303c8b29e1d0bb"}, "aarch64-linux": {"url": "https://files.pythonhosted.org/packages/08/2f/f54462300535ab99b551eda733177be2eef5dbc2997d3fdb357c4ddd760a/ty-0.0.64-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", "sha256": "138d6c37ad4bf8583aa7a9b29d90954151d7856f9910a03eae3eb34b34c57215"}, "x86_64-linux": {"url": "https://files.pythonhosted.org/packages/af/ef/dfb9b7f9bcc032d3b540b0d1f55f532a336e2fb41b1bd539c05ae81a151a/ty-0.0.64-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "sha256": "86db830cb914bb33bb8247b66ccea58de4496c2391bd42658aba744b439f3290"}}},
+    {"id": "uv", "language": "python", "version": "0.11.33", "source": "https://github.com/astral-sh/uv/commit/fece32fc54b0e6fb6a031d3c80397cc4afb25737", "source_digest": "git:fece32fc54b0e6fb6a031d3c80397cc4afb25737", "artifacts": {"aarch64-darwin": {"url": "https://files.pythonhosted.org/packages/4d/e5/17a4e36299e9bd5e8101680be697c7832afac686d1fe8b28be28046c1d95/uv-0.11.33-py3-none-macosx_11_0_arm64.whl", "sha256": "8017991a398a55d177c33ecdb29beb33e7b53969921183e4681e3e5b278d73c2"}, "aarch64-linux": {"url": "https://files.pythonhosted.org/packages/0c/c9/166e7ce2bdb754e5dcb991773f16b54dc1a2339ac78c2a36414cc69db93f/uv-0.11.33-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.musllinux_1_1_aarch64.whl", "sha256": "36a98c68ba5c3bb59469414f54aaf00bd3134a647ca34509bc53d133ed8e0b5d"}, "x86_64-linux": {"url": "https://files.pythonhosted.org/packages/a3/cb/f0ccaba1bf9b0f778dc883e56f3bfb315e3d974ba36fb7432a067b459528/uv-0.11.33-py3-none-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", "sha256": "9542178978b0b6f16a7ae99e55aca039f493a1edb373a15d7993eab80a28615a"}}}
+  ]
 }

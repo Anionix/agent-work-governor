@@ -37,13 +37,11 @@ normalization_reasons = [
 ]
 
 schema_bound_json_contracts = [
-  ".agent-work-governor/toolchain.lock.json=.agent-work-governor/LLM-CONTRACT.md",
   ".codex-plugin/plugin.json=.codex-plugin/LLM-CONTRACT.md",
   "adapters/ask-matt-routes.json=adapters/LLM-CONTRACT.md",
   "references/ask-matt.lock.json=references/LLM-CONTRACT.md",
   "references/canonical-validators.lock.json=references/LLM-CONTRACT.md",
   "references/code-review.lock.json=references/LLM-CONTRACT.md",
   "references/okf-v0.2.lock.json=references/LLM-CONTRACT.md",
-  "rust/toolchain.lock.json=rust/toolchain.lock.LLM-CONTRACT.md",
   "toolchain.lock.json=toolchain.lock.LLM-CONTRACT.md",
 ]
