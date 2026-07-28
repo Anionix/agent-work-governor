@@ -12,7 +12,7 @@ const PLAN_SCHEMA_VERSION: &str = "0.1";
 
 // LLM-CONTRACT
 // id: agent-work-governor.canonical-execution-plan
-// state: RESOLVED_GOVERNANCE_IR -> CANONICAL_EXECUTION_PLAN | PLAN_REJECTED
+// state: RESOLVED_GOVERNANCE_IR + DIGEST_BOUND_LANGUAGE_RECIPES -> CANONICAL_EXECUTION_PLAN | PLAN_REJECTED
 // preconditions: the typed IR and digest-bound adapter recipes are complete and explicit
 // invariant: emit joins exact recipe data and emits canonical bytes without inference or execution
 // failure: emit returns one stable PLAN reason code without bytes or a digest
@@ -23,8 +23,18 @@ const PLAN_SCHEMA_VERSION: &str = "0.1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CanonicalExecutionPlan {
-    pub(crate) canonical_json: Vec<u8>,
-    pub(crate) sha256: String,
+    canonical_json: Vec<u8>,
+    sha256: String,
+}
+
+impl CanonicalExecutionPlan {
+    pub(crate) fn canonical_json(&self) -> &[u8] {
+        &self.canonical_json
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -92,42 +102,10 @@ fn closed_recipes() -> Result<Vec<ExecutionRecipe>, PlanError> {
         crate::python_adapter::execution_recipes().map_err(|_| PlanError::CATALOG_INVALID)?;
     recipes
         .extend(crate::rust_adapter::execution_recipes().map_err(|_| PlanError::CATALOG_INVALID)?);
-    for recipe in &mut recipes {
-        recipe.dependencies.sort();
-        recipe.input_artifacts.sort();
-        recipe.output_artifacts.sort();
-        let metadata = recipe
-            .dependencies
-            .iter()
-            .chain(&recipe.input_artifacts)
-            .chain(&recipe.output_artifacts);
-        let args_are_ascii = recipe.argv.iter().all(|arg| match arg {
-            RecipeArg::Literal(value) | RecipeArg::Artifact { artifact: value } => {
-                !value.is_empty() && value.is_ascii()
-            }
-        });
-        let unique = [
-            &recipe.dependencies,
-            &recipe.input_artifacts,
-            &recipe.output_artifacts,
-        ]
-        .iter()
-        .all(|values| values.windows(2).all(|pair| pair[0] != pair[1]));
-        if recipe.argv.is_empty()
-            || recipe.timeout_seconds == 0
-            || !metadata
-                .into_iter()
-                .all(|value| !value.is_empty() && value.is_ascii())
-            || !args_are_ascii
-            || !unique
-        {
-            return Err(PlanError::CATALOG_INVALID);
-        }
-    }
-    recipes.sort_by(|left, right| left.identifier.cmp(&right.identifier));
+    recipes.sort_by(|left, right| left.identifier().cmp(right.identifier()));
     if recipes
         .windows(2)
-        .any(|pair| pair[0].identifier == pair[1].identifier)
+        .any(|pair| pair[0].identifier() == pair[1].identifier())
     {
         Err(PlanError::CATALOG_INVALID)
     } else {
@@ -140,16 +118,16 @@ fn bind<'a>(
     recipes: &'a [ExecutionRecipe],
 ) -> Result<(&'a ResolvedCheck, &'a ExecutionRecipe), PlanError> {
     let recipe = recipes
-        .binary_search_by(|recipe| recipe.identifier.as_str().cmp(&check.identifier.0))
+        .binary_search_by(|recipe| recipe.identifier().cmp(&check.identifier.0))
         .map(|index| &recipes[index])
         .map_err(|_| PlanError::UNKNOWN_CHECK)?;
-    let dependencies_match = recipe.dependencies.iter().map(String::as_str).eq(check
+    let dependencies_match = recipe.dependencies().iter().map(String::as_str).eq(check
         .dependencies
         .iter()
         .map(|dependency| dependency.0.0.as_str()));
-    if recipe.language == check.language
-        && recipe.kind == check.kind
-        && recipe.tool_identity == check.tool.identity
+    if recipe.language() == check.language
+        && recipe.kind() == check.kind
+        && recipe.tool_identity() == check.tool.identity
         && dependencies_match
     {
         Ok((check, recipe))
@@ -181,15 +159,15 @@ struct PlanCheck<'a> {
 impl<'a> From<(&'a ResolvedCheck, &'a ExecutionRecipe)> for PlanCheck<'a> {
     fn from((check, recipe): (&'a ResolvedCheck, &'a ExecutionRecipe)) -> Self {
         Self {
-            argv: &recipe.argv,
+            argv: recipe.argv(),
             dependencies: &check.dependencies,
             identifier: &check.identifier,
-            input_artifacts: &recipe.input_artifacts,
+            input_artifacts: recipe.input_artifacts(),
             kind: check.kind,
             language: check.language,
-            output_artifacts: &recipe.output_artifacts,
+            output_artifacts: recipe.output_artifacts(),
             path: &check.path,
-            timeout_seconds: recipe.timeout_seconds,
+            timeout_seconds: recipe.timeout_seconds(),
             tool: PlanTool {
                 identity: &check.tool.identity,
                 version: &check.tool.version,

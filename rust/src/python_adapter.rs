@@ -8,7 +8,7 @@ use crate::{
     adapter_catalog::{closed_id, sha256_hex, tool_version},
     governance_ir::{
         CheckDraft, CheckKind, GovernanceIr, Language,
-        execution_recipe::{ExecutionRecipe, RecipeArg},
+        execution_recipe::{ExecutionRecipe, ExecutionRecipeDraft, RecipeArg},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -155,48 +155,47 @@ fn parse_recipe_catalog(bytes: &str) -> Result<Vec<Recipe>, PythonAdapterError> 
 }
 
 pub(crate) fn execution_recipes() -> Result<Vec<ExecutionRecipe>, PythonAdapterError> {
-    parse_recipe_catalog(RECIPE_BYTES).map(|recipes| {
-        recipes
-            .into_iter()
-            .map(|recipe| {
-                match recipe.working_directory {
-                    WorkingDirectory::ProjectRoot => {}
-                }
-                ExecutionRecipe {
-                    argv: recipe
-                        .argv
-                        .into_iter()
-                        .map(|atom| match atom {
-                            ArgAtom::Literal(value) => RecipeArg::Literal(value),
-                            ArgAtom::Artifact { artifact } => RecipeArg::Artifact {
-                                artifact: artifact.as_str().into(),
-                            },
-                        })
-                        .collect(),
-                    dependencies: recipe
-                        .dependencies
-                        .iter()
-                        .map(|dependency| dependency.as_str().into())
-                        .collect(),
-                    identifier: recipe.id.as_str().into(),
-                    input_artifacts: recipe
-                        .input_artifacts
-                        .iter()
-                        .map(|artifact| artifact.as_str().into())
-                        .collect(),
-                    kind: recipe.kind,
-                    language: Language::Python,
-                    output_artifacts: recipe
-                        .output_artifacts
-                        .iter()
-                        .map(|artifact| artifact.as_str().into())
-                        .collect(),
-                    timeout_seconds: recipe.timeout_seconds,
-                    tool_identity: recipe.tool.as_str().into(),
-                }
+    parse_recipe_catalog(RECIPE_BYTES)?
+        .into_iter()
+        .map(|recipe| {
+            match recipe.working_directory {
+                WorkingDirectory::ProjectRoot => {}
+            }
+            let argv = recipe
+                .argv
+                .into_iter()
+                .map(|atom| match atom {
+                    ArgAtom::Literal(value) => RecipeArg::literal(value),
+                    ArgAtom::Artifact { artifact } => RecipeArg::artifact(artifact.as_str().into()),
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| PythonAdapterError::RECIPE_CATALOG_INVALID)?;
+            ExecutionRecipe::resolve(ExecutionRecipeDraft {
+                argv,
+                dependencies: recipe
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.as_str().into())
+                    .collect(),
+                identifier: recipe.id.as_str().into(),
+                input_artifacts: recipe
+                    .input_artifacts
+                    .iter()
+                    .map(|artifact| artifact.as_str().into())
+                    .collect(),
+                kind: recipe.kind,
+                language: Language::Python,
+                output_artifacts: recipe
+                    .output_artifacts
+                    .iter()
+                    .map(|artifact| artifact.as_str().into())
+                    .collect(),
+                timeout_seconds: recipe.timeout_seconds,
+                tool_identity: recipe.tool.as_str().into(),
             })
-            .collect()
-    })
+            .map_err(|_| PythonAdapterError::RECIPE_CATALOG_INVALID)
+        })
+        .collect()
 }
 
 pub(crate) fn adapt_python(
@@ -219,20 +218,29 @@ pub(crate) fn adapt_python(
     let working_directory = project
         .working_directory
         .ok_or(PythonAdapterError::PROJECT_INCOMPLETE)?;
-    let recipes = execution_recipes()?;
+    let recipes = parse_recipe_catalog(RECIPE_BYTES)?;
     let mut drafts = Vec::with_capacity(recipes.len());
 
     for recipe in recipes {
-        let version = tool_version(TOOLCHAIN_BYTES, "python", &recipe.tool_identity)
+        let version = tool_version(TOOLCHAIN_BYTES, "python", recipe.tool.as_str())
             .map_err(|_| PythonAdapterError::TOOLCHAIN_CATALOG_INVALID)?;
+        let recipe_workdir = match recipe.working_directory {
+            WorkingDirectory::ProjectRoot => working_directory.clone(),
+        };
         drafts.push(CheckDraft {
-            identifier: Some(recipe.identifier),
-            language: Some(recipe.language),
+            identifier: Some(recipe.id.as_str().into()),
+            language: Some(Language::Python),
             kind: Some(recipe.kind),
-            tool_identity: Some(recipe.tool_identity),
+            tool_identity: Some(recipe.tool.as_str().into()),
             tool_version: Some(version),
-            path: Some(working_directory.clone()),
-            dependencies: Some(recipe.dependencies),
+            path: Some(recipe_workdir),
+            dependencies: Some(
+                recipe
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.as_str().into())
+                    .collect(),
+            ),
         });
     }
     let governance_ir =

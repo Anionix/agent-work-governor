@@ -8,7 +8,7 @@ use crate::{
     adapter_catalog::{closed_id, sha256_hex, tool_version},
     governance_ir::{
         CheckDraft, CheckKind, GovernanceIr, Language,
-        execution_recipe::{ExecutionRecipe, RecipeArg},
+        execution_recipe::{ExecutionRecipe, ExecutionRecipeDraft, RecipeArg},
     },
 };
 use serde::{Deserialize, Serialize};
@@ -139,31 +139,36 @@ fn parse_rust_recipe_catalog(bytes: &str) -> Result<Vec<Recipe>, RustAdapterErro
 }
 
 pub(crate) fn execution_recipes() -> Result<Vec<ExecutionRecipe>, RustAdapterError> {
-    parse_rust_recipe_catalog(RECIPE_BYTES).map(|recipes| {
-        recipes
-            .into_iter()
-            .map(|recipe| {
-                match recipe.working_directory {
-                    WorkingDirectory::ProjectRoot => {}
-                }
-                ExecutionRecipe {
-                    argv: recipe.argv.into_iter().map(RecipeArg::Literal).collect(),
-                    dependencies: recipe
-                        .dependencies
-                        .iter()
-                        .map(|dependency| dependency.as_str().into())
-                        .collect(),
-                    identifier: recipe.id.as_str().into(),
-                    input_artifacts: Vec::new(),
-                    kind: recipe.kind,
-                    language: Language::Rust,
-                    output_artifacts: Vec::new(),
-                    timeout_seconds: recipe.timeout_seconds,
-                    tool_identity: recipe.tool.as_str().into(),
-                }
+    parse_rust_recipe_catalog(RECIPE_BYTES)?
+        .into_iter()
+        .map(|recipe| {
+            match recipe.working_directory {
+                WorkingDirectory::ProjectRoot => {}
+            }
+            let argv = recipe
+                .argv
+                .into_iter()
+                .map(RecipeArg::literal)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| RustAdapterError::RECIPE_CATALOG_INVALID)?;
+            ExecutionRecipe::resolve(ExecutionRecipeDraft {
+                argv,
+                dependencies: recipe
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.as_str().into())
+                    .collect(),
+                identifier: recipe.id.as_str().into(),
+                input_artifacts: Vec::new(),
+                kind: recipe.kind,
+                language: Language::Rust,
+                output_artifacts: Vec::new(),
+                timeout_seconds: recipe.timeout_seconds,
+                tool_identity: recipe.tool.as_str().into(),
             })
-            .collect()
-    })
+            .map_err(|_| RustAdapterError::RECIPE_CATALOG_INVALID)
+        })
+        .collect()
 }
 
 pub(crate) fn adapt_rust(project: RustProjectDraft) -> Result<RustCheckSet, RustAdapterError> {
@@ -187,19 +192,28 @@ pub(crate) fn adapt_rust(project: RustProjectDraft) -> Result<RustCheckSet, Rust
     let working_directory = project
         .working_directory
         .ok_or(RustAdapterError::PROJECT_INCOMPLETE)?;
-    let recipes = execution_recipes()?;
+    let recipes = parse_rust_recipe_catalog(RECIPE_BYTES)?;
     let mut drafts = Vec::with_capacity(recipes.len());
     for recipe in recipes {
-        let version = tool_version(TOOLCHAIN_BYTES, "rust", &recipe.tool_identity)
+        let version = tool_version(TOOLCHAIN_BYTES, "rust", recipe.tool.as_str())
             .map_err(|_| RustAdapterError::TOOLCHAIN_CATALOG_INVALID)?;
+        let recipe_workdir = match recipe.working_directory {
+            WorkingDirectory::ProjectRoot => working_directory.clone(),
+        };
         drafts.push(CheckDraft {
-            identifier: Some(recipe.identifier),
-            language: Some(recipe.language),
+            identifier: Some(recipe.id.as_str().into()),
+            language: Some(Language::Rust),
             kind: Some(recipe.kind),
-            tool_identity: Some(recipe.tool_identity),
+            tool_identity: Some(recipe.tool.as_str().into()),
             tool_version: Some(version),
-            path: Some(working_directory.clone()),
-            dependencies: Some(recipe.dependencies),
+            path: Some(recipe_workdir),
+            dependencies: Some(
+                recipe
+                    .dependencies
+                    .iter()
+                    .map(|dependency| dependency.as_str().into())
+                    .collect(),
+            ),
         });
     }
     let governance_ir =
