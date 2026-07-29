@@ -649,6 +649,68 @@ class DoctorTests(unittest.TestCase):
                 PLUGIN_ROOT / "scripts/canonical_runtime_runner.py",
                 runner_target,
             )
+
+            fifo_probe = """
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("validate_canonical_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+operation = sys.argv[2]
+expected = sys.argv[3]
+try:
+    if operation == "lock":
+        module.load_lock(Path(sys.argv[4]))
+    elif operation == "runtime":
+        entries = module.load_lock(Path(sys.argv[4]))
+        module.load_runtime(Path(sys.argv[5]), entries)
+    else:
+        raise SystemExit(4)
+except module.CanonicalRuntimeError as error:
+    print(error.code)
+    raise SystemExit(0 if error.code == expected else 2)
+raise SystemExit(3)
+"""
+
+            def run_fifo_probe(*arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-c",
+                        fifo_probe,
+                        str(PLUGIN_ROOT / "scripts/validate_canonical.py"),
+                        *arguments,
+                    ],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                    timeout=2,
+                )
+
+            validator_lock_target = root / "references/canonical-validators.lock.json"
+            os.mkfifo(validator_lock_target)
+            validator_lock_result = run_fifo_probe(
+                "lock",
+                "CANONICAL_VALIDATOR_LOCK_INVALID",
+                str(root),
+            )
+            self.assertEqual(
+                0,
+                validator_lock_result.returncode,
+                validator_lock_result.stderr,
+            )
+            self.assertEqual(
+                "CANONICAL_VALIDATOR_LOCK_INVALID",
+                validator_lock_result.stdout.strip(),
+            )
+            validator_lock_target.unlink()
+
             with self.assertRaises(validate_canonical.CanonicalRuntimeError) as missing:
                 validate_canonical.load_runtime(root, entries)
             self.assertEqual("VALIDATOR_RUNTIME_MISSING", missing.exception.code)
@@ -686,6 +748,21 @@ class DoctorTests(unittest.TestCase):
                 directory_error.exception.code,
             )
 
+            runtime_target.rmdir()
+            os.mkfifo(runtime_target)
+            fifo_result = run_fifo_probe(
+                "runtime",
+                "VALIDATOR_RUNTIME_INVALID",
+                str(PLUGIN_ROOT),
+                str(root),
+            )
+            self.assertEqual(0, fifo_result.returncode, fifo_result.stderr)
+            self.assertEqual(
+                "VALIDATOR_RUNTIME_INVALID",
+                fifo_result.stdout.strip(),
+            )
+
+            runtime_target.unlink()
             lock_target.write_text("{}\n", encoding="utf-8")
             with self.assertRaises(
                 validate_canonical.CanonicalRuntimeError

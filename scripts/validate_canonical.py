@@ -122,7 +122,19 @@ def require_string(entry: dict[str, Any], field: str, key: str) -> str:
 
 def load_lock(plugin_root: Path) -> dict[str, dict[str, str]]:
     lock_path = plugin_root / "references/canonical-validators.lock.json"
-    document = json.loads(lock_path.read_text(encoding="utf-8"))
+    try:
+        document = json.loads(
+            regular_file_bytes(
+                lock_path,
+                maximum=64_000,
+                missing_code="CANONICAL_VALIDATOR_LOCK_MISSING",
+                invalid_code="CANONICAL_VALIDATOR_LOCK_INVALID",
+            )
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CanonicalValidationError(
+            "canonical validator lock JSON is invalid"
+        ) from error
     if not isinstance(document, dict) or document.get("schema_version") != "0.1":
         raise CanonicalValidationError("canonical validator lock schema is invalid")
 
@@ -176,7 +188,12 @@ def regular_file_bytes(
     missing_code: str,
     invalid_code: str,
 ) -> bytes:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    # Primary source: https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html
+    # O_NONBLOCK prevents a FIFO open from waiting for a writer before fstat rejects it.
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    if not isinstance(nonblocking, int):
+        raise CanonicalRuntimeError(f"{invalid_code}: O_NONBLOCK unavailable")
+    flags = os.O_RDONLY | nonblocking | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except FileNotFoundError as error:
@@ -203,7 +220,7 @@ def regular_file_bytes(
 # id: agent-work-governor.canonical-validator-runtime
 # state: RUNTIME_LOCK -> VERIFIED_SNAPSHOTS -> ISOLATED_IMPORT | CLOSED_BLOCKER
 # preconditions: the bundle contains locked builder, runner, and PyYAML archive bytes
-# invariant: missing, symlinked, or digest-mismatched runtime bytes never execute
+# invariant: non-regular, missing, symlinked, or digest-mismatched bytes never execute or block
 # failure: raise a typed fail-closed CanonicalRuntimeError before validator execution
 # source: bundle:references/canonical-runtime.lock.json
 # knowledge: bundle:knowledge/policies/work-governor.md
