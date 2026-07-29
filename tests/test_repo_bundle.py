@@ -752,6 +752,33 @@ class PortableBundleTests(unittest.TestCase):
                 )
                 self.assertIsNotNone(error)
 
+    def test_reference_component_diagnostics_match_rust(self) -> None:
+        corpus_path = (
+            BUNDLE_ROOT
+            / "assets/repository/.agent-work-governor/tests/fixtures"
+            / "reference-component-parity.tsv"
+        )
+        if not corpus_path.is_file():
+            corpus_path = BUNDLE_ROOT / "tests/fixtures/reference-component-parity.tsv"
+        corpus = corpus_path.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            bundle = Path(directory)
+            (bundle / "dir").mkdir()
+            (bundle / "evidence.md").write_text("evidence\n", encoding="utf-8")
+            (bundle / "dir/evidence.md").write_text(
+                "nested evidence\n", encoding="utf-8"
+            )
+            for row in corpus.splitlines():
+                reference, expected = row.split("\t", maxsplit=1)
+                with self.subTest(reference=reference):
+                    _, error = contract_blocks.resolve_contract_reference(
+                        reference,
+                        repo_root=bundle,
+                        bundle_root=bundle,
+                        allow_external=False,
+                    )
+                    self.assertEqual(expected, error)
+
     def test_enforcement_token_ignores_contract_metadata(self) -> None:
         source = "# enforced_by: ghost_symbol\n"
         self.assertFalse(

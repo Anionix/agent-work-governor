@@ -99,13 +99,14 @@ fn safe_relative_path(raw_path: &str) -> Option<Vec<String>> {
     }
 
     let mut parts = Vec::new();
+    // Path components normalize repeated separators, non-leading `.`, and trailing
+    // separators, so validate the decoded syntax before constructing any Path.
+    // Primary source: https://doc.rust-lang.org/1.97.1/std/path/index.html#path-normalization
     for part in decoded.split('/') {
-        if part == ".." {
+        if part.is_empty() || part == "." || part == ".." {
             return None;
         }
-        if !part.is_empty() && part != "." {
-            parts.push(part.to_owned());
-        }
+        parts.push(part.to_owned());
     }
     Some(parts)
 }

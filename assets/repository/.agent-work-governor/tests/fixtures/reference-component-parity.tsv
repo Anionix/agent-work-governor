@@ -1,0 +1,13 @@
+bundle:./evidence.md	reference contains an unsafe path
+bundle:%2e/evidence.md	reference contains an unsafe path
+bundle:dir/./evidence.md	reference contains an unsafe path
+bundle:dir/%2E/evidence.md	reference contains an unsafe path
+bundle:dir//evidence.md	reference contains an unsafe path
+bundle:dir/%2f/evidence.md	reference contains an unsafe path
+bundle:dir%2F%2Fevidence.md	reference contains an unsafe path
+bundle:evidence.md/	reference contains an unsafe path
+bundle:evidence.md/.	reference contains an unsafe path
+bundle:../evidence.md	reference contains an unsafe path
+bundle:%2e%2e/evidence.md	reference contains an unsafe path
+bundle:dir/../evidence.md	reference contains an unsafe path
+bundle:dir/%2E%2E/evidence.md	reference contains an unsafe path
