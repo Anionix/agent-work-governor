@@ -81,8 +81,8 @@ class RepositoryGate(Protocol):
         self,
         root: Path,
         bundle_root: Path,
-        source_path: Path,
         source_text: str,
+        tree_entries: dict[Path, object],
     ) -> list[dict[str, object]]: ...
 
 
@@ -254,19 +254,18 @@ class PortableBundleTests(unittest.TestCase):
         )
 
     def test_bundled_toolchain_sidecar_is_machine_valid(self) -> None:
-        gate = load_gate()
         sidecar = toolchain_contract_path()
         source = sidecar.read_text(encoding="utf-8")
         self.assertIsNone(contract_blocks.contract_diagnostic(source))
-        self.assertEqual(
-            [],
-            gate.contract_reference_errors(
-                BUNDLE_ROOT,
-                BUNDLE_ROOT,
-                sidecar,
-                source,
-            ),
-        )
+        for contract in contract_blocks.parsed_contracts(source):
+            for field in ("source", "knowledge", "test"):
+                _, error = contract_blocks.resolve_contract_reference(
+                    contract[field],
+                    repo_root=BUNDLE_ROOT,
+                    bundle_root=BUNDLE_ROOT,
+                    allow_external=field == "source",
+                )
+                self.assertIsNone(error)
 
     def test_bundled_catalog_has_required_python_and_rust_pins(self) -> None:
         pins, findings = toolchain_catalog.validate_catalog(
@@ -900,6 +899,140 @@ class PortableBundleTests(unittest.TestCase):
             error,
         )
 
+    def test_contract_references_use_exact_head_tree_bytes_and_modes(self) -> None:
+        gate = load_gate()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*arguments: str) -> str:
+                process = subprocess.run(
+                    [
+                        "git",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "-C",
+                        str(root),
+                        *arguments,
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return process.stdout.strip()
+
+            def contract(
+                knowledge_reference: str = "repo:knowledge.md",
+                *,
+                source_reference: str = (
+                    "https://github.com/git/git/blob/"
+                    "13c7afec212fc97ce257d15601659314c6673d6c/"
+                    "Documentation/git-ls-tree.adoc"
+                ),
+                test_reference: str = "repo:tests/test_source.py",
+            ) -> str:
+                return (
+                    "# LLM-CONTRACT\n"
+                    "# id: fixture.tree-references\n"
+                    "# state: REFERENCES -> EXACT_BLOBS\n"
+                    "# preconditions: candidate tree is fixed\n"
+                    "# invariant: ambient evidence is ignored\n"
+                    "# failure: reject missing or non-blob references\n"
+                    f"# source: {source_reference}\n"
+                    f"# knowledge: {knowledge_reference}\n"
+                    "# enforced_by: VALUE\n"
+                    f"# test: {test_reference}\n"
+                    "VALUE = 1\n"
+                )
+
+            def reference_errors() -> list[dict[str, object]]:
+                entries, entry_error = gate.git_tree_entries(root, "HEAD")
+                self.assertIsNone(entry_error)
+                source, source_error = gate.git_tree_text(
+                    root, entries, source_path.resolve()
+                )
+                self.assertIsNone(source_error)
+                self.assertIsNotNone(source)
+                return gate.contract_reference_errors(
+                    root,
+                    bundle,
+                    source or "",
+                    entries,
+                )
+
+            def error_codes() -> set[str]:
+                return {str(item["code"]) for item in reference_errors()}
+
+            git("init", "-b", "main")
+            git("config", "user.name", "Contract Test")
+            git("config", "user.email", "contract@example.invalid")
+            source_path = root / "source.py"
+            knowledge = root / "knowledge.md"
+            test_path = root / "tests/test_source.py"
+            bundle = root / "bundle"
+            test_path.parent.mkdir()
+            bundle.mkdir()
+            source_path.write_text(contract(), encoding="utf-8")
+            knowledge.write_text("status: active\n", encoding="utf-8")
+            test_path.write_text("def test_source(): pass\n", encoding="utf-8")
+            (bundle / "evidence.md").write_text("status: active\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "-m", "baseline")
+            baseline = git("rev-parse", "HEAD")
+
+            git("switch", "-c", "work/deprecated")
+            knowledge.write_text("status: deprecated\n", encoding="utf-8")
+            git("add", knowledge.name)
+            git("commit", "-m", "commit deprecated knowledge")
+            knowledge.write_text("status: active\n", encoding="utf-8")
+            self.assertIn("LLM_CONTRACT_KNOWLEDGE_DEPRECATED", error_codes())
+
+            git("reset", "--hard")
+            git("switch", "-C", "work/missing-test", baseline)
+            git("rm", "tests/test_source.py")
+            git("commit", "-m", "delete candidate test")
+            test_path.parent.mkdir()
+            test_path.write_text("def test_source(): pass\n", encoding="utf-8")
+            self.assertIn("LLM_CONTRACT_TEST_INVALID", error_codes())
+
+            test_path.unlink()
+            git("switch", "-C", "work/symlink", baseline)
+            knowledge.unlink()
+            knowledge.symlink_to("ambient.md")
+            git("add", knowledge.name)
+            git("commit", "-m", "commit knowledge symlink")
+            knowledge.unlink()
+            knowledge.write_text("status: active\n", encoding="utf-8")
+            self.assertIn("LLM_CONTRACT_KNOWLEDGE_INVALID", error_codes())
+
+            git("reset", "--hard")
+            git("switch", "-C", "work/missing-bundle", baseline)
+            source_path.write_text(contract("bundle:evidence.md"), encoding="utf-8")
+            git("rm", "bundle/evidence.md")
+            git("add", source_path.name)
+            git("commit", "-m", "delete candidate bundle evidence")
+            bundle.mkdir()
+            (bundle / "evidence.md").write_text("status: active\n", encoding="utf-8")
+            self.assertIn("LLM_CONTRACT_KNOWLEDGE_INVALID", error_codes())
+
+            (bundle / "evidence.md").unlink()
+            git("reset", "--hard")
+            git("switch", "-C", "work/binary-evidence", baseline)
+            source_path.write_text(
+                contract(
+                    source_reference="repo:primary.pdf",
+                    test_reference="bundle:fixture.bin",
+                ),
+                encoding="utf-8",
+            )
+            (root / "primary.pdf").write_bytes(b"\xff")
+            (bundle / "fixture.bin").write_bytes(b"\xff")
+            git("add", ".")
+            git("commit", "-m", "commit binary evidence")
+            errors = reference_errors()
+            codes = {str(item["code"]) for item in errors}
+            self.assertNotIn("LLM_CONTRACT_SOURCE_INVALID", codes, errors)
+            self.assertNotIn("LLM_CONTRACT_TEST_INVALID", codes, errors)
+
     def test_bundle_reference_is_explicit_and_bounded(self) -> None:
         resolved, error = contract_blocks.resolve_contract_reference(
             "bundle:knowledge/policies/work-governor.md",
@@ -979,16 +1112,17 @@ class PortableBundleTests(unittest.TestCase):
         self.assertEqual("reference escapes its declared root", error)
 
     def test_repository_gate_contract_references_resolve(self) -> None:
-        gate = load_gate()
         source_path = gate_path()
         source = source_path.read_text(encoding="utf-8")
-        errors = gate.contract_reference_errors(
-            BUNDLE_ROOT,
-            BUNDLE_ROOT,
-            source_path,
-            source,
-        )
-        self.assertEqual([], errors)
+        for contract in contract_blocks.parsed_contracts(source):
+            for field in ("source", "knowledge", "test"):
+                _, error = contract_blocks.resolve_contract_reference(
+                    contract[field],
+                    repo_root=BUNDLE_ROOT,
+                    bundle_root=BUNDLE_ROOT,
+                    allow_external=field == "source",
+                )
+                self.assertIsNone(error, (source_path, field))
 
 
 if __name__ == "__main__":
