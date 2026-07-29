@@ -58,6 +58,25 @@ class RepositoryGate(Protocol):
         head_ref: str,
     ) -> tuple[list[Path], str | None]: ...
 
+    def git_tree_entries(
+        self,
+        root: Path,
+        treeish: str,
+    ) -> tuple[dict[Path, object], str | None]: ...
+
+    def git_tree_text(
+        self,
+        root: Path,
+        entries: dict[Path, object],
+        path: Path,
+    ) -> tuple[str | None, str | None]: ...
+
+    def repository_contract_index(
+        self,
+        root: Path,
+        head_ref: str,
+    ) -> tuple[dict[str, list[str]], str | None]: ...
+
     def contract_reference_errors(
         self,
         root: Path,
@@ -722,6 +741,68 @@ class PortableBundleTests(unittest.TestCase):
                 error,
             )
 
+            sidecar.write_text("# untracked replacement\n", encoding="utf-8")
+            paths, error = gate.changed_code_files(root, "origin/main", "HEAD")
+            self.assertEqual([], paths)
+            self.assertEqual(
+                "manifest.LLM-CONTRACT.md: required JSON contract sidecar was deleted",
+                error,
+            )
+            sidecar.unlink()
+
+            git("switch", "-C", "work/untracked-fallback", "origin/main")
+            git("rm", sidecar.name)
+            git("commit", "-m", "delete sidecar with ambient fallback")
+            fallback = root / "LLM-CONTRACT.md"
+            fallback.write_text("# untracked fallback\n", encoding="utf-8")
+            paths, error = gate.changed_code_files(root, "origin/main", "HEAD")
+            self.assertEqual([], paths)
+            self.assertEqual(
+                "manifest.LLM-CONTRACT.md: required JSON contract sidecar was deleted",
+                error,
+            )
+            fallback.unlink()
+
+            git("switch", "-C", "work/tracked-fallback", "origin/main")
+            git("rm", sidecar.name)
+            fallback.write_text(
+                "# LLM-CONTRACT\n"
+                "# id: fixture.tracked-fallback\n"
+                "# state: SOURCE -> VALIDATED\n"
+                "# preconditions: candidate tree is fixed\n"
+                "# invariant: only tracked evidence is accepted\n"
+                "# failure: reject missing contract evidence\n"
+                "# source: bundle:fixture\n"
+                "# knowledge: bundle:fixture\n"
+                "# enforced_by: fixture\n"
+                "# test: bundle:fixture\n",
+                encoding="utf-8",
+            )
+            git("add", fallback.name)
+            git("commit", "-m", "replace sidecar with tracked fallback")
+            paths, error = gate.changed_code_files(root, "origin/main", "HEAD")
+            self.assertIsNone(error)
+            self.assertEqual([fallback.resolve()], paths)
+            self.assertIsNone(
+                contract_blocks.contract_diagnostic(
+                    fallback.read_text(encoding="utf-8")
+                )
+            )
+
+            git("switch", "-C", "work/malformed-fallback", "origin/main")
+            git("rm", sidecar.name)
+            fallback.write_text("# malformed tracked fallback\n", encoding="utf-8")
+            git("add", fallback.name)
+            git("commit", "-m", "replace sidecar with malformed fallback")
+            paths, error = gate.changed_code_files(root, "origin/main", "HEAD")
+            self.assertIsNone(error)
+            self.assertEqual([fallback.resolve()], paths)
+            self.assertIsNotNone(
+                contract_blocks.contract_diagnostic(
+                    fallback.read_text(encoding="utf-8")
+                )
+            )
+
             git("switch", "-C", "work/delete-both", "origin/main")
             git("rm", manifest.name, sidecar.name)
             git("commit", "-m", "delete governed JSON and sidecar")
@@ -729,6 +810,95 @@ class PortableBundleTests(unittest.TestCase):
 
         self.assertEqual([], paths)
         self.assertIsNone(error)
+
+    def test_contract_authority_uses_exact_head_tree_bytes_and_modes(self) -> None:
+        gate = load_gate()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*arguments: str) -> None:
+                subprocess.run(
+                    [
+                        "git",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "-C",
+                        str(root),
+                        *arguments,
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+
+            valid_contract = (
+                "# LLM-CONTRACT\n"
+                "# id: fixture.valid-head\n"
+                "# state: SOURCE -> VALIDATED\n"
+                "# preconditions: candidate tree is fixed\n"
+                "# invariant: only committed bytes are accepted\n"
+                "# failure: reject ambient replacement evidence\n"
+                "# source: bundle:fixture\n"
+                "# knowledge: bundle:fixture\n"
+                "# enforced_by: fixture\n"
+                "# test: bundle:fixture\n"
+            )
+            git("init", "-b", "main")
+            git("config", "user.name", "Contract Test")
+            git("config", "user.email", "contract@example.invalid")
+            manifest = root / "manifest.json"
+            sidecar = root / "manifest.LLM-CONTRACT.md"
+            manifest.write_text('{"schema_version":"0.1"}\n', encoding="utf-8")
+            sidecar.write_text(valid_contract, encoding="utf-8")
+            git("add", manifest.name, sidecar.name)
+            git("commit", "-m", "baseline")
+            git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+            git("switch", "-c", "work/malformed-head")
+            sidecar.write_text("# malformed committed contract\n", encoding="utf-8")
+            git("add", sidecar.name)
+            git("commit", "-m", "commit malformed contract")
+            sidecar.write_text(valid_contract, encoding="utf-8")
+
+            paths, error = gate.changed_code_files(root, "origin/main", "HEAD")
+            self.assertIsNone(error)
+            self.assertEqual([sidecar.resolve()], paths)
+            entries, error = gate.git_tree_entries(root, "HEAD")
+            self.assertIsNone(error)
+            source, error = gate.git_tree_text(root, entries, sidecar.resolve())
+            self.assertIsNone(error)
+            self.assertIsNotNone(source)
+            self.assertIsNotNone(contract_blocks.contract_diagnostic(source or ""))
+            self.assertIsNone(
+                contract_blocks.contract_diagnostic(sidecar.read_text(encoding="utf-8"))
+            )
+
+            git("reset", "--hard", "HEAD")
+            git("switch", "-C", "work/index-only", "origin/main")
+            staged_contract = valid_contract.replace(
+                "fixture.valid-head", "fixture.index-only"
+            )
+            sidecar.write_text(staged_contract, encoding="utf-8")
+            git("add", sidecar.name)
+            index, error = gate.repository_contract_index(root, "HEAD")
+            self.assertIsNone(error)
+            self.assertIn("fixture.valid-head", index)
+            self.assertNotIn("fixture.index-only", index)
+
+            git("reset", "--hard", "origin/main")
+            git("switch", "-C", "work/symlink-head", "origin/main")
+            sidecar.unlink()
+            sidecar.symlink_to("ambient-contract.md")
+            git("add", sidecar.name)
+            git("commit", "-m", "replace contract with symlink")
+            sidecar.unlink()
+            sidecar.write_text(valid_contract, encoding="utf-8")
+            paths, error = gate.changed_code_files(root, "origin/main", "HEAD")
+
+        self.assertEqual([], paths)
+        self.assertEqual(
+            "manifest.LLM-CONTRACT.md: contract source is not a regular Git blob",
+            error,
+        )
 
     def test_bundle_reference_is_explicit_and_bounded(self) -> None:
         resolved, error = contract_blocks.resolve_contract_reference(
