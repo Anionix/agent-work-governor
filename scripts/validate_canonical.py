@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -37,45 +38,26 @@ MAX_VALIDATOR_BYTES = 1_000_000
 MAX_RUNTIME_BYTES = 512_000
 SOURCE_REPOSITORY = "https://github.com/openai/codex"
 RAW_PREFIX = "https://raw.githubusercontent.com/openai/codex"
-RUNTIME_SOURCE_URL = (
-    "https://files.pythonhosted.org/packages/05/8e/"
-    "961c0007c59b8dd7729d542c61a4d537767a59645b82a0b521206e1e25c2/"
-    "pyyaml-6.0.3.tar.gz"
-)
-RUNTIME_SOURCE_SHA256 = (
-    "d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f"
-)
-RUNTIME_ARCHIVE_SHA256 = (
-    "ead6da5d6b270fe2c9064c9e5e76c36e585148ad1eb8d3ed4c60968bfce25cf5"
-)
-RUNTIME_BUILDER_SHA256 = (
-    "8cda6d67649ac6480a095299de868d950e63dd99cc7ef7aa2cd4dc1ff49da471"
-)
-RUNTIME_ARCHIVE_SIZE = 216_586
 RUNTIME_RELATIVE_PATH = "vendor/pyyaml-6.0.3.zip"
 RUNTIME_BUILDER_PATH = "scripts/package_canonical_runtime.py"
 RUNTIME_RUNNER_PATH = "scripts/canonical_runtime_runner.py"
-RUNTIME_RUNNER_SHA256 = (
-    "eb7208955f06fe025962e3fa2631342106c18de2529a8a6842bf14146b2c5949"
-)
-RUNTIME_LOCK = {
-    "distribution": "PyYAML",
-    "version": "6.0.3",
-    "relative_path": RUNTIME_RELATIVE_PATH,
-    "sha256": RUNTIME_ARCHIVE_SHA256,
-    "size": RUNTIME_ARCHIVE_SIZE,
-    "source_url": RUNTIME_SOURCE_URL,
-    "source_sha256": RUNTIME_SOURCE_SHA256,
-    "license": "MIT",
-    "license_member": "PyYAML-LICENSE",
-    "builder_path": RUNTIME_BUILDER_PATH,
-    "builder_sha256": RUNTIME_BUILDER_SHA256,
-    "runner_path": RUNTIME_RUNNER_PATH,
-    "runner_sha256": RUNTIME_RUNNER_SHA256,
-    "compatible_validator_sha256": [
-        "6cc9dc3199c935916cf6f73fcbbbb0e3bb1b58c8f5109fefa499978908164f51",
-        "ebda00d55d7518b127f675f062fb5c6e7a1ffdc0a99df1a55ac594400d7d3228",
-    ],
+RUNTIME_DEPENDENCY = {
+    "name": "pyyaml",
+    "group": "runtime-build",
+    "lock_path": "uv.lock",
+}
+RUNTIME_FIELDS = {
+    "builder_path",
+    "builder_sha256",
+    "compatible_validator_sha256",
+    "distribution",
+    "license",
+    "license_member",
+    "relative_path",
+    "runner_path",
+    "runner_sha256",
+    "sha256",
+    "size",
 }
 
 
@@ -100,6 +82,16 @@ class RuntimeSnapshot:
     runner: bytes
     sha256: str
     relative_path: str
+
+
+@dataclass(frozen=True)
+class RuntimeContract:
+    """Validated runtime artifact identities."""
+
+    sha256: str
+    size: int
+    builder_sha256: str
+    runner_sha256: str
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -216,10 +208,138 @@ def regular_file_bytes(
         os.close(descriptor)
 
 
+def validate_pyyaml_lock(plugin_root: Path) -> None:
+    try:
+        lock = tomllib.loads(
+            regular_file_bytes(
+                plugin_root / RUNTIME_DEPENDENCY["lock_path"],
+                maximum=2_000_000,
+                missing_code="VALIDATOR_RUNTIME_DEPENDENCY_LOCK_MISSING",
+                invalid_code="VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID",
+            ).decode()
+        )
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise CanonicalRuntimeError(
+            "VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID"
+        ) from error
+    packages = lock.get("package")
+    if not isinstance(packages, list):
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID")
+    roots = [
+        entry
+        for entry in packages
+        if isinstance(entry, dict)
+        and entry.get("name") == "agent-work-governor"
+        and entry.get("source") == {"virtual": "."}
+    ]
+    dependencies = [
+        entry
+        for entry in packages
+        if isinstance(entry, dict) and entry.get("name") == RUNTIME_DEPENDENCY["name"]
+    ]
+    if len(roots) != 1 or len(dependencies) != 1:
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID")
+    dependency = dependencies[0]
+    version = dependency.get("version")
+    sdist = dependency.get("sdist")
+    if (
+        not isinstance(version, str)
+        or not isinstance(sdist, dict)
+        or dependency.get("source") != {"registry": "https://pypi.org/simple"}
+    ):
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID")
+    expected_group = [{"name": RUNTIME_DEPENDENCY["name"]}]
+    expected_requirement = [
+        {"name": RUNTIME_DEPENDENCY["name"], "specifier": f"=={version}"}
+    ]
+    root = roots[0]
+    groups = root.get("dev-dependencies")
+    metadata = root.get("metadata")
+    requirements = metadata.get("requires-dev") if isinstance(metadata, dict) else None
+    if (
+        not isinstance(groups, dict)
+        or groups.get(RUNTIME_DEPENDENCY["group"]) != expected_group
+        or not isinstance(requirements, dict)
+        or requirements.get(RUNTIME_DEPENDENCY["group"]) != expected_requirement
+    ):
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID")
+    source_url = sdist.get("url")
+    source_hash = sdist.get("hash")
+    source_size = sdist.get("size")
+    if (
+        not isinstance(source_url, str)
+        or not source_url.startswith("https://files.pythonhosted.org/packages/")
+        or not source_url.endswith(f"/pyyaml-{version}.tar.gz")
+        or not isinstance(source_hash, str)
+        or not source_hash.startswith("sha256:")
+        or SHA256_RE.fullmatch(source_hash.removeprefix("sha256:")) is None
+        or not isinstance(source_size, int)
+        or isinstance(source_size, bool)
+        or not 0 < source_size <= 2_000_000
+    ):
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID")
+
+
+def load_runtime_contract(
+    plugin_root: Path,
+    validator_entries: dict[str, dict[str, str]],
+) -> RuntimeContract:
+    try:
+        document = json.loads(
+            regular_file_bytes(
+                plugin_root / "references/canonical-runtime.lock.json",
+                maximum=64_000,
+                missing_code="VALIDATOR_RUNTIME_LOCK_MISSING",
+                invalid_code="VALIDATOR_RUNTIME_LOCK_INVALID",
+            )
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID") from error
+    if (
+        not isinstance(document, dict)
+        or set(document) != {"schema_version", "dependency", "runtime"}
+        or document.get("schema_version") != "0.2"
+        or document.get("dependency") != RUNTIME_DEPENDENCY
+        or not isinstance(document.get("runtime"), dict)
+    ):
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID")
+    runtime = document["runtime"]
+    compatible = sorted(entry["sha256"] for entry in validator_entries.values())
+    if (
+        set(runtime) != RUNTIME_FIELDS
+        or runtime.get("distribution") != "PyYAML"
+        or runtime.get("license") != "MIT"
+        or runtime.get("license_member") != "PyYAML-LICENSE"
+        or runtime.get("relative_path") != RUNTIME_RELATIVE_PATH
+        or runtime.get("builder_path") != RUNTIME_BUILDER_PATH
+        or runtime.get("runner_path") != RUNTIME_RUNNER_PATH
+        or runtime.get("compatible_validator_sha256") != compatible
+    ):
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID")
+    for field in ("sha256", "builder_sha256", "runner_sha256"):
+        value = runtime.get(field)
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID")
+    size = runtime.get("size")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or not 0 < size <= MAX_RUNTIME_BYTES
+    ):
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID")
+    validate_pyyaml_lock(plugin_root)
+    return RuntimeContract(
+        sha256=runtime["sha256"],
+        size=runtime["size"],
+        builder_sha256=runtime["builder_sha256"],
+        runner_sha256=runtime["runner_sha256"],
+    )
+
+
 # LLM-CONTRACT
 # id: agent-work-governor.canonical-validator-runtime
-# state: RUNTIME_LOCK -> VERIFIED_SNAPSHOTS -> ISOLATED_IMPORT | CLOSED_BLOCKER
-# preconditions: the bundle contains locked builder, runner, and PyYAML archive bytes
+# state: DEPENDENCY_LOCK + RUNTIME_LOCK -> VERIFIED_SNAPSHOTS -> ISOLATED_IMPORT | CLOSED_BLOCKER
+# preconditions: the bundle contains uv-locked provenance plus builder, runner, and archive bytes
 # invariant: non-regular, missing, symlinked, or digest-mismatched bytes never execute or block
 # failure: raise a typed fail-closed CanonicalRuntimeError before validator execution
 # source: bundle:references/canonical-runtime.lock.json
@@ -230,23 +350,7 @@ def load_runtime(
     plugin_root: Path,
     validator_entries: dict[str, dict[str, str]],
 ) -> RuntimeSnapshot:
-    lock_path = plugin_root / "references/canonical-runtime.lock.json"
-    try:
-        document = json.loads(
-            regular_file_bytes(
-                lock_path,
-                maximum=64_000,
-                missing_code="VALIDATOR_RUNTIME_LOCK_MISSING",
-                invalid_code="VALIDATOR_RUNTIME_LOCK_INVALID",
-            )
-        )
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID") from error
-
-    compatible = sorted(entry["sha256"] for entry in validator_entries.values())
-    expected = {**RUNTIME_LOCK, "compatible_validator_sha256": compatible}
-    if document != {"schema_version": "0.1", "runtime": expected}:
-        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID")
+    runtime = load_runtime_contract(plugin_root, validator_entries)
 
     builder = regular_file_bytes(
         plugin_root / RUNTIME_BUILDER_PATH,
@@ -254,7 +358,7 @@ def load_runtime(
         missing_code="VALIDATOR_RUNTIME_BUILDER_MISSING",
         invalid_code="VALIDATOR_RUNTIME_BUILDER_INVALID",
     )
-    if sha256_bytes(builder) != RUNTIME_BUILDER_SHA256:
+    if sha256_bytes(builder) != runtime.builder_sha256:
         raise CanonicalRuntimeError("VALIDATOR_RUNTIME_BUILDER_DIGEST_MISMATCH")
 
     runner = regular_file_bytes(
@@ -263,7 +367,7 @@ def load_runtime(
         missing_code="VALIDATOR_RUNTIME_RUNNER_MISSING",
         invalid_code="VALIDATOR_RUNTIME_RUNNER_INVALID",
     )
-    if sha256_bytes(runner) != RUNTIME_RUNNER_SHA256:
+    if sha256_bytes(runner) != runtime.runner_sha256:
         raise CanonicalRuntimeError("VALIDATOR_RUNTIME_RUNNER_DIGEST_MISMATCH")
 
     payload = regular_file_bytes(
@@ -273,7 +377,7 @@ def load_runtime(
         invalid_code="VALIDATOR_RUNTIME_INVALID",
     )
     observed = sha256_bytes(payload)
-    if len(payload) != RUNTIME_ARCHIVE_SIZE or observed != RUNTIME_ARCHIVE_SHA256:
+    if len(payload) != runtime.size or observed != runtime.sha256:
         raise CanonicalRuntimeError("VALIDATOR_RUNTIME_DIGEST_MISMATCH")
     return RuntimeSnapshot(payload, runner, observed, RUNTIME_RELATIVE_PATH)
 

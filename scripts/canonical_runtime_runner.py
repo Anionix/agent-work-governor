@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import sys
 from pathlib import Path
 
@@ -37,8 +38,7 @@ def main(argv: list[str]) -> int:
 
     sys.path.insert(0, runtime)
     try:
-        import yaml
-
+        yaml = importlib.import_module("yaml")
         origin = getattr(yaml, "__file__", None)
         isolated = (
             isinstance(origin, str)

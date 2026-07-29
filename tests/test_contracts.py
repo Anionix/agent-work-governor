@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import tomllib
 import unittest
@@ -628,6 +629,54 @@ class DoctorTests(unittest.TestCase):
             blocked.exception.code,
         )
 
+    def test_canonical_runtime_rebuild_rejects_lock_drift(self) -> None:
+        source = io.BytesIO()
+        with tarfile.open(fileobj=source, mode="w:gz") as archive:
+            for output_name in package_canonical_runtime.ARCHIVE_MEMBERS:
+                source_name = (
+                    "pyyaml-6.0.3/LICENSE"
+                    if output_name == "PyYAML-LICENSE"
+                    else f"pyyaml-6.0.3/lib/{output_name}"
+                )
+                payload = f"# {output_name}\n".encode()
+                member = tarfile.TarInfo(source_name)
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+        source_bytes = source.getvalue()
+        source_sha256 = hashlib.sha256(source_bytes).hexdigest()
+
+        with self.assertRaisesRegex(ValueError, "source size mismatch"):
+            package_canonical_runtime.build_archive(
+                source_bytes,
+                source_sha256,
+                len(source_bytes) + 1,
+                "6.0.3",
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "pyyaml.tar.gz"
+            output_path = root / "runtime.zip"
+            source_path.write_bytes(source_bytes)
+            with contextlib.redirect_stderr(io.StringIO()):
+                result = package_canonical_runtime.main(
+                    [
+                        "--source",
+                        str(source_path),
+                        "--source-sha256",
+                        source_sha256,
+                        "--source-size",
+                        str(len(source_bytes)),
+                        "--version",
+                        "6.0.3",
+                        "--output",
+                        str(output_path),
+                        "--expected-sha256",
+                        "0" * 64,
+                    ]
+                )
+            self.assertEqual(1, result)
+            self.assertFalse(output_path.exists())
+
     def test_canonical_runtime_faults_are_typed_and_fail_closed(self) -> None:
         entries = validate_canonical.load_lock(PLUGIN_ROOT)
         with tempfile.TemporaryDirectory() as directory:
@@ -638,6 +687,8 @@ class DoctorTests(unittest.TestCase):
                 PLUGIN_ROOT / "references/canonical-runtime.lock.json",
                 lock_target,
             )
+            dependency_lock_target = root / "uv.lock"
+            shutil.copy2(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
             builder_target = root / "scripts/package_canonical_runtime.py"
             builder_target.parent.mkdir()
             shutil.copy2(
@@ -763,6 +814,36 @@ raise SystemExit(3)
             )
 
             runtime_target.unlink()
+            dependency_lock_target.write_text(
+                'version = 1\n[[package]]\nname = "agent-work-governor"\n',
+                encoding="utf-8",
+            )
+            with self.assertRaises(
+                validate_canonical.CanonicalRuntimeError
+            ) as dependency_lock:
+                validate_canonical.load_runtime(root, entries)
+            self.assertEqual(
+                "VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID",
+                dependency_lock.exception.code,
+            )
+            shutil.copy2(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
+            dependency_lock_target.write_text(
+                dependency_lock_target.read_text(encoding="utf-8").replace(
+                    'name = "pyyaml"\nversion = "6.0.3"',
+                    'name = "pyyaml"\nversion = "6.0.4"',
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(
+                validate_canonical.CanonicalRuntimeError
+            ) as identity_drift:
+                validate_canonical.load_runtime(root, entries)
+            self.assertEqual(
+                "VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID",
+                identity_drift.exception.code,
+            )
+            shutil.copy2(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
             lock_target.write_text("{}\n", encoding="utf-8")
             with self.assertRaises(
                 validate_canonical.CanonicalRuntimeError
@@ -781,6 +862,7 @@ raise SystemExit(3)
                 Path("references/canonical-runtime.lock.json"),
                 Path("scripts/canonical_runtime_runner.py"),
                 Path("scripts/package_canonical_runtime.py"),
+                Path("uv.lock"),
                 Path("vendor/pyyaml-6.0.3.zip"),
             ):
                 target = root / relative

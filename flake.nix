@@ -19,6 +19,9 @@
     }:
     let
       fail = code: detail: throw "${code}${if detail == "" then "" else ":${detail}"}";
+      exactlyOne =
+        code: detail: values:
+        if builtins.length values == 1 then builtins.head values else fail code detail;
       catalogResult = builtins.tryEval (builtins.fromJSON (builtins.readFile ./toolchain.lock.json));
       catalog =
         if
@@ -441,7 +444,7 @@
           pyreflyVersion = (pinFor "python" "pyrefly").version;
           rustCommit = gitCommit "rust" "rust";
           cargoCommit = gitCommit "rust" "cargo";
-          python = pythonBase.withPackages (packages: [ packages.pyyaml ]);
+          python = pythonBase;
           actionlint = bindNixPackage "nix" "actionlint" "actionlint" pkgs.actionlint;
           cargoAudit = bindNixPackage "rust" "cargo-audit" "cargo-audit" pkgs.cargo-audit;
           cargoDeny = bindNixPackage "rust" "cargo-deny" "cargo-deny" pkgs.cargo-deny;
@@ -473,6 +476,50 @@
         pkgs:
         let
           toolchain = mkToolchain pkgs;
+          uvDocument = builtins.fromTOML (builtins.readFile ./uv.lock);
+          pyyaml = exactlyOne "PYYAML_PACKAGE_LOCK_INVALID" "" (
+            builtins.filter (entry: builtins.isAttrs entry && (entry.name or null) == "pyyaml") (
+              uvDocument.package or [ ]
+            )
+          );
+          runtimeDocument = builtins.fromJSON (builtins.readFile ./references/canonical-runtime.lock.json);
+          runtime = runtimeDocument.runtime or { };
+          sdist = pyyaml.sdist or { };
+          sourceIdentityValid =
+            builtins.isString (pyyaml.version or null)
+            && builtins.match "[0-9]+(\\.[0-9]+){1,3}" pyyaml.version != null
+            && builtins.isString (sdist.url or null)
+            &&
+              builtins.match "https://files.pythonhosted.org/packages/.+/pyyaml-${pyyaml.version}\\.tar\\.gz" sdist.url
+              != null
+            && builtins.isString (sdist.hash or null)
+            && builtins.match "sha256:[0-9a-f]{64}" sdist.hash != null
+            && builtins.isInt (sdist.size or null)
+            && sdist.size > 0
+            && sdist.size <= 2000000;
+          pyyamlSource =
+            if sourceIdentityValid then
+              pkgs.fetchurl {
+                url = sdist.url;
+                sha256 = builtins.substring 7 64 sdist.hash;
+              }
+            else
+              fail "PYYAML_SOURCE_LOCK_INVALID" "";
+          canonicalRuntime =
+            pkgs.runCommand "agent-work-governor-pyyaml-runtime"
+              {
+                nativeBuildInputs = [ toolchain.python ];
+              }
+              ''
+                python ${./scripts/package_canonical_runtime.py} \
+                  --source ${pyyamlSource} \
+                  --source-sha256 ${pkgs.lib.escapeShellArg (builtins.substring 7 64 sdist.hash)} \
+                  --source-size ${pkgs.lib.escapeShellArg (toString sdist.size)} \
+                  --version ${pkgs.lib.escapeShellArg pyyaml.version} \
+                  --output "$out" \
+                  --expected-sha256 ${pkgs.lib.escapeShellArg runtime.sha256}
+                test "$(wc -c < "$out")" -eq ${pkgs.lib.escapeShellArg (toString runtime.size)}
+              '';
           rustPlatform = pkgs.makeRustPlatform {
             cargo = toolchain.rust;
             rustc = toolchain.rust;
@@ -538,6 +585,7 @@
               assert_locked_identity pyrefly \
                 "$(pyrefly --version | awk '{print $2}')" \
                 "${toolchain.pyreflyVersion}"
+              cmp "${canonicalRuntime}" vendor/pyyaml-6.0.3.zip
               cd rust
               cargo fmt --check
               cargo clippy --all-targets --all-features --offline -- -D warnings
@@ -626,10 +674,10 @@
 
 # LLM-CONTRACT
 # id: agent-work-governor.unified-nix-environment
-# state: CATALOG_BYTES -> VALIDATED_IDENTITIES -> REPRODUCIBLE_SHELL | TOOLCHAIN_LOCK_REJECTED | BUILD_FAILURE
-# preconditions: toolchain.lock.json, flake.lock, and Cargo.lock are present
-# invariant: every catalogued Nix package, Rust release, and wheel artifact matches one exact identity
-# failure: stable TOOLCHAIN_* evaluation error or a Nix dependency, build, or test failure
+# state: TOOLCHAIN + UV_RUNTIME_LOCKS -> VALIDATED_IDENTITIES + REBUILT_RUNTIME -> REPRODUCIBLE_SHELL | CLOSED_FAILURE
+# preconditions: toolchain.lock.json, uv.lock, canonical-runtime.lock.json, flake.lock, and Cargo.lock are present
+# invariant: every tool and the vendored PyYAML runtime match their exact locked identities
+# failure: stable TOOLCHAIN_* or PYYAML_* error, or a Nix dependency, build, or test failure
 # source: https://github.com/NixOS/nix/blob/2c6d06e9387cf58167cb5a7ab91cee7333d8d17c/src/nix/flake.md
 # knowledge: bundle:knowledge/policies/work-governor.md
 # enforced_by: checks
