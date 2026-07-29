@@ -827,12 +827,23 @@ raise SystemExit(3)
                 dependency_lock.exception.code,
             )
             shutil.copy2(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
+            coherent_drift = dependency_lock_target.read_text(encoding="utf-8").replace(
+                'runtime-build = [{ name = "pyyaml", specifier = "==6.0.3" }]',
+                'runtime-build = [{ name = "pyyaml", specifier = "==6.0.4" }]',
+                1,
+            )
+            coherent_drift = coherent_drift.replace(
+                'name = "pyyaml"\nversion = "6.0.3"',
+                'name = "pyyaml"\nversion = "6.0.4"',
+                1,
+            )
+            coherent_drift = coherent_drift.replace(
+                "/pyyaml-6.0.3.tar.gz",
+                "/pyyaml-6.0.4.tar.gz",
+                1,
+            )
             dependency_lock_target.write_text(
-                dependency_lock_target.read_text(encoding="utf-8").replace(
-                    'name = "pyyaml"\nversion = "6.0.3"',
-                    'name = "pyyaml"\nversion = "6.0.4"',
-                    1,
-                ),
+                coherent_drift,
                 encoding="utf-8",
             )
             with self.assertRaises(
@@ -840,7 +851,7 @@ raise SystemExit(3)
             ) as identity_drift:
                 validate_canonical.load_runtime(root, entries)
             self.assertEqual(
-                "VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID",
+                "VALIDATOR_RUNTIME_DEPENDENCY_IDENTITY_MISMATCH",
                 identity_drift.exception.code,
             )
             shutil.copy2(PLUGIN_ROOT / "uv.lock", dependency_lock_target)

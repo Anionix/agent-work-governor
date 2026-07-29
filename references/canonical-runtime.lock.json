@@ -14,6 +14,7 @@
     "license_member": "PyYAML-LICENSE",
     "builder_path": "scripts/package_canonical_runtime.py",
     "builder_sha256": "2d0cefdab14d355f98418a21f0f8dd855ed5ca6dcbfe6474a247e139db48357e",
+    "dependency_identity_sha256": "93f2437030e54874ebe2cf9dbdbbeaac053758cc1c2c7480aae8fc94ea5a7bda",
     "runner_path": "scripts/canonical_runtime_runner.py",
     "runner_sha256": "e17ab6055933bf406debd7e3292db8af74feed0bcf22e970079356f4039077c9",
     "compatible_validator_sha256": [

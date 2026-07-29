@@ -50,6 +50,7 @@ RUNTIME_FIELDS = {
     "builder_path",
     "builder_sha256",
     "compatible_validator_sha256",
+    "dependency_identity_sha256",
     "distribution",
     "license",
     "license_member",
@@ -208,7 +209,17 @@ def regular_file_bytes(
         os.close(descriptor)
 
 
-def validate_pyyaml_lock(plugin_root: Path) -> None:
+# LLM-CONTRACT
+# id: agent-work-governor.pyyaml-dependency-identity
+# state: UV_LOCK_BYTES -> VALIDATED_SOURCE_IDENTITY -> CANONICAL_DIGEST | CLOSED_FAILURE
+# preconditions: uv.lock contains one project root and one PyYAML source package
+# invariant: version, registry, sdist, and runtime-build requirement have one stable digest
+# failure: reject malformed, duplicate, or contradictory lock state before runtime admission
+# source: bundle:uv.lock
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: pyyaml_identity_sha256
+# test: bundle:tests/test_contracts.py
+def pyyaml_identity_sha256(plugin_root: Path) -> str:
     try:
         lock = tomllib.loads(
             regular_file_bytes(
@@ -278,6 +289,20 @@ def validate_pyyaml_lock(plugin_root: Path) -> None:
         or not 0 < source_size <= 2_000_000
     ):
         raise CanonicalRuntimeError("VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID")
+    identity = {
+        "group": RUNTIME_DEPENDENCY["group"],
+        "name": RUNTIME_DEPENDENCY["name"],
+        "registry": "https://pypi.org/simple",
+        "sdist": {
+            "hash": source_hash,
+            "size": source_size,
+            "url": source_url,
+        },
+        "version": version,
+    }
+    return sha256_bytes(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    )
 
 
 def load_runtime_contract(
@@ -316,7 +341,12 @@ def load_runtime_contract(
         or runtime.get("compatible_validator_sha256") != compatible
     ):
         raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID")
-    for field in ("sha256", "builder_sha256", "runner_sha256"):
+    for field in (
+        "sha256",
+        "builder_sha256",
+        "runner_sha256",
+        "dependency_identity_sha256",
+    ):
         value = runtime.get(field)
         if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
             raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID")
@@ -327,7 +357,9 @@ def load_runtime_contract(
         or not 0 < size <= MAX_RUNTIME_BYTES
     ):
         raise CanonicalRuntimeError("VALIDATOR_RUNTIME_LOCK_INVALID")
-    validate_pyyaml_lock(plugin_root)
+    dependency_identity = pyyaml_identity_sha256(plugin_root)
+    if runtime["dependency_identity_sha256"] != dependency_identity:
+        raise CanonicalRuntimeError("VALIDATOR_RUNTIME_DEPENDENCY_IDENTITY_MISMATCH")
     return RuntimeContract(
         sha256=runtime["sha256"],
         size=runtime["size"],
