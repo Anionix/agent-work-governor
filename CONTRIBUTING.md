@@ -10,6 +10,9 @@ GitHub Issues are the work specification. Pick an Issue marked
    executable configuration.
 4. Run `nix flake check --no-update-lock-file --no-write-lock-file` and
    task-specific checks.
+   If `flake.nix` or `flake.lock` changes, also regenerate the candidate lock
+   into a temporary `--output-lock-file` with registries disabled and require
+   byte equality. Commit a lock diff only when regeneration changes its bytes.
 5. Review the final commit with the code-review skill and write its ignored
    receipt under `.governance/receipts/`.
 6. Open one squash-merge PR, targeting roughly 200 product-diff lines.
