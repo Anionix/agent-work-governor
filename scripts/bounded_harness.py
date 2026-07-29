@@ -32,6 +32,9 @@ from typing import Any, cast
 MAX_OUTPUT = MAX_PLAN = 1_048_576
 TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 DIGEST = re.compile(r"^[0-9a-f]{64}$")
+NIX_WRAPPER_TARGET = re.compile(
+    r"^NIX_(?:CC|BINTOOLS)_WRAPPER_TARGET_(?:BUILD|HOST)_[A-Za-z0-9_]+$"
+)
 REPORT_FIELDS = {
     "bindings",
     "execution_plan",
@@ -330,8 +333,17 @@ def _isolation_identity() -> RunIdentity:
 def _candidate_environment(
     artifacts: Path, cargo_home: Path | None = None
 ) -> dict[str, str]:
+    # LLM contract: trusted Nix shell + wrapper target marker -> preserved
+    # compiler semantics; malformed or non-unit ambient markers are discarded.
+    # Primary sources:
+    # https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/build-support/setup-hooks/role.bash#L52-L61
+    # https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/build-support/cc-wrapper/default.nix#L141-L148
+    # https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/build-support/bintools-wrapper/default.nix#L107-L110
     environment = {
-        key: value for key, value in os.environ.items() if key in SAFE_ENVIRONMENT
+        key: value
+        for key, value in os.environ.items()
+        if key in SAFE_ENVIRONMENT
+        or (NIX_WRAPPER_TARGET.fullmatch(key) is not None and value == "1")
     }
     environment.update(
         {

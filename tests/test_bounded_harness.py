@@ -269,6 +269,9 @@ class BoundedHarnessTests(unittest.TestCase):
                 "GITHUB_ENV": "/tmp/github-env",
                 "LD_PRELOAD": "/tmp/inject.so",
                 "NIX_CFLAGS_COMPILE": "-isystem /nix/store/include",
+                "NIX_CC_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu": "1",
+                "NIX_CC_WRAPPER_TARGET_HOST_injected": "0",
+                "NIX_CC_WRAPPER_TARGET_HOST_bad-name": "1",
                 "NIX_REMOTE": "ssh://root@host",
                 "NIX_SECRET_TOKEN": "secret",
                 "NIX_USER_CONF_FILES": "/tmp/nix.conf",
@@ -287,6 +290,10 @@ class BoundedHarnessTests(unittest.TestCase):
             "-isystem /nix/store/include",
             environment["NIX_CFLAGS_COMPILE"],
         )
+        self.assertEqual(
+            "1",
+            environment["NIX_CC_WRAPPER_TARGET_HOST_x86_64_unknown_linux_gnu"],
+        )
         for denied in (
             "AWS_ACCESS_KEY_ID",
             "BASH_ENV",
@@ -295,6 +302,8 @@ class BoundedHarnessTests(unittest.TestCase):
             "NIX_REMOTE",
             "NIX_SECRET_TOKEN",
             "NIX_USER_CONF_FILES",
+            "NIX_CC_WRAPPER_TARGET_HOST_injected",
+            "NIX_CC_WRAPPER_TARGET_HOST_bad-name",
             "PKG_CONFIG_ATTACK",
             "RUST_TOKEN",
         ):
