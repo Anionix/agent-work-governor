@@ -570,15 +570,18 @@ class PortableBundleTests(unittest.TestCase):
             git("config", "user.name", "Contract Test")
             git("config", "user.email", "contract@example.invalid")
             (root / "README.md").write_text("baseline\n", encoding="utf-8")
-            git("add", "README.md")
+            escaping = root / "escape.py"
+            escaping.write_text("VALUE = 'inside'\n", encoding="utf-8")
+            git("add", "README.md", "escape.py")
             git("commit", "-m", "baseline")
             git("update-ref", "refs/remotes/origin/main", "HEAD")
             git("switch", "-c", "work/path-escape")
             outside = workspace / "outside.py"
             outside.write_text("VALUE = 1\n", encoding="utf-8")
-            (root / "escape.py").symlink_to(outside)
+            escaping.unlink()
+            escaping.symlink_to(outside)
             git("add", "escape.py")
-            git("commit", "-m", "add escaping path")
+            git("commit", "-m", "replace governed path with escaping symlink")
 
             paths, error = gate.changed_code_files(root, "origin/main", "HEAD")
 
