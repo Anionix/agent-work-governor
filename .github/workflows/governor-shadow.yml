@@ -126,10 +126,37 @@ jobs:
           environment_sha="$(hash_file "$output/environment")"
           invocation_sha="$(hash_file "$output/invocation")"
           harness_sha="$(hash_file "$plugin/scripts/bounded_harness.py")"
+          # LLM contract: trusted Nix Python closure -> store-only import path
+          # or fail before candidate execution; cwd/ambient imports never enter.
+          # Primary source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/using/cmdline.rst
+          trusted_pythonpath="${PYTHONPATH-}"
+          trusted_pythonpath="$(
+            "$python" -I -S - "$trusted_pythonpath" <<'PYTHONPATH_CHECK'
+          import sys
+          from pathlib import Path
+
+          store = Path("/nix/store")
+          paths = sys.argv[1].split(":")
+          if not paths or any(not path for path in paths):
+              raise SystemExit("trusted PYTHONPATH contains an empty component")
+          canonical = []
+          for raw in paths:
+              path = Path(raw)
+              try:
+                  resolved = path.resolve(strict=True)
+              except OSError as error:
+                  raise SystemExit("trusted PYTHONPATH cannot be resolved") from error
+              if path != resolved or not resolved.is_dir() or not resolved.is_relative_to(store):
+                  raise SystemExit("trusted PYTHONPATH escaped the Nix store")
+              canonical.append(str(resolved))
+          sys.stdout.write(":".join(canonical))
+          PYTHONPATH_CHECK
+          )"
           root_environment=(
             "PATH=$PATH"
             "PYTHONHASHSEED=0"
             "PYTHONNOUSERSITE=1"
+            "PYTHONPATH=$trusted_pythonpath"
           )
           for name in AR CC CXX LD RANLIB SDKROOT MACOSX_DEPLOYMENT_TARGET \
             NIX_CC NIX_CFLAGS_COMPILE NIX_LDFLAGS NIX_SSL_CERT_FILE SSL_CERT_FILE

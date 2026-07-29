@@ -63,6 +63,21 @@ def profile_metadata(concept_type: str = "Reference") -> dict[str, object]:
     }
 
 
+def copy_mutable_fixture(source: Path, target: Path) -> None:
+    # LLM-CONTRACT
+    # id: agent-work-governor.mutable-test-fixture
+    # state: READ_ONLY_SOURCE -> CONTENT_COPY -> MUTABLE_FIXTURE
+    # preconditions: source is a regular repository fixture
+    # invariant: source metadata never removes write access from the temporary copy
+    # failure: copyfile raises and the test fails before exercising a false fixture
+    # source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/shutil.rst
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: DoctorTests
+    # test: bundle:tests/test_contracts.py
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, target)
+
+
 def bundled_runtime_or_skip(
     test_case: unittest.TestCase,
 ) -> rust_dispatch.BinarySelection:
@@ -461,6 +476,18 @@ class OkfTests(unittest.TestCase):
 
 
 class DoctorTests(unittest.TestCase):
+    def test_mutable_fixture_copy_drops_read_only_source_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.lock"
+            target = root / "fixture/target.lock"
+            source.write_text("locked\n", encoding="utf-8")
+            source.chmod(0o444)
+            copy_mutable_fixture(source, target)
+            target.write_text("mutated\n", encoding="utf-8")
+            self.assertEqual("mutated\n", target.read_text(encoding="utf-8"))
+            self.assertEqual(0, source.stat().st_mode & 0o222)
+
     def test_unknown_okf_status_fails_closed(self) -> None:
         self.assertEqual("PASS", doctor.normalize_validator_status("valid"))
         self.assertEqual(
@@ -682,13 +709,12 @@ class DoctorTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             lock_target = root / "references/canonical-runtime.lock.json"
-            lock_target.parent.mkdir()
-            shutil.copy2(
+            copy_mutable_fixture(
                 PLUGIN_ROOT / "references/canonical-runtime.lock.json",
                 lock_target,
             )
             dependency_lock_target = root / "uv.lock"
-            shutil.copy2(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
+            copy_mutable_fixture(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
             builder_target = root / "scripts/package_canonical_runtime.py"
             builder_target.parent.mkdir()
             shutil.copy2(
@@ -826,7 +852,7 @@ raise SystemExit(3)
                 "VALIDATOR_RUNTIME_DEPENDENCY_LOCK_INVALID",
                 dependency_lock.exception.code,
             )
-            shutil.copy2(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
+            copy_mutable_fixture(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
             coherent_drift = dependency_lock_target.read_text(encoding="utf-8").replace(
                 'runtime-build = [{ name = "pyyaml", specifier = "==6.0.3" }]',
                 'runtime-build = [{ name = "pyyaml", specifier = "==6.0.4" }]',
@@ -854,7 +880,7 @@ raise SystemExit(3)
                 "VALIDATOR_RUNTIME_DEPENDENCY_IDENTITY_MISMATCH",
                 identity_drift.exception.code,
             )
-            shutil.copy2(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
+            copy_mutable_fixture(PLUGIN_ROOT / "uv.lock", dependency_lock_target)
             lock_target.write_text("{}\n", encoding="utf-8")
             with self.assertRaises(
                 validate_canonical.CanonicalRuntimeError
@@ -878,7 +904,10 @@ raise SystemExit(3)
             ):
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(PLUGIN_ROOT / relative, target)
+                if relative == Path("vendor/pyyaml-6.0.3.zip"):
+                    copy_mutable_fixture(PLUGIN_ROOT / relative, target)
+                else:
+                    shutil.copy2(PLUGIN_ROOT / relative, target)
             runtime = validate_canonical.load_runtime(root, entries)
             validator_path = root / "validator.py"
             validator_path.write_text(
@@ -1985,6 +2014,10 @@ class SourceHygieneTests(unittest.TestCase):
             'nix store add-path "$subject"',
             "--no-update-lock-file --no-write-lock-file",
             "sudo /usr/bin/env -i",
+            'trusted_pythonpath="${PYTHONPATH-}"',
+            '"$python" -I -S - "$trusted_pythonpath"',
+            "not resolved.is_relative_to(store)",
+            '"PYTHONPATH=$trusted_pythonpath"',
             "--runtime-root",
             "--trusted-rust-inputs",
             "--evidence-root",
