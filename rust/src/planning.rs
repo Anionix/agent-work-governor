@@ -14,7 +14,7 @@ use crate::{
         adapt_rust,
     },
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // LLM-CONTRACT
 // id: agent-work-governor.plan-interface
@@ -32,7 +32,8 @@ use serde::Serialize;
     clippy::struct_field_names,
     reason = "the repeated suffix is the exact public wire contract"
 )]
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanBindings {
     /// SHA-256 digest of the execution environment.
     pub environment_sha256: String,
@@ -64,7 +65,7 @@ impl PlanBindings {
         }
     }
 
-    fn fields(&self) -> [(&'static str, &str); 5] {
+    pub(crate) fn fields(&self) -> [(&'static str, &str); 5] {
         [
             ("repository_sha256", &self.repository_sha256),
             ("revision_sha256", &self.revision_sha256),

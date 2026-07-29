@@ -60,6 +60,21 @@ pub enum CheckRequest {
         /// Closed caller-confirmed project profile.
         project: crate::planning::PlanProject,
     },
+    /// Verify one untrusted aggregate receipt against a recomputed plan.
+    Verify {
+        /// Repository and governed-environment bindings used to recompute the plan.
+        bindings: crate::planning::PlanBindings,
+        /// Closed caller-confirmed project profile.
+        project: crate::planning::PlanProject,
+        /// Trusted expected digest of the bounded harness implementation.
+        expected_harness_sha256: String,
+        /// Verifier-owned digest identifying the expected run invocation.
+        expected_invocation_sha256: String,
+        /// Untrusted aggregate receipt JSON bytes.
+        receipt_json: Vec<u8>,
+        /// Untrusted evidence bytes supplied separately from receipt claims.
+        evidence: Vec<crate::verification::EvidenceArtifact>,
+    },
 }
 
 /// Supported bootstrap policy presets.
@@ -149,6 +164,8 @@ pub enum CheckReport {
     Repository(RepositoryReport),
     /// Digest-bound execution plan report.
     Plan(crate::planning::PlanReport),
+    /// Aggregate run-receipt verification report.
+    Verify(crate::verification::VerificationReport),
 }
 
 impl CheckReport {
@@ -165,6 +182,7 @@ impl CheckReport {
             Self::Bootstrap(report) => report.status == Status::DryRun,
             Self::Repository(report) => report.status == Status::Pass,
             Self::Plan(report) => report.status() == Status::Planned,
+            Self::Verify(report) => report.status() == Status::Pass,
         }
     }
 }

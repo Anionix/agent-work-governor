@@ -11,6 +11,7 @@ mod policy;
 mod python_adapter;
 mod reference;
 mod rust_adapter;
+mod verification;
 
 use std::path::{Path, PathBuf};
 
@@ -20,6 +21,10 @@ pub use model::{CheckReport, CheckRequest, Finding, Preset, RepositoryReport, St
 pub use okf::OkfStatus;
 pub use planning::{PlanBindings, PlanProject, PlanReport};
 use thiserror::Error;
+pub use verification::{
+    CheckOutcome, CheckReceipt, EvidenceArtifact, MAX_CHECK_OUTPUT_BYTES, MAX_RUN_RECEIPT_BYTES,
+    RunReceipt, VerificationOutcome, VerificationReason, VerificationReport,
+};
 
 /// Static Governor Module with one public checking Interface.
 #[derive(Clone, Debug, Default)]
@@ -88,6 +93,21 @@ impl Governor {
             CheckRequest::Plan { bindings, project } => {
                 Ok(CheckReport::Plan(planning::build_plan(bindings, project)?))
             }
+            CheckRequest::Verify {
+                bindings,
+                project,
+                expected_harness_sha256,
+                expected_invocation_sha256,
+                receipt_json,
+                evidence,
+            } => Ok(CheckReport::Verify(verification::verify_receipt(
+                bindings,
+                project,
+                expected_harness_sha256,
+                expected_invocation_sha256,
+                &receipt_json,
+                &evidence,
+            )?)),
         }
     }
 }
@@ -157,9 +177,9 @@ fn check_repository(repo: &Path, plugin_root: &Path) -> Result<RepositoryReport,
 
 // LLM-CONTRACT
 // id: agent-work-governor.rust-static-interface
-// state: REQUEST -> PURE_CHECKS -> REPORT | PLANNED | INFRASTRUCTURE_FAULT
+// state: REQUEST -> PURE_CHECKS -> REPORT | PLANNED | VERIFIED | INFRASTRUCTURE_FAULT
 // preconditions: paths are explicit and external attestations are not caller supplied
-// invariant: check never mutates a repository and planning cannot grant PASS authority
+// invariant: check never mutates a repository and only receipt verification can derive runtime PASS
 // failure: return typed infrastructure faults or fail-closed findings
 // source: bundle:knowledge/policies/work-governor.md
 // knowledge: bundle:knowledge/policies/work-governor.md

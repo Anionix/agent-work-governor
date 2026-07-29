@@ -25,6 +25,8 @@ const PLAN_SCHEMA_VERSION: &str = "0.1";
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CanonicalExecutionPlan {
     canonical_json: Vec<u8>,
+    check_identifiers: Vec<String>,
+    coverage_sha256: String,
     sha256: String,
 }
 
@@ -39,6 +41,16 @@ impl CanonicalExecutionPlan {
     #[must_use]
     pub fn sha256(&self) -> &str {
         &self.sha256
+    }
+
+    /// SHA-256 of the canonical JSON array of ordered check identifiers.
+    #[must_use]
+    pub fn coverage_sha256(&self) -> &str {
+        &self.coverage_sha256
+    }
+
+    pub(crate) fn check_identifiers(&self) -> &[String] {
+        &self.check_identifiers
     }
 }
 
@@ -86,14 +98,22 @@ impl PlanEmitter {
             .into_iter()
             .map(|check| bind(check, &recipes).map(PlanCheck::from))
             .collect::<Result<Vec<_>, _>>()?;
+        let check_identifiers = checks
+            .iter()
+            .map(|check| check.identifier.0.clone())
+            .collect::<Vec<_>>();
+        let coverage_json =
+            serde_json::to_vec(&check_identifiers).map_err(|_| PlanError::ENCODING_FAILED)?;
         let canonical_json = serde_json::to_vec(&PlanDocument {
             checks,
             schema_version: PLAN_SCHEMA_VERSION,
         })
         .map_err(|_| PlanError::ENCODING_FAILED)?;
         Ok(CanonicalExecutionPlan {
+            coverage_sha256: crate::adapter_catalog::sha256_hex(&coverage_json),
             sha256: crate::adapter_catalog::sha256_hex(&canonical_json),
             canonical_json,
+            check_identifiers,
         })
     }
 }
