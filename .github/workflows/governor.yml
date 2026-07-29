@@ -225,7 +225,8 @@ jobs:
           run_locked ty check
           run_locked python -B -m unittest discover -s tests
           run_locked python scripts/validate_canonical.py --fetch-missing .
-          run_locked uv export --quiet --locked \
+          run_locked uv export --quiet --locked --all-packages \
+            --all-extras --all-groups --no-emit-workspace \
             --format requirements.txt \
             --output-file "$AUDIT_REQUIREMENTS"
           run_locked pip-audit --cache-dir "$PIP_AUDIT_CACHE" --disable-pip \

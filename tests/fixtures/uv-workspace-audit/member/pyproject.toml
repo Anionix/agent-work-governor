@@ -1,0 +1,19 @@
+# LLM-CONTRACT
+# id: agent-work-governor.uv-workspace-audit-member-fixture
+# state: WORKSPACE_MEMBER -> MEMBER_ONLY_LOCKED_DEPENDENCY
+# preconditions: audit-member is not a dependency of audit-root
+# invariant: idna is reachable only when every workspace package is exported
+# failure: the regression cannot prove full-workspace audit coverage
+# source: https://github.com/astral-sh/uv/blob/fece32fc54b0e6fb6a031d3c80397cc4afb25737/docs/concepts/projects/workspaces.md
+# knowledge: repo:adapters/check-recipes.v1.LLM-CONTRACT.md
+# enforced_by: dependencies
+# test: repo:tests/test_contracts.py
+
+[project]
+name = "audit-member"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["idna==3.11"]
+
+[tool.uv]
+package = false
