@@ -11,6 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, NamedTuple
+from urllib.parse import unquote
 
 import toolchain_catalog
 import validate_policy
@@ -210,20 +211,20 @@ def git_tree_entries(
     return entries, None
 
 
-def git_tree_text(
+def git_tree_blob(
     root: Path,
     entries: dict[Path, GitTreeEntry],
     path: Path,
-) -> tuple[str | None, str | None]:
+) -> tuple[bytes | None, str | None]:
     # LLM-CONTRACT
-    # id: agent-work-governor.git-tree-text
-    # state: PATH_BOUND_ENTRY -> EXACT_BLOB_BYTES -> UTF8_TEXT | SOURCE_REJECTED
+    # id: agent-work-governor.git-tree-blob
+    # state: PATH_BOUND_ENTRY -> EXACT_BLOB_BYTES | SOURCE_REJECTED
     # preconditions: entries came from the candidate tree named by the gate
     # invariant: ambient files, index entries, and symlinks cannot replace committed bytes
-    # failure: reject missing, non-regular, unreadable, or non-UTF-8 Git objects
+    # failure: reject missing, non-regular, or unreadable Git objects
     # source: https://github.com/git/git/blob/13c7afec212fc97ce257d15601659314c6673d6c/Documentation/git-cat-file.adoc
     # knowledge: bundle:knowledge/policies/work-governor.md
-    # enforced_by: main
+    # enforced_by: git_tree_blob
     # test: bundle:tests/test_repo_bundle.py
     entry = entries.get(path)
     relative_name = path.relative_to(root.resolve()).as_posix()
@@ -243,9 +244,21 @@ def git_tree_text(
     if process.returncode != 0:
         detail = os.fsdecode(process.stderr).strip() or "Git blob is unavailable"
         return None, f"{relative_name}: {detail}"
+    return process.stdout, None
+
+
+def git_tree_text(
+    root: Path,
+    entries: dict[Path, GitTreeEntry],
+    path: Path,
+) -> tuple[str | None, str | None]:
+    payload, error = git_tree_blob(root, entries, path)
+    if error is not None or payload is None:
+        return None, error
     try:
-        return process.stdout.decode("utf-8", errors="strict"), None
+        return payload.decode("utf-8", errors="strict"), None
     except UnicodeDecodeError as exception:
+        relative_name = path.relative_to(root.resolve()).as_posix()
         return None, f"{relative_name}: {exception}"
 
 
@@ -503,18 +516,19 @@ def repository_contract_id_errors(
 def contract_reference_errors(
     root: Path,
     bundle_root: Path,
-    source_path: Path,
     source_text: str,
+    tree_entries: dict[Path, GitTreeEntry],
 ) -> list[dict[str, Any]]:
     errors: list[dict[str, Any]] = []
     for contract in parsed_contracts(source_text):
         identifier = contract["id"]
 
         source_ref = contract["source"]
-        _, source_error = resolve_contract_reference(
+        _, source_error = candidate_reference_bytes(
             source_ref,
-            repo_root=root,
+            root=root,
             bundle_root=bundle_root,
+            tree_entries=tree_entries,
             allow_external=True,
         )
         if source_error is not None:
@@ -529,13 +543,14 @@ def contract_reference_errors(
 
         for field in ("knowledge", "test"):
             reference = contract[field]
-            target, reference_error = resolve_contract_reference(
+            reference_bytes, reference_error = candidate_reference_bytes(
                 reference,
-                repo_root=root,
+                root=root,
                 bundle_root=bundle_root,
+                tree_entries=tree_entries,
                 allow_external=False,
             )
-            if reference_error is not None or target is None:
+            if reference_error is not None or reference_bytes is None:
                 errors.append(
                     finding(
                         f"LLM_CONTRACT_{field.upper()}_INVALID",
@@ -547,8 +562,8 @@ def contract_reference_errors(
                 continue
             if field == "knowledge":
                 try:
-                    knowledge = target.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError) as exception:
+                    reference_text = reference_bytes.decode("utf-8", errors="strict")
+                except UnicodeDecodeError as exception:
                     errors.append(
                         finding(
                             "LLM_CONTRACT_KNOWLEDGE_UNREADABLE",
@@ -561,7 +576,7 @@ def contract_reference_errors(
                     if re.search(
                         r'(?im)^\s*(?:status\s*:\s*|["\']status["\']\s*:\s*["\'])'
                         r"deprecated\b",
-                        knowledge,
+                        reference_text,
                     ):
                         errors.append(
                             finding(
@@ -583,6 +598,59 @@ def contract_reference_errors(
                 )
             )
     return errors
+
+
+def candidate_reference_bytes(
+    reference: str,
+    *,
+    root: Path,
+    bundle_root: Path,
+    tree_entries: dict[Path, GitTreeEntry],
+    allow_external: bool,
+) -> tuple[bytes | None, str | None]:
+    # LLM-CONTRACT
+    # id: agent-work-governor.candidate-tree-contract-reference
+    # state: CONTRACT_REFERENCE -> EXACT_TREE_PATH -> EXACT_BLOB_BYTES | REJECTED
+    # preconditions: tree_entries names the same candidate revision as the contract source
+    # invariant: ambient, untracked, dirty, symlink, or non-blob evidence never satisfies a reference
+    # failure: return no bytes and a stable error before contract evidence is accepted
+    # source: https://github.com/git/git/blob/13c7afec212fc97ce257d15601659314c6673d6c/Documentation/git-cat-file.adoc
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: candidate_reference_bytes
+    # test: bundle:tests/test_repo_bundle.py
+    scheme, separator, raw_path = reference.partition(":")
+    lexical_root = Path(os.path.abspath(root))
+    lexical_bundle = Path(os.path.abspath(bundle_root))
+    root = root.resolve()
+    bundle_base = (
+        root / lexical_bundle.relative_to(lexical_root)
+        if lexical_bundle.is_relative_to(lexical_root)
+        else lexical_bundle
+    )
+    roots = {"repo": root, "bundle": bundle_base}
+    if not separator or scheme not in roots:
+        _, error = resolve_contract_reference(
+            reference,
+            repo_root=root,
+            bundle_root=bundle_root,
+            allow_external=allow_external,
+        )
+        return None, error
+
+    decoded = unquote(raw_path)
+    parts = decoded.split("/")
+    if (
+        not decoded
+        or "\x00" in decoded
+        or "\\" in decoded
+        or decoded.startswith("/")
+        or any(part in {"", ".", ".."} for part in parts)
+    ):
+        return None, "reference contains an unsafe path"
+    base = roots[scheme]
+    if not base.is_relative_to(root):
+        return None, "reference escapes the candidate Git tree"
+    return git_tree_blob(root, tree_entries, base.joinpath(*parts))
 
 
 def validate_pre_pr_receipt(
@@ -881,7 +949,7 @@ def main() -> int:
                         )
                     else:
                         errors.extend(repository_contract_id_errors(contract_index))
-                    bundle_root = Path(__file__).resolve().parent
+                    bundle_root = Path(os.path.abspath(__file__)).parent
                     for path in code_files:
                         source, source_error = git_tree_text(root, tree_entries, path)
                         if source_error is not None or source is None:
@@ -907,8 +975,8 @@ def main() -> int:
                             contract_reference_errors(
                                 root,
                                 bundle_root,
-                                path,
                                 source,
+                                tree_entries,
                             )
                         )
                     if code_files:
