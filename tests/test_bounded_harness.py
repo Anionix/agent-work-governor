@@ -7,6 +7,7 @@ import json
 import os
 import pwd
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -282,10 +283,11 @@ class BoundedHarnessTests(unittest.TestCase):
             },
             clear=True,
         ):
-            environment = harness._candidate_environment(self.root)
+            environment = harness._candidate_environment(self.root, self.root)
         self.assertEqual("/trusted/bin", environment["PATH"])
         self.assertEqual("/trusted/python", environment["PYTHONPATH"])
         self.assertEqual("true", environment["CARGO_NET_OFFLINE"])
+        self.assertEqual(str(self.root), environment["TMPDIR"])
         self.assertEqual(
             "-isystem /nix/store/include",
             environment["NIX_CFLAGS_COMPILE"],
@@ -370,7 +372,9 @@ class BoundedHarnessTests(unittest.TestCase):
             )
         assert cargo_home is not None
         self.assertEqual(source / "config.toml", (cargo_home / "config.toml").resolve())
-        environment = harness._candidate_environment(runtime.artifacts, cargo_home)
+        environment = harness._candidate_environment(
+            runtime.artifacts, runtime.temporary, cargo_home
+        )
         self.assertEqual(str(cargo_home), environment["CARGO_HOME"])
         self.assertEqual(str(source / "advisory-db"), environment["GIT_CONFIG_VALUE_0"])
         cargo_lock.write_bytes(b"changed")
@@ -475,6 +479,80 @@ class BoundedHarnessTests(unittest.TestCase):
         os.geteuid() == 0,
         "requires a disposable root harness",
     )
+    def test_distinct_uid_temp_root_supports_component_walk(self) -> None:
+        self.root.chmod(0o755)
+        runtime_root = (
+            Path(tempfile.gettempdir()).resolve()
+            / f"agent-work-governor-temp-{uuid.uuid4().hex}"
+        )
+        temporary_anchor = runtime_root.with_name(f"{runtime_root.name}-candidate")
+        self.addCleanup(shutil.rmtree, runtime_root, True)
+        self.addCleanup(shutil.rmtree, temporary_anchor, True)
+        code = """
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+try:
+    os.listdir(Path(sys.argv[1]))
+except PermissionError:
+    pass
+else:
+    raise SystemExit("protected runtime became readable")
+temporary = Path(tempfile.mkdtemp())
+descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+try:
+    for component in temporary.parts[1:]:
+        child = os.open(
+            component,
+            os.O_RDONLY | os.O_DIRECTORY,
+            dir_fd=descriptor,
+        )
+        os.close(descriptor)
+        descriptor = child
+finally:
+    os.close(descriptor)
+"""
+        digest = self.plan([self.check("python.temp-walk", code, str(runtime_root))])
+        receipt = runtime_root / "run.json"
+        with redirect_stdout(io.StringIO()):
+            result = harness.main(
+                [
+                    "--plan-report",
+                    str(self.plan_path),
+                    "--expected-plan-sha256",
+                    digest,
+                    "--repository",
+                    str(self.root),
+                    "--invocation-sha256",
+                    "b" * 64,
+                    "--receipt",
+                    str(receipt),
+                    "--runtime-root",
+                    str(runtime_root),
+                    "--workers",
+                    "1",
+                ]
+            )
+        self.assertEqual(0, result)
+        self.assertEqual(
+            {"EXITED": {"exit_code": 0}},
+            json.loads(receipt.read_text())["checks"][0]["outcome"],
+        )
+        identity = harness._isolation_identity()
+        self.assertEqual(0o711, stat.S_IMODE(runtime_root.stat().st_mode))
+        self.assertEqual(0o755, stat.S_IMODE(temporary_anchor.stat().st_mode))
+        self.assertEqual(identity.uid, (temporary_anchor / "tmp").stat().st_uid)
+        self.assertEqual(
+            0o700,
+            stat.S_IMODE((temporary_anchor / "tmp").stat().st_mode),
+        )
+
+    @unittest.skipUnless(
+        os.geteuid() == 0,
+        "requires a disposable root harness",
+    )
     def test_distinct_uid_blocks_new_session_receipt_rewrite(self) -> None:
         self.root.chmod(0o755)
         runtime_root = (
@@ -482,6 +560,11 @@ class BoundedHarnessTests(unittest.TestCase):
             / f"agent-work-governor-isolation-{uuid.uuid4().hex}"
         )
         self.addCleanup(shutil.rmtree, runtime_root, True)
+        self.addCleanup(
+            shutil.rmtree,
+            runtime_root.with_name(f"{runtime_root.name}-candidate"),
+            True,
+        )
         receipt = runtime_root / "run.json"
         blocked = runtime_root / "artifacts/overwrite-blocked"
         source = self.root / "source.py"

@@ -485,33 +485,6 @@ jobs:
           print(json.dumps(result, separators=(",", ":"), sort_keys=True))
           PYTHON
           cat "$output/shadow.json"
-          # LLM contract: one exact reviewed public candidate + secret-free
-          # bounded evidence -> inert base64 debug tail | no debug output.
-          # The payload is non-authoritative and never enters Verify or state.
-          # Primary source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Lib/base64.py#L51-L60
-          if [[ "$CANDIDATE_REPOSITORY" == "Anionix/agent-work-governor" &&
-                "$CANDIDATE_HEAD_SHA" == "09b4630c4236af18324b612bdf59526e74437517" ]]
-          then
-            sudo /usr/bin/env -i "$python" -B - \
-              "$runtime/evidence/rust.tests.log" <<'DEBUG_EVIDENCE'
-          import base64
-          import hashlib
-          import sys
-          from pathlib import Path
-
-          data = Path(sys.argv[1]).read_bytes()
-          if len(data) > 1_048_576:
-              raise SystemExit("debug evidence exceeded the harness bound")
-          tail = data[-131_072:]
-          print(
-              "AWG_DEBUG_RUST_TESTS_BEGIN "
-              f"sha256={hashlib.sha256(data).hexdigest()} "
-              f"bytes={len(data)} tail_bytes={len(tail)}"
-          )
-          print(base64.b64encode(tail).decode("ascii"))
-          print("AWG_DEBUG_RUST_TESTS_END")
-          DEBUG_EVIDENCE
-          fi
           {
             echo '### Agent Work Governor shadow evidence'
             echo '```json'
