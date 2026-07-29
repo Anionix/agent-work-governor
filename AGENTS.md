@@ -28,7 +28,10 @@ These rules apply to this owner-original repository.
 
 - Fail closed on missing, stale, duplicate, or contradictory evidence.
 - Pin Actions to full SHAs and record release sources.
-- Update `flake.nix` and `flake.lock` together.
+- Treat `flake.nix` and `flake.lock` as a verified pair. When either changes,
+  regenerate the candidate lock in isolation and require byte equality with the
+  committed lock. Commit changed lock bytes; keep byte-identical locks unchanged
+  and never fabricate lockfile churn.
 - Do not track build/cache/venv output, receipts, `.governance/`,
   `rust/target/`, or `bin/`.
 - Squash merge, keep linear history, and delete merged topic branches.

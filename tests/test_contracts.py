@@ -1802,6 +1802,23 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertIn("assert_version rust-analyzer", workflow)
         self.assertIn("TOOLCHAIN_COMPONENT_MISSING::rust-src", workflow)
         self.assertIn("run_locked pip-audit", workflow)
+        # LLM contract: workflow text -> isolated lock regeneration evidence
+        # or this repository-contract test fails before merge.
+        for evidence in (
+            "nix flake lock",
+            "--no-use-registries",
+            "--output-lock-file",
+            "scripts/validate_flake_lock_pair.py",
+            "FLAKE_PAIR_UNCHANGED",
+            "git archive",
+            "git rev-parse HEAD",
+            "git status --porcelain",
+            "path:$source_tree",
+            "flake.lock.regeneration-failed",
+            "FlakeLockPairNixIntegrationTests",
+        ):
+            self.assertIn(evidence, workflow)
+        self.assertNotIn("nix flake update", workflow)
         self.assertLess(
             workflow.index("command -v nix >/dev/null 2>&1"),
             workflow.index("uses: cachix/install-nix-action@"),

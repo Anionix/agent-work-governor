@@ -103,6 +103,49 @@ jobs:
           # The preceding step verifies the catalog-bound installer bytes.
           install_url: file://${{ runner.temp }}/nix-install
 
+      - name: Verify regenerated flake lock pair
+        shell: bash
+        run: |
+          # LLM contract: changed flake pair -> isolated regeneration ->
+          # BYTE_EQUIVALENT or fail-closed mismatch/inconclusive evidence.
+          # Primary source: https://github.com/NixOS/nix/blob/2c6d06e9387cf58167cb5a7ab91cee7333d8d17c/src/nix/flake-lock.md
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          if [[ "$actual_head" != "$EXPECTED_HEAD_SHA" ]] ||
+            [[ -n "$(git status --porcelain=v1 --untracked-files=all)" ]]; then
+            printf '{"code":"FLAKE_LOCK_CHECKOUT_IDENTITY_INVALID","expected_head_sha":"%s","head_sha":"%s","status":"INCONCLUSIVE"}\n' \
+              "$EXPECTED_HEAD_SHA" "$actual_head"
+            exit 2
+          fi
+          python3 -B -m unittest \
+            tests.test_flake_lock_pair.FlakeLockPairNixIntegrationTests
+          if git diff --quiet "$BASE_SHA...$EXPECTED_HEAD_SHA" -- \
+            flake.nix flake.lock; then
+            echo '{"code":"FLAKE_PAIR_UNCHANGED","status":"SKIP"}'
+            exit 0
+          fi
+          source_tree="$RUNNER_TEMP/flake-pair-source"
+          regenerated="$RUNNER_TEMP/flake.lock.regenerated"
+          mkdir -p "$source_tree"
+          git archive "$EXPECTED_HEAD_SHA" | tar -x -C "$source_tree"
+          if ! nix flake lock \
+            --no-use-registries \
+            --output-lock-file "$regenerated" \
+            "path:$source_tree"; then
+            python3 -B scripts/validate_flake_lock_pair.py \
+              --flake-nix "$source_tree/flake.nix" \
+              --committed-lock "$source_tree/flake.lock" \
+              --regenerated-lock "$RUNNER_TEMP/flake.lock.regeneration-failed" \
+              --head-sha "$EXPECTED_HEAD_SHA" \
+              --nix-version "$(nix --version)"
+          fi
+          python3 -B scripts/validate_flake_lock_pair.py \
+            --flake-nix "$source_tree/flake.nix" \
+            --committed-lock "$source_tree/flake.lock" \
+            --regenerated-lock "$regenerated" \
+            --head-sha "$EXPECTED_HEAD_SHA" \
+            --nix-version "$(nix --version)"
+
       - name: Assert installed Nix identity
         shell: bash
         run: |
