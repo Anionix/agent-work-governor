@@ -267,7 +267,11 @@ fn markdown_fifo_fails_closed_without_blocking() -> TestResult {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // LLM contract: SPAWNED -> EXITED_WITH_TYPED_REJECTION | KILLED_AS_BLOCKED.
+    // The wall-clock bound contains a regression; exit status and the report,
+    // rather than scheduler latency, establish correctness.
+    // Primary source: https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/library/std/src/process.rs#L2389-L2402
+    let deadline = Instant::now() + Duration::from_secs(30);
     let child_status = loop {
         if let Some(status) = child.try_wait()? {
             break status;

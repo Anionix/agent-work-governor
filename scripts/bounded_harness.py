@@ -333,14 +333,12 @@ def _isolation_identity() -> RunIdentity:
 def _candidate_environment(
     artifacts: Path, cargo_home: Path | None = None
 ) -> dict[str, str]:
-    # LLM contract: trusted Nix shell + wrapper target marker + fixed Cargo
-    # output mode -> deterministic child environment; ambient overrides and
-    # malformed or non-unit markers are discarded.
+    # LLM contract: trusted Nix shell + wrapper target marker -> preserved
+    # compiler semantics; malformed or non-unit ambient markers are discarded.
     # Primary sources:
     # https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/build-support/setup-hooks/role.bash#L52-L61
     # https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/build-support/cc-wrapper/default.nix#L141-L148
     # https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/build-support/bintools-wrapper/default.nix#L107-L110
-    # https://github.com/rust-lang/cargo/blob/1d775c7efc926b45633c2e72b0c4195f8e4afb0a/src/doc/src/reference/config.md#L1477-L1482
     environment = {
         key: value
         for key, value in os.environ.items()
@@ -352,7 +350,6 @@ def _candidate_environment(
             "CARGO_HOME": str(cargo_home or artifacts),
             "CARGO_NET_OFFLINE": "true",
             "CARGO_TARGET_DIR": str(artifacts / "cargo-target"),
-            "CARGO_TERM_COLOR": "never",
             "HOME": str(artifacts),
             "PIP_CACHE_DIR": str(artifacts / "pip-cache"),
             "RUFF_CACHE_DIR": str(artifacts / "ruff-cache"),

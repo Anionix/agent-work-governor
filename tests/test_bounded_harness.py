@@ -266,7 +266,6 @@ class BoundedHarnessTests(unittest.TestCase):
             {
                 "AWS_ACCESS_KEY_ID": "secret",
                 "BASH_ENV": "/tmp/inject",
-                "CARGO_TERM_COLOR": "always",
                 "GITHUB_ENV": "/tmp/github-env",
                 "LD_PRELOAD": "/tmp/inject.so",
                 "NIX_CFLAGS_COMPILE": "-isystem /nix/store/include",
@@ -287,7 +286,6 @@ class BoundedHarnessTests(unittest.TestCase):
         self.assertEqual("/trusted/bin", environment["PATH"])
         self.assertEqual("/trusted/python", environment["PYTHONPATH"])
         self.assertEqual("true", environment["CARGO_NET_OFFLINE"])
-        self.assertEqual("never", environment["CARGO_TERM_COLOR"])
         self.assertEqual(
             "-isystem /nix/store/include",
             environment["NIX_CFLAGS_COMPILE"],
