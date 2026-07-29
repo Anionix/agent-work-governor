@@ -123,7 +123,6 @@ jobs:
           revision_sha="$(hash_file "$output/revision")"
           policy_sha="$(hash_file "$plugin/assets/presets/owner-original.toml")"
           toolchain_sha="$(hash_file "$plugin/toolchain.lock.json")"
-          environment_sha="$(hash_file "$output/environment")"
           invocation_sha="$(hash_file "$output/invocation")"
           harness_sha="$(hash_file "$plugin/scripts/bounded_harness.py")"
           # LLM contract: trusted Nix Python closure -> store-only import path
@@ -158,8 +157,44 @@ jobs:
             "PYTHONNOUSERSITE=1"
             "PYTHONPATH=$trusted_pythonpath"
           )
-          for name in AR CC CXX LD RANLIB SDKROOT MACOSX_DEPLOYMENT_TARGET \
-            NIX_CC NIX_CFLAGS_COMPILE NIX_LDFLAGS NIX_SSL_CERT_FILE SSL_CERT_FILE
+          wrapper_environment=()
+          wrapper_suffix=
+          # LLM contract: one trusted native Nix wrapper marker per
+          # family/role -> preserved linker flags or refusal before execution.
+          # Primary sources:
+          # https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/build-support/setup-hooks/role.bash#L52-L61
+          # https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/build-support/cc-wrapper/default.nix#L141-L148
+          # https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/build-support/bintools-wrapper/default.nix#L107-L110
+          for family in CC BINTOOLS; do
+            for role in BUILD HOST; do
+              prefix="NIX_${family}_WRAPPER_TARGET_${role}_"
+              selected=
+              suffix=
+              while IFS='=' read -r name value; do
+                [[ "$name" == "$prefix"* ]] || continue
+                [[ "$name" =~ ^NIX_(CC|BINTOOLS)_WRAPPER_TARGET_(BUILD|HOST)_[A-Za-z0-9_]+$ ]]
+                [[ "$value" == 1 && -z "$selected" ]]
+                selected="$name=$value"
+                suffix=${name#"$prefix"}
+              done < <(env)
+              [[ -n "$selected" && -n "$suffix" ]]
+              if [[ -n "$wrapper_suffix" ]]; then
+                [[ "$suffix" == "$wrapper_suffix" ]]
+              else
+                wrapper_suffix=$suffix
+              fi
+              wrapper_environment+=("$selected")
+            done
+          done
+          root_environment+=("${wrapper_environment[@]}")
+          printf '%s\n' "${wrapper_environment[@]}" >> "$output/environment"
+          environment_sha="$(hash_file "$output/environment")"
+          for name in AR AR_FOR_BUILD AS AS_FOR_BUILD CC CC_FOR_BUILD \
+            CONFIG_SHELL CPATH CXX CXX_FOR_BUILD LD LD_DYLD_PATH LD_FOR_BUILD \
+            LIBRARY_PATH RANLIB RANLIB_FOR_BUILD SDKROOT MACOSX_DEPLOYMENT_TARGET \
+            NIX_BINTOOLS NIX_BINTOOLS_FOR_BUILD NIX_BUILD_CORES NIX_CC \
+            NIX_CC_FOR_BUILD NIX_CFLAGS_COMPILE NIX_CFLAGS_COMPILE_FOR_BUILD \
+            NIX_LDFLAGS NIX_LDFLAGS_FOR_BUILD NIX_SSL_CERT_FILE SSL_CERT_FILE
           do
             value=${!name-}
             if [[ -n "$value" ]]; then
@@ -294,6 +329,33 @@ jobs:
                                   found.add(item[key])
               return found
 
+          # LLM contract: untrusted aggregate receipt -> bounded diagnostics;
+          # only trusted Verify and stage exits determine the semantic state.
+          # Primary source: https://github.com/slsa-framework/slsa/blob/ae7fc76215004e8fae250c877eff8919bf048e3b/spec/verifying-artifacts.md
+          def observed_outcomes(value):
+              found = []
+              checks = value.get("checks", []) if isinstance(value, dict) else []
+              if not isinstance(checks, list):
+                  return found
+              for item in checks:
+                  if not isinstance(item, dict) or not isinstance(item.get("identifier"), str):
+                      continue
+                  outcome = item.get("outcome")
+                  if outcome == "TIMED_OUT":
+                      found.append({"identifier": item["identifier"], "outcome": "TIMED_OUT"})
+                  elif isinstance(outcome, dict):
+                      exited = outcome.get("EXITED")
+                      code = exited.get("exit_code") if isinstance(exited, dict) else None
+                      if isinstance(code, int) and not isinstance(code, bool):
+                          found.append(
+                              {
+                                  "exit_code": code,
+                                  "identifier": item["identifier"],
+                                  "outcome": "EXITED",
+                              }
+                          )
+              return sorted(found, key=lambda item: item["identifier"])
+
           plan, plan_digest = document(output / "plan.json")
           receipt, receipt_digest = document(runtime / "run.json")
           fault, _ = document(runtime / "run.json.fault.json")
@@ -340,6 +402,7 @@ jobs:
                   else None
               ),
               "legacy_conclusion": "success",
+              "observed_check_outcomes": observed_outcomes(receipt),
               "plan_report_sha256": plan_digest,
               "reason_codes": sorted(reason_codes),
               "receipt_sha256": receipt_digest,
