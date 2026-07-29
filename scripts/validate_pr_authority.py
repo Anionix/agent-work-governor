@@ -41,6 +41,27 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 ISSUE_TRAILER_RE = re.compile(r"Issue-Spec: #(?P<number>[1-9][0-9]{0,9})")
 BODY_ISSUE_RE = re.compile(r"Issue/spec:[ \t]+#(?P<number>[1-9][0-9]{0,9})[ \t]*")
 LINK_RE = re.compile(r'\s*<(?P<url>[^<>\s]+)>;\s*rel="(?P<rel>[a-z]+)"\s*')
+HTML_RAW_END_RE = re.compile(r"</(?:script|pre|style)>", re.IGNORECASE)
+HTML_BLOCK_TAG_RE = re.compile(
+    r"</?(?:address|article|aside|base|basefont|blockquote|body|caption|center|"
+    r"col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|"
+    r"footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|"
+    r"link|main|menu|menuitem|nav|noframes|ol|optgroup|option|p|param|section|"
+    r"source|summary|table|tbody|td|tfoot|th|thead|title|tr|track|ul)"
+    r"(?=[ \t\v\f]|/?>|$)",
+    re.IGNORECASE,
+)
+HTML_ATTRIBUTE = (
+    r"[ \t\v\f]+[A-Za-z_:][A-Za-z0-9_.:-]*"
+    r"(?:[ \t\v\f]*=[ \t\v\f]*(?:[^ \t\v\f\"'=<>`]+|'[^']*'|\"[^\"]*\"))?"
+)
+HTML_OPEN_TAG_RE = re.compile(
+    rf"<(?P<name>[A-Za-z][A-Za-z0-9-]*)(?:{HTML_ATTRIBUTE})*"
+    rf"[ \t\v\f]*/?>[ \t\v\f]*"
+)
+HTML_CLOSE_TAG_RE = re.compile(r"</[A-Za-z][A-Za-z0-9-]*[ \t\v\f]*>[ \t\v\f]*")
+
+HtmlBlockEnd = Literal["raw-tag", "processing", "declaration", "cdata", "blank"]
 
 
 @dataclass(frozen=True)
@@ -479,7 +500,7 @@ def _commit_issue_number(
 def _body_issue_number(body: str) -> int:
     # LLM-CONTRACT
     # id: agent-work-governor.visible-body-issue
-    # state: LIVE_BODY -> VISIBLE | HTML_COMMENT | FENCE -> ONE_VISIBLE_FIELD
+    # state: LIVE_BODY -> GFM_BLOCK_CLASSIFIED -> ONE_VISIBLE_FIELD
     # preconditions: body is the bounded live PR body from both stable snapshots
     # invariant: hidden, mixed, or structurally incomplete Issue/spec evidence never authorizes
     # failure: reject hidden markers, unclosed contexts, or non-canonical visible fields
@@ -492,6 +513,7 @@ def _body_issue_number(body: str) -> int:
     fence_character: str | None = None
     fence_length = 0
     in_comment = False
+    html_block_end: HtmlBlockEnd | None = None
     hidden_marker = False
 
     for line in lines:
@@ -511,6 +533,15 @@ def _body_issue_number(body: str) -> int:
                 fence_length = 0
             continue
 
+        if html_block_end is not None:
+            if html_block_end == "blank" and _gfm_blank(line):
+                html_block_end = None
+                continue
+            hidden_marker |= "issue/spec:" in folded
+            if _html_block_ends(html_block_end, line):
+                html_block_end = None
+            continue
+
         if not in_comment and indentation <= 3 and content[:1] in {"`", "~"}:
             candidate = content[0]
             run_length = len(content) - len(content.lstrip(candidate))
@@ -519,6 +550,14 @@ def _body_issue_number(body: str) -> int:
                 hidden_marker |= "issue/spec:" in folded
                 fence_character = candidate
                 fence_length = run_length
+                continue
+
+        if not in_comment and indentation <= 3:
+            html_block_end = _html_block_start(content)
+            if html_block_end is not None:
+                hidden_marker |= "issue/spec:" in folded
+                if _html_block_ends(html_block_end, line):
+                    html_block_end = None
                 continue
 
         starts_visible = not in_comment
@@ -548,6 +587,7 @@ def _body_issue_number(body: str) -> int:
     if (
         in_comment
         or fence_character is not None
+        or html_block_end not in {None, "blank"}
         or hidden_marker
         or len(authority_lines) != 1
     ):
@@ -559,6 +599,53 @@ def _body_issue_number(body: str) -> int:
     if number > MAX_PR_NUMBER:
         raise _Reject("AUTHORITY_BODY_ISSUE_INVALID")
     return number
+
+
+# LLM contract: GFM_BLOCK_START -> MATCHING_END | EOF_BLANK_BLOCK; ambiguous
+# type-7 paragraph interruption is conservatively HIDDEN until a GFM blank line,
+# and a mismatched or still-open explicit context cannot authorize.
+# Primary source: https://github.com/github/cmark-gfm/blob/499789b49373bfa045d0e7547e5ee63444c77bca/test/spec.txt
+def _html_block_start(content: str) -> HtmlBlockEnd | None:
+    """Classify GFM raw HTML block starts in bounded, deterministic order."""
+    folded = content.casefold()
+    if re.match(r"<(?:script|pre|style)(?:[ \t\v\f]|>|$)", folded):
+        return "raw-tag"
+    if content.startswith("<?"):
+        return "processing"
+    if content.startswith("<![CDATA["):
+        return "cdata"
+    if re.match(r"<![A-Z]", content):
+        return "declaration"
+    if HTML_BLOCK_TAG_RE.match(content):
+        return "blank"
+    open_tag = HTML_OPEN_TAG_RE.fullmatch(content)
+    if open_tag is not None and open_tag.group("name").casefold() not in {
+        "script",
+        "style",
+        "pre",
+    }:
+        return "blank"
+    if HTML_CLOSE_TAG_RE.fullmatch(content):
+        return "blank"
+    return None
+
+
+def _gfm_blank(line: str) -> bool:
+    """Accept only the U+0020/U+0009 blank-line grammar."""
+    return not line.strip(" \t")
+
+
+def _html_block_ends(block_end: HtmlBlockEnd, line: str) -> bool:
+    """Apply the matching GFM end condition without changing block classes."""
+    if block_end == "raw-tag":
+        return HTML_RAW_END_RE.search(line) is not None
+    if block_end == "processing":
+        return "?>" in line
+    if block_end == "declaration":
+        return ">" in line
+    if block_end == "cdata":
+        return "]]>" in line
+    return False
 
 
 # LLM contract: stable body + immutable trailer -> SAME_REPOSITORY_ISSUE or fail closed.
