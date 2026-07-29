@@ -38,6 +38,7 @@ SOURCE_INPUTS = (
     Path("rust/rust-toolchain.toml"),
     Path("rust/rustfmt.toml"),
     Path("scripts/canonical_runtime_runner.py"),
+    Path("scripts/bounded_harness.py"),
     Path("scripts/doctor.py"),
     Path("scripts/package_canonical_runtime.py"),
     Path("scripts/validate_canonical.py"),
