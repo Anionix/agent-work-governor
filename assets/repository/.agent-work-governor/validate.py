@@ -10,7 +10,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import toolchain_catalog
 import validate_policy
@@ -63,6 +63,12 @@ COMMENTABLE_EXTENSIONS = {
 }
 SIDECAR_EXTENSIONS = {".json"}
 EXECUTABLE_CONFIG_NAMES = {"Dockerfile", "Justfile", "Makefile"}
+
+
+class GitTreeEntry(NamedTuple):
+    mode: str
+    object_type: str
+    object_id: str
 
 
 def finding(code: str, message: str, **evidence: object) -> dict[str, Any]:
@@ -128,6 +134,119 @@ def run_git_paths_z(root: Path, *args: str) -> tuple[list[Path], str | None]:
             return [], "Git path escapes the repository root"
         paths.append(candidate)
     return paths, None
+
+
+def git_tree_entries(
+    root: Path,
+    treeish: str,
+) -> tuple[dict[Path, GitTreeEntry], str | None]:
+    # LLM-CONTRACT
+    # id: agent-work-governor.git-tree-entries
+    # state: TREEISH -> EXACT_TREE_RECORDS -> PATH_BOUND_BLOBS | TREE_REJECTED
+    # preconditions: treeish names the immutable candidate commit under validation
+    # invariant: paths, object modes, and object ids come from one exact Git tree
+    # failure: reject malformed, unsafe, or non-NUL-terminated tree output
+    # source: https://github.com/git/git/blob/13c7afec212fc97ce257d15601659314c6673d6c/Documentation/git-ls-tree.adoc
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: changed_code_files
+    # test: bundle:tests/test_repo_bundle.py
+    try:
+        process = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                treeish,
+            ],
+            check=False,
+            capture_output=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exception:
+        return {}, str(exception)
+    if process.returncode != 0:
+        return {}, os.fsdecode(process.stderr).strip()
+    if process.stdout and not process.stdout.endswith(b"\0"):
+        return {}, "Git tree stream is not NUL-terminated"
+
+    root = root.resolve()
+    entries: dict[Path, GitTreeEntry] = {}
+    records = process.stdout[:-1].split(b"\0") if process.stdout else []
+    for record in records:
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split(b" ")
+        components = raw_path.split(b"/")
+        if (
+            separator != b"\t"
+            or len(fields) != 3
+            or not raw_path
+            or raw_path.startswith(b"/")
+            or any(component in {b"", b".", b".."} for component in components)
+        ):
+            return {}, "Git returned an unsafe or malformed tree record"
+        try:
+            mode, object_type, object_id = (
+                field.decode("ascii", errors="strict") for field in fields
+            )
+        except UnicodeDecodeError:
+            return {}, "Git returned non-ASCII tree metadata"
+        if (
+            re.fullmatch(r"[0-7]{6}", mode) is None
+            or object_type not in {"blob", "commit", "tree"}
+            or re.fullmatch(r"[0-9a-f]{40,64}", object_id) is None
+        ):
+            return {}, "Git returned invalid tree metadata"
+        relative = Path(os.fsdecode(raw_path))
+        if relative.is_absolute():
+            return {}, "Git path escapes the repository root"
+        candidate = root / relative
+        if candidate in entries:
+            return {}, "Git returned a duplicate tree path"
+        entries[candidate] = GitTreeEntry(mode, object_type, object_id)
+    return entries, None
+
+
+def git_tree_text(
+    root: Path,
+    entries: dict[Path, GitTreeEntry],
+    path: Path,
+) -> tuple[str | None, str | None]:
+    # LLM-CONTRACT
+    # id: agent-work-governor.git-tree-text
+    # state: PATH_BOUND_ENTRY -> EXACT_BLOB_BYTES -> UTF8_TEXT | SOURCE_REJECTED
+    # preconditions: entries came from the candidate tree named by the gate
+    # invariant: ambient files, index entries, and symlinks cannot replace committed bytes
+    # failure: reject missing, non-regular, unreadable, or non-UTF-8 Git objects
+    # source: https://github.com/git/git/blob/13c7afec212fc97ce257d15601659314c6673d6c/Documentation/git-cat-file.adoc
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: main
+    # test: bundle:tests/test_repo_bundle.py
+    entry = entries.get(path)
+    relative_name = path.relative_to(root.resolve()).as_posix()
+    if entry is None:
+        return None, f"{relative_name}: path is absent from the candidate Git tree"
+    if entry.object_type != "blob" or entry.mode not in {"100644", "100755"}:
+        return None, f"{relative_name}: contract source is not a regular Git blob"
+    try:
+        process = subprocess.run(
+            ["git", "-C", str(root), "cat-file", "blob", entry.object_id],
+            check=False,
+            capture_output=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exception:
+        return None, f"{relative_name}: {exception}"
+    if process.returncode != 0:
+        detail = os.fsdecode(process.stderr).strip() or "Git blob is unavailable"
+        return None, f"{relative_name}: {detail}"
+    try:
+        return process.stdout.decode("utf-8", errors="strict"), None
+    except UnicodeDecodeError as exception:
+        return None, f"{relative_name}: {exception}"
 
 
 def load_json(path: Path) -> tuple[dict[str, Any] | None, str | None]:
@@ -233,6 +352,7 @@ def is_governed_source(path: Path) -> bool:
 
 
 def contract_source_path(path: Path) -> Path:
+    """Resolve a local sidecar for inspection, never for Git-tree authority."""
     if path.suffix.lower() not in SIDECAR_EXTENSIONS:
         return path
     candidates = (
@@ -240,6 +360,28 @@ def contract_source_path(path: Path) -> Path:
         path.parent / "LLM-CONTRACT.md",
     )
     return next((candidate for candidate in candidates if candidate.is_file()), path)
+
+
+def tracked_contract_source_path(path: Path, tracked_paths: set[Path]) -> Path:
+    # LLM-CONTRACT
+    # id: agent-work-governor.tracked-contract-source
+    # state: HEAD_TREE_PATH -> TRACKED_SIDECAR | SOURCE_REQUIRES_INLINE_CONTRACT
+    # preconditions: tracked_paths comes from the exact candidate Git tree
+    # invariant: ambient or untracked files never satisfy committed contract evidence
+    # failure: return the governed source so missing inline evidence fails validation
+    # source: https://github.com/git/git/blob/13c7afec212fc97ce257d15601659314c6673d6c/Documentation/git-ls-tree.adoc
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: changed_code_files
+    # test: bundle:tests/test_repo_bundle.py
+    if path.suffix.lower() not in SIDECAR_EXTENSIONS:
+        return path
+    candidates = (
+        path.with_suffix(".LLM-CONTRACT.md"),
+        path.parent / "LLM-CONTRACT.md",
+    )
+    return next(
+        (candidate for candidate in candidates if candidate in tracked_paths), path
+    )
 
 
 def changed_code_files(
@@ -259,6 +401,11 @@ def changed_code_files(
         return [], error
 
     root = root.resolve()
+    tree_entries, error = git_tree_entries(root, head_ref)
+    if error is not None:
+        return [], error
+    tracked_paths = list(tree_entries)
+    tracked_path_set = set(tracked_paths)
     deleted_paths, error = run_git_paths_z(
         root,
         "diff",
@@ -272,14 +419,11 @@ def changed_code_files(
         return [], error
     deleted_sidecars = {path for path in deleted_paths if is_contract_sidecar(path)}
     if deleted_sidecars:
-        tracked_paths, error = run_git_paths_z(root, "ls-files", "-z")
-        if error is not None:
-            return [], error
         required_sidecars: set[Path] = set()
         for source in tracked_paths:
             if (
                 source.suffix.lower() in SIDECAR_EXTENSIONS
-                and contract_source_path(source) == source
+                and tracked_contract_source_path(source, tracked_path_set) == source
             ):
                 required_sidecars.update(
                     (
@@ -298,37 +442,38 @@ def changed_code_files(
     for path in changed_paths:
         if not is_governed_source(path):
             continue
-        contract_path = contract_source_path(path)
-        if not contract_path.resolve(strict=False).is_relative_to(root):
-            return [], "LLM contract sidecar escapes the repository root"
+        contract_path = tracked_contract_source_path(path, tracked_path_set)
+        _, source_error = git_tree_text(root, tree_entries, contract_path)
+        if source_error is not None:
+            return [], source_error
         paths.add(contract_path)
     return sorted(paths), None
 
 
 def repository_contract_index(
     root: Path,
+    head_ref: str,
 ) -> tuple[dict[str, list[str]], str | None]:
-    tracked_paths, error = run_git_paths_z(root, "ls-files", "-z")
+    tree_entries, error = git_tree_entries(root, head_ref)
     if error is not None:
         return {}, error
 
     contract_sources: set[Path] = set()
+    tracked_paths = list(tree_entries)
+    tracked_path_set = set(tracked_paths)
     root = root.resolve()
     for path in tracked_paths:
         if not is_governed_source(path):
             continue
-        contract_path = contract_source_path(path)
-        if not contract_path.resolve(strict=False).is_relative_to(root):
-            return {}, "LLM contract sidecar escapes the repository root"
+        contract_path = tracked_contract_source_path(path, tracked_path_set)
         contract_sources.add(contract_path)
 
     index: dict[str, list[str]] = {}
     for path in sorted(contract_sources):
         relative_name = str(path.relative_to(root))
-        try:
-            source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exception:
-            return {}, f"{relative_name}: {exception}"
+        source, source_error = git_tree_text(root, tree_entries, path)
+        if source_error is not None or source is None:
+            return {}, source_error or f"{relative_name}: Git blob is unavailable"
         for contract in parsed_contracts(source):
             identifier = contract.get("id")
             if identifier:
@@ -713,7 +858,19 @@ def main() -> int:
                         )
                     )
                 else:
-                    contract_index, index_error = repository_contract_index(root)
+                    tree_entries, tree_error = git_tree_entries(root, head_ref)
+                    if tree_error is not None:
+                        errors.append(
+                            finding(
+                                "LLM_CONTRACT_TREE_UNAVAILABLE",
+                                "cannot read the candidate Git tree",
+                                detail=tree_error,
+                            )
+                        )
+                        tree_entries = {}
+                    contract_index, index_error = repository_contract_index(
+                        root, head_ref
+                    )
                     if index_error is not None:
                         errors.append(
                             finding(
@@ -726,13 +883,12 @@ def main() -> int:
                         errors.extend(repository_contract_id_errors(contract_index))
                     bundle_root = Path(__file__).resolve().parent
                     for path in code_files:
-                        try:
-                            source = path.read_text(encoding="utf-8")
-                        except (OSError, UnicodeDecodeError) as exception:
+                        source, source_error = git_tree_text(root, tree_entries, path)
+                        if source_error is not None or source is None:
                             errors.append(
                                 finding(
                                     "CODE_UNREADABLE",
-                                    str(exception),
+                                    source_error or "Git blob is unavailable",
                                     path=str(path),
                                 )
                             )
