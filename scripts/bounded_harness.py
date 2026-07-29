@@ -327,13 +327,16 @@ def _isolation_identity() -> RunIdentity:
     return RunIdentity(uid, gid)
 
 
-def _candidate_environment(artifacts: Path) -> dict[str, str]:
+def _candidate_environment(
+    artifacts: Path, cargo_home: Path | None = None
+) -> dict[str, str]:
     environment = {
         key: value for key, value in os.environ.items() if key in SAFE_ENVIRONMENT
     }
     environment.update(
         {
-            "CARGO_HOME": str(artifacts),
+            "CARGO_HOME": str(cargo_home or artifacts),
+            "CARGO_NET_OFFLINE": "true",
             "CARGO_TARGET_DIR": str(artifacts / "cargo-target"),
             "HOME": str(artifacts),
             "PIP_CACHE_DIR": str(artifacts / "pip-cache"),
@@ -343,11 +346,28 @@ def _candidate_environment(artifacts: Path) -> dict[str, str]:
             "XDG_CACHE_HOME": str(artifacts),
         }
     )
+    if cargo_home is not None:
+        # LLM contract: one pinned advisory repository -> one protected Git
+        # trust exception; candidate/global Git configuration remains absent.
+        # Primary source: https://git-scm.com/docs/git-config/2.55.0#Documentation/git-config.txt-safedirectory
+        environment.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "safe.directory",
+                "GIT_CONFIG_VALUE_0": str(
+                    (cargo_home / "advisory-db").resolve(strict=True)
+                ),
+            }
+        )
     return environment
 
 
 async def _spawn(
-    argv: list[str], cwd: Path, artifacts: Path, identity: RunIdentity | None
+    argv: list[str],
+    cwd: Path,
+    artifacts: Path,
+    cargo_home: Path | None,
+    identity: RunIdentity | None,
 ) -> asyncio.subprocess.Process:
     if identity is None:
         return await asyncio.create_subprocess_exec(
@@ -361,7 +381,7 @@ async def _spawn(
     return await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
-        env=_candidate_environment(artifacts),
+        env=_candidate_environment(artifacts, cargo_home),
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -380,6 +400,7 @@ async def _execute_check(
     events: dict[str, asyncio.Event],
     semaphore: asyncio.Semaphore,
     state: dict[str, CheckPhase],
+    cargo_home: Path | None,
     identity: RunIdentity | None,
 ) -> dict[str, object]:
     identifier = check["identifier"]
@@ -396,7 +417,11 @@ async def _execute_check(
                 for atom in check["argv"]
             ]
             process = await _spawn(
-                argv, _inside(repository, check["path"]), artifacts, identity
+                argv,
+                _inside(repository, check["path"]),
+                artifacts,
+                cargo_home,
+                identity,
             )
         except HarnessError as error:
             state[identifier] = CheckPhase.FAILED
@@ -529,6 +554,96 @@ def _validate_subject(repository: Path, identity: RunIdentity) -> None:
     )
 
 
+def _trusted_nix_store_path(path: Path) -> bool:
+    # LLM contract: resolved Nix-store path + root-owned immutable mode ->
+    # trusted runtime input, or rejection before candidate execution.
+    # Primary source: https://github.com/NixOS/nix/blob/2c6d06e9387cf58167cb5a7ab91cee7333d8d17c/src/nix/store-api.md
+    try:
+        path.relative_to(Path("/nix/store"))
+        metadata = path.stat()
+    except (OSError, ValueError):
+        return False
+    return (
+        path.is_dir()
+        and metadata.st_uid == 0
+        and metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH) == 0
+    )
+
+
+def _prepare_rust_inputs(
+    source: Path | None,
+    repository: Path,
+    checks: list[dict[str, Any]],
+    runtime: RuntimePaths,
+    identity: RunIdentity,
+) -> Path | None:
+    # LLM contract: immutable Nix inputs + matching candidate Cargo.lock ->
+    # root-owned Cargo home; mismatch or candidate config closes before spawn.
+    # Primary source: https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/doc/src/reference/config.md
+    rust_paths = {check["path"] for check in checks if check["language"] == "rust"}
+    if not rust_paths:
+        return None
+    if source is None:
+        raise HarnessError("HARNESS_RUST_INPUTS_REQUIRED")
+    try:
+        source = source.resolve(strict=True)
+        _require(
+            _trusted_nix_store_path(source),
+            "HARNESS_RUST_INPUTS_UNTRUSTED",
+        )
+        raw_manifest = json.loads((source / "manifest.json").read_bytes())
+        _require(
+            isinstance(raw_manifest, dict)
+            and set(raw_manifest)
+            == {"cargo_lock_sha256", "rustsec_revision", "schema_version"},
+            "HARNESS_RUST_INPUTS_UNTRUSTED",
+        )
+        manifest = cast(dict[str, Any], raw_manifest)
+        _require(
+            manifest["schema_version"] == "0.1"
+            and isinstance(manifest["rustsec_revision"], str)
+            and re.fullmatch(r"[0-9a-f]{40}", manifest["rustsec_revision"]) is not None
+            and isinstance(manifest["cargo_lock_sha256"], str)
+            and DIGEST.fullmatch(manifest["cargo_lock_sha256"]) is not None
+            and (source / "config.toml").is_file()
+            and (source / "advisory-db/.git").is_dir(),
+            "HARNESS_RUST_INPUTS_UNTRUSTED",
+        )
+        _require(len(rust_paths) == 1, "HARNESS_RUST_LAYOUT_UNSUPPORTED")
+        rust_root = _inside(repository, next(iter(rust_paths)))
+        for ancestor in (repository, rust_root):
+            for name in ("config", "config.toml"):
+                _require(
+                    not (ancestor / ".cargo" / name).exists()
+                    and not (ancestor / ".cargo" / name).is_symlink(),
+                    "HARNESS_CARGO_CONFIG_UNTRUSTED",
+                )
+        cargo_lock = rust_root / "Cargo.lock"
+        _require(
+            cargo_lock.is_file()
+            and cargo_lock.stat().st_size <= MAX_PLAN
+            and _sha(cargo_lock.read_bytes()) == manifest["cargo_lock_sha256"],
+            "HARNESS_CARGO_LOCK_DIVERGED",
+        )
+        cargo_home = runtime.receipt.parent / "cargo-home"
+        cargo_home.mkdir(mode=0o755)
+        cargo_home.chmod(0o755)
+        (cargo_home / "config.toml").symlink_to(source / "config.toml")
+        (cargo_home / "advisory-db").symlink_to(source / "advisory-db")
+        advisory_root = cargo_home / "advisory-dbs"
+        advisory_root.mkdir(mode=0o755)
+        advisory_root.chmod(0o755)
+        (advisory_root / "advisory-db-3157b0e258782691").symlink_to(
+            source / "advisory-db"
+        )
+        for lock in (cargo_home / ".package-cache", advisory_root / "db.lock"):
+            lock.touch(mode=0o600)
+            os.chown(lock, identity.uid, identity.gid)
+        return cargo_home
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+        raise HarnessError("HARNESS_RUST_INPUTS_UNTRUSTED") from error
+
+
 def _prepare_runtime(
     repository: Path,
     receipt: Path,
@@ -594,6 +709,7 @@ async def execute(
     workers: int,
     runtime: RuntimePaths,
     identity: RunIdentity | None,
+    cargo_home: Path | None = None,
 ) -> None:
     _require(
         DIGEST.fullmatch(invocation_sha256) is not None and 0 < workers <= 8,
@@ -616,6 +732,7 @@ async def execute(
                 events,
                 semaphore,
                 state,
+                cargo_home,
                 identity,
             )
         )
@@ -686,6 +803,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--invocation-sha256", required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     parser.add_argument("--runtime-root", type=Path, required=True)
+    parser.add_argument("--trusted-rust-inputs", type=Path)
     parser.add_argument("--workers", type=int, default=2)
     args = parser.parse_args(argv)
     runtime: RuntimePaths | None = None
@@ -696,6 +814,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         bindings, checks, plan_sha256, coverage_sha256 = load_plan(
             args.plan_report, args.expected_plan_sha256
+        )
+        cargo_home = _prepare_rust_inputs(
+            args.trusted_rust_inputs, repository, checks, runtime, identity
         )
         asyncio.run(
             execute(
@@ -709,6 +830,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.workers,
                 runtime,
                 identity,
+                cargo_home,
             )
         )
     except KeyboardInterrupt:

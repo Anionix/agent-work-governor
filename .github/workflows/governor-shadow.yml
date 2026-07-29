@@ -88,14 +88,19 @@ jobs:
             nix build --no-update-lock-file --no-write-lock-file \
               "path:$control#default" --no-link --print-out-paths
           )"
+          rust_inputs="$(
+            nix build --no-update-lock-file --no-write-lock-file \
+              "path:$control#shadow-inputs" --no-link --print-out-paths
+          )"
           nix develop --no-update-lock-file --no-write-lock-file \
             "path:$control" --command bash -s -- \
-            "$control" "$subject" "$output" "$package" <<'SHADOW'
+            "$control" "$subject" "$output" "$package" "$rust_inputs" <<'SHADOW'
           set -euo pipefail
           control=$1
           subject=$2
           output=$3
           package=$4
+          rust_inputs=$5
           plugin="$package/share/agent-work-governor"
           python="$(command -v python)"
           hash_file() { nix hash file --type sha256 --base16 "$1"; }
@@ -106,13 +111,15 @@ jobs:
             nix hash path --type sha256 --base16 "$subject_store"
           )"
           control_manifest_sha="$(hash_file "$plugin/bin/manifest.json")"
+          rust_inputs_sha="$(nix hash path --type sha256 --base16 "$rust_inputs")"
           printf '%s' "$CANDIDATE_HEAD_SHA" > "$output/revision"
-          printf '%s\n%s\n%s\n' "$CONTROL_SHA" "$control_manifest_sha" \
-            "$RUNNER_LABEL" > "$output/environment"
-          printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+          printf '%s\n%s\n%s\n%s\n' "$CONTROL_SHA" "$control_manifest_sha" \
+            "$rust_inputs_sha" "$RUNNER_LABEL" > "$output/environment"
+          printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
             "$CONTROL_SHA" "$CANDIDATE_REPOSITORY" "$CANDIDATE_HEAD_SHA" \
             "$candidate_archive_sha" "$candidate_store_sha" "$WORKFLOW_RUN_ID" \
-            "$WORKFLOW_RUN_ATTEMPT:$RUNNER_LABEL" > "$output/invocation"
+            "$WORKFLOW_RUN_ATTEMPT:$RUNNER_LABEL" "$rust_inputs_sha" \
+            > "$output/invocation"
           revision_sha="$(hash_file "$output/revision")"
           policy_sha="$(hash_file "$plugin/assets/presets/owner-original.toml")"
           toolchain_sha="$(hash_file "$plugin/toolchain.lock.json")"
@@ -171,6 +178,7 @@ jobs:
               --invocation-sha256 "$invocation_sha" \
               --receipt "$receipt" \
               --runtime-root "$runtime" \
+              --trusted-rust-inputs "$rust_inputs" \
               > "$output/harness.json" 2> "$output/harness.stderr" \
               || harness_exit=$?
           fi
@@ -199,7 +207,7 @@ jobs:
           sudo /usr/bin/env -i "$python" -B - "$output" "$runtime" \
             "$CONTROL_SHA" "$CANDIDATE_REPOSITORY" "$CANDIDATE_HEAD_SHA" \
             "$candidate_archive_sha" "$candidate_store_sha" \
-            "$control_manifest_sha" "$RUNNER_LABEL" "$WORKFLOW_RUN_ID" \
+            "$control_manifest_sha" "$rust_inputs_sha" "$RUNNER_LABEL" "$WORKFLOW_RUN_ID" \
             "$WORKFLOW_RUN_ATTEMPT" "$plan_exit" "$harness_exit" \
             "$verify_exit" <<'PYTHON' > "$output/shadow.json"
           import hashlib
@@ -216,6 +224,7 @@ jobs:
               candidate_archive_sha,
               candidate_store_sha,
               control_manifest_sha,
+              rust_inputs_sha,
               runner,
               workflow_run_id,
               workflow_run_attempt,
@@ -307,6 +316,7 @@ jobs:
               "plan_report_sha256": plan_digest,
               "reason_codes": sorted(reason_codes),
               "receipt_sha256": receipt_digest,
+              "rust_inputs_sha256": rust_inputs_sha,
               "runner": runner,
               "schema_version": "0.1",
               "stage_exit": exits,

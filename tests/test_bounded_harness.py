@@ -282,6 +282,7 @@ class BoundedHarnessTests(unittest.TestCase):
             environment = harness._candidate_environment(self.root)
         self.assertEqual("/trusted/bin", environment["PATH"])
         self.assertEqual("/trusted/python", environment["PYTHONPATH"])
+        self.assertEqual("true", environment["CARGO_NET_OFFLINE"])
         self.assertEqual(
             "-isystem /nix/store/include",
             environment["NIX_CFLAGS_COMPILE"],
@@ -318,6 +319,58 @@ class BoundedHarnessTests(unittest.TestCase):
             self.assertEqual(1, self.invoke(digest, workers=1))
         fault = json.loads(self.receipt.with_name("run.json.fault.json").read_text())
         self.assertEqual("HARNESS_CONTAINMENT_FAILED", fault["code"])
+
+    def test_trusted_rust_inputs_bind_lock_and_read_only_cargo_home(self) -> None:
+        rust = self.root / "rust"
+        rust.mkdir()
+        cargo_lock = rust / "Cargo.lock"
+        cargo_lock.write_bytes(b"locked")
+        source = self.root / "trusted-rust-inputs"
+        (source / "advisory-db/.git").mkdir(parents=True)
+        (source / "config.toml").write_text("[net]\noffline = true\n")
+        (source / "manifest.json").write_bytes(
+            encoded(
+                {
+                    "cargo_lock_sha256": hashlib.sha256(b"locked").hexdigest(),
+                    "rustsec_revision": "b" * 40,
+                    "schema_version": "0.1",
+                }
+            )
+        )
+        repository, runtime = harness._prepare_runtime(
+            self.root, self.receipt, self.runtime_root, None
+        )
+        identity = harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid)
+        checks = [{"language": "rust", "path": "rust"}]
+        cargo_config = self.root / ".cargo/config.toml"
+        cargo_config.parent.mkdir()
+        cargo_config.write_text("[net]\noffline = false\n")
+        with (
+            mock.patch.object(harness, "_trusted_nix_store_path", return_value=True),
+            self.assertRaises(harness.HarnessError) as raised,
+        ):
+            harness._prepare_rust_inputs(source, repository, checks, runtime, identity)
+        self.assertEqual("HARNESS_CARGO_CONFIG_UNTRUSTED", raised.exception.code)
+        cargo_config.unlink()
+        with (
+            mock.patch.object(harness, "_trusted_nix_store_path", return_value=True),
+            mock.patch.object(harness.os, "chown"),
+        ):
+            cargo_home = harness._prepare_rust_inputs(
+                source, repository, checks, runtime, identity
+            )
+        assert cargo_home is not None
+        self.assertEqual(source / "config.toml", (cargo_home / "config.toml").resolve())
+        environment = harness._candidate_environment(runtime.artifacts, cargo_home)
+        self.assertEqual(str(cargo_home), environment["CARGO_HOME"])
+        self.assertEqual(str(source / "advisory-db"), environment["GIT_CONFIG_VALUE_0"])
+        cargo_lock.write_bytes(b"changed")
+        with (
+            mock.patch.object(harness, "_trusted_nix_store_path", return_value=True),
+            self.assertRaises(harness.HarnessError) as raised,
+        ):
+            harness._prepare_rust_inputs(source, repository, checks, runtime, identity)
+        self.assertEqual("HARNESS_CARGO_LOCK_DIVERGED", raised.exception.code)
 
     def test_invalid_digest_and_escaped_cwd_spawn_nothing(self) -> None:
         digest = self.plan([self.check("python.safe", "print('x')")])
