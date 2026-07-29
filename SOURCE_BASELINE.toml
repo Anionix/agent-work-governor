@@ -42,6 +42,7 @@ schema_bound_json_contracts = [
   "adapters/rust-check-recipes.v1.json=adapters/rust-check-recipes.v1.LLM-CONTRACT.md",
   "adapters/ask-matt-routes.json=adapters/LLM-CONTRACT.md",
   "references/ask-matt.lock.json=references/LLM-CONTRACT.md",
+  "references/canonical-runtime.lock.json=references/LLM-CONTRACT.md",
   "references/canonical-validators.lock.json=references/LLM-CONTRACT.md",
   "references/code-review.lock.json=references/LLM-CONTRACT.md",
   "references/okf-v0.2.lock.json=references/LLM-CONTRACT.md",

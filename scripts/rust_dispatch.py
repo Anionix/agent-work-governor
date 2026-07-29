@@ -34,6 +34,13 @@ SOURCE_INPUTS = (
     Path("rust/deny.toml"),
     Path("rust/rust-toolchain.toml"),
     Path("rust/rustfmt.toml"),
+    Path("scripts/canonical_runtime_runner.py"),
+    Path("scripts/doctor.py"),
+    Path("scripts/package_canonical_runtime.py"),
+    Path("scripts/validate_canonical.py"),
+    Path("references/canonical-runtime.lock.json"),
+    Path("references/canonical-validators.lock.json"),
+    Path("vendor/pyyaml-6.0.3.zip"),
 )
 SUPPORTED_TARGETS = frozenset(
     {

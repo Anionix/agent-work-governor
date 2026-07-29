@@ -14,6 +14,7 @@ from typing import Any
 
 import rust_dispatch
 import toolchain_catalog
+import validate_canonical
 import validate_okf
 import validate_policy
 
@@ -95,30 +96,24 @@ def canonical_validator(
     validator: Path,
     expected_sha256: str,
     target: Path,
+    runtime: validate_canonical.RuntimeSnapshot,
 ) -> tuple[str, str]:
-    if not validator.is_file():
-        return "INCONCLUSIVE", f"canonical validator not found: {validator}"
-    observed_sha256 = digest(validator)
-    if observed_sha256 != expected_sha256:
-        return (
-            "INCONCLUSIVE",
-            f"canonical validator digest mismatch: {observed_sha256}",
-        )
     try:
-        process = subprocess.run(
-            [sys.executable, "-I", str(validator), str(target)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=30,
+        process = validate_canonical.run_validator(
+            validator,
+            expected_sha256,
+            runtime,
+            target,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except validate_canonical.CanonicalRuntimeError as error:
+        return "INCONCLUSIVE" if error.inconclusive else "FAIL", error.code
+    except validate_canonical.CanonicalValidationError as error:
+        return "FAIL", str(error)
+    except (OSError, subprocess.SubprocessError) as error:
         return "INCONCLUSIVE", str(error)
     evidence = (process.stdout.strip() or process.stderr.strip())[:2000]
     if process.returncode == 0:
         return "PASS", evidence or str(validator)
-    if "ModuleNotFoundError" in evidence:
-        return "INCONCLUSIVE", evidence
     return "FAIL", evidence or f"validator exited {process.returncode}"
 
 
@@ -152,9 +147,37 @@ def audit(repo: Path) -> dict[str, Any]:
     except (OSError, json.JSONDecodeError) as error:
         add("FAIL", "plugin_manifest_parse_smoke", str(error))
 
-    validator_lock_path = plugin_root / "references/canonical-validators.lock.json"
+    skill_paths: list[Path] = []
     try:
-        validator_lock = json.loads(validator_lock_path.read_text(encoding="utf-8"))
+        validator_lock = validate_canonical.load_lock(plugin_root)
+        skill_paths = sorted(
+            path for path in (plugin_root / "skills").iterdir() if path.is_dir()
+        )
+        runtime = validate_canonical.load_runtime(plugin_root, validator_lock)
+    except validate_canonical.CanonicalRuntimeError as error:
+        status = "INCONCLUSIVE" if error.inconclusive else "FAIL"
+        add(status, "canonical_validator_runtime", error.code)
+        add(status, "plugin_manifest_canonical", f"not executed: {error.code}")
+        for skill_path in skill_paths:
+            add(
+                status,
+                f"skill_canonical:{skill_path.name}",
+                f"not executed: {error.code}",
+            )
+    except (
+        OSError,
+        KeyError,
+        TypeError,
+        json.JSONDecodeError,
+        validate_canonical.CanonicalValidationError,
+    ) as error:
+        add("FAIL", "canonical_validator_lock", str(error))
+    else:
+        add(
+            "PASS",
+            "canonical_validator_runtime",
+            f"{runtime.relative_path}: {runtime.sha256}",
+        )
         plugin_validator_lock = validator_lock["plugin_validator"]
         skill_validator_lock = validator_lock["skill_validator"]
         plugin_validator = Path.home() / plugin_validator_lock["path"]
@@ -163,20 +186,18 @@ def audit(repo: Path) -> dict[str, Any]:
             validator=plugin_validator,
             expected_sha256=plugin_validator_lock["sha256"],
             target=plugin_root,
+            runtime=runtime,
         )
         add(status, "plugin_manifest_canonical", evidence)
 
-        for skill_path in sorted(
-            path for path in (plugin_root / "skills").iterdir() if path.is_dir()
-        ):
+        for skill_path in skill_paths:
             status, evidence = canonical_validator(
                 validator=skill_validator,
                 expected_sha256=skill_validator_lock["sha256"],
                 target=skill_path,
+                runtime=runtime,
             )
             add(status, f"skill_canonical:{skill_path.name}", evidence)
-    except (OSError, KeyError, TypeError, json.JSONDecodeError) as error:
-        add("FAIL", "canonical_validator_lock", str(error))
 
     status, evidence = inspect_toolchain_catalog(
         plugin_root / "toolchain.lock.json",
