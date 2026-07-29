@@ -1,0 +1,22 @@
+# LLM-CONTRACT
+# id: agent-work-governor.uv-workspace-audit-root-fixture
+# state: ROOT_PROJECT + UNREACHABLE_MEMBER -> LOCKED_WORKSPACE_GRAPH
+# preconditions: the root project has no dependency edge to the member
+# invariant: workspace membership alone is the only route to the member graph
+# failure: the regression no longer distinguishes root-only from workspace export
+# source: https://github.com/astral-sh/uv/blob/fece32fc54b0e6fb6a031d3c80397cc4afb25737/docs/concepts/projects/workspaces.md
+# knowledge: repo:adapters/check-recipes.v1.LLM-CONTRACT.md
+# enforced_by: tool.uv.workspace
+# test: repo:tests/test_contracts.py
+
+[project]
+name = "audit-root"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["member"]

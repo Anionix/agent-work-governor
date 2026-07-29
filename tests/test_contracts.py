@@ -1223,6 +1223,76 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertTrue(security["source"].startswith("https://"))
         self.assertRegex(security["source_digest"], r"^sha256:[0-9a-f]{64}$")
 
+    def test_python_audit_exports_every_uv_workspace_package(self) -> None:
+        # LLM contract: locked workspace -> complete hashed audit input or test failure.
+        catalog = json.loads(
+            (PLUGIN_ROOT / "adapters/check-recipes.v1.json").read_text(encoding="utf-8")
+        )
+        export_recipe = next(
+            recipe
+            for recipe in catalog["recipes"]
+            if recipe["id"] == "python.uv-export"
+        )
+        fixture = PLUGIN_ROOT / "tests/fixtures/uv-workspace-audit"
+
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "requirements.txt"
+            argv = [
+                str(output) if isinstance(atom, dict) else atom
+                for atom in export_recipe["argv"]
+            ]
+            environment = {
+                **os.environ,
+                "UV_CACHE_DIR": str(Path(directory) / "cache"),
+                "UV_OFFLINE": "1",
+            }
+            completed = subprocess.run(
+                argv,
+                cwd=fixture,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            requirements = output.read_text(encoding="utf-8")
+            root_only_output = Path(directory) / "root-only-requirements.txt"
+            root_only_argv = [
+                str(root_only_output) if atom == str(output) else atom
+                for atom in argv
+                if atom != "--all-packages"
+            ]
+            root_only = subprocess.run(
+                root_only_argv,
+                cwd=fixture,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, root_only.returncode, root_only.stderr)
+            root_only_requirements = root_only_output.read_text(encoding="utf-8")
+
+        self.assertIn("idna==3.11", requirements)
+        self.assertIn("--hash=sha256:", requirements)
+        self.assertNotIn("idna==3.11", root_only_requirements)
+        self.assertIn("--all-packages", argv)
+        self.assertIn("--locked", argv)
+
+        workflow = (PLUGIN_ROOT / ".github/workflows/governor.yml").read_text(
+            encoding="utf-8"
+        )
+        python_checks = workflow_run_block(
+            workflow,
+            "Check locked Python toolchain and dependencies",
+        )
+        export_start = python_checks.index("run_locked uv export")
+        audit_start = python_checks.index("run_locked pip-audit", export_start)
+        export_command = python_checks[export_start:audit_start]
+        self.assertIn("--all-packages", export_command)
+        self.assertIn("--locked", export_command)
+        self.assertIn("--require-hashes", python_checks[audit_start:])
+
     def test_pre_nix_bootstrap_rejects_provenance_mutations(self) -> None:
         accepted = run_nix_bootstrap_fixture()
         self.assertEqual(0, accepted.returncode, accepted.stderr)

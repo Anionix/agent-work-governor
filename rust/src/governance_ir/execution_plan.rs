@@ -408,11 +408,11 @@ mod tests {
     fn mixed_golden_is_canonical_and_digest_bound() -> Result<(), Box<dyn StdError>> {
         let plan = PlanEmitter::emit(&GovernanceIr::resolve(fixtures())?)?;
         assert_eq!(
-            br#"{"checks":[{"argv":["uv","lock","--check"],"dependencies":[],"identifier":"python.uv-lock","input_artifacts":[],"kind":"dependency","language":"python","output_artifacts":[],"path":".","timeout_seconds":60,"tool":{"identity":"uv","version":"0.11.33"}},{"argv":["uv","export","--quiet","--locked","--all-extras","--all-groups","--no-emit-workspace","--format","requirements.txt","--output-file",{"artifact":"python-audit-requirements"}],"dependencies":["python.uv-lock"],"identifier":"python.uv-export","input_artifacts":[],"kind":"dependency","language":"python","output_artifacts":["python-audit-requirements"],"path":".","timeout_seconds":60,"tool":{"identity":"uv","version":"0.11.33"}},{"argv":["cargo","test","--workspace","--all-features","--locked","--offline"],"dependencies":[],"identifier":"rust.tests","input_artifacts":[],"kind":"test","language":"rust","output_artifacts":[],"path":"rust","timeout_seconds":600,"tool":{"identity":"cargo","version":"1.97.1"}}],"schema_version":"0.1"}"#,
+            br#"{"checks":[{"argv":["uv","lock","--check"],"dependencies":[],"identifier":"python.uv-lock","input_artifacts":[],"kind":"dependency","language":"python","output_artifacts":[],"path":".","timeout_seconds":60,"tool":{"identity":"uv","version":"0.11.33"}},{"argv":["uv","export","--quiet","--locked","--all-packages","--all-extras","--all-groups","--no-emit-workspace","--format","requirements.txt","--output-file",{"artifact":"python-audit-requirements"}],"dependencies":["python.uv-lock"],"identifier":"python.uv-export","input_artifacts":[],"kind":"dependency","language":"python","output_artifacts":["python-audit-requirements"],"path":".","timeout_seconds":60,"tool":{"identity":"uv","version":"0.11.33"}},{"argv":["cargo","test","--workspace","--all-features","--locked","--offline"],"dependencies":[],"identifier":"rust.tests","input_artifacts":[],"kind":"test","language":"rust","output_artifacts":[],"path":"rust","timeout_seconds":600,"tool":{"identity":"cargo","version":"1.97.1"}}],"schema_version":"0.1"}"#,
             plan.canonical_json.as_slice()
         );
         assert_eq!(
-            "853f8cf3d4ef642e0be5d4f0724f947f0326e8c3ee14201d62d45ce3ce7b215f",
+            "6e55ac6661848ba8b48cb0cb744ecaacc9b10c36ef281783c951b05bb7beeee6",
             plan.sha256
         );
         let encoded = String::from_utf8(plan.canonical_json)?;

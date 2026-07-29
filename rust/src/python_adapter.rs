@@ -11,7 +11,7 @@ use thiserror::Error;
 
 const RECIPE_BYTES: &str = include_str!("../../adapters/check-recipes.v1.json");
 const RECIPE_SCHEMA: &str = "0.2";
-const RECIPE_SHA256: &str = "35dd14bb851cc822d50327db3f5bb3ccb89b2e5f8a958d35f19d27166a302333";
+const RECIPE_SHA256: &str = "2bb2a21929e8dfd65d3ccb77889d0901aea58443d5094e4c6e327198a4c46efc";
 const TOOLCHAIN_BYTES: &str = include_str!("../../toolchain.lock.json");
 
 // LLM-CONTRACT
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(7, checks.len());
         assert_eq!("0.2", encoded["catalog_version"]);
         assert_eq!(
-            "35dd14bb851cc822d50327db3f5bb3ccb89b2e5f8a958d35f19d27166a302333",
+            "2bb2a21929e8dfd65d3ccb77889d0901aea58443d5094e4c6e327198a4c46efc",
             encoded["catalog_sha256"]
         );
         assert_eq!(
@@ -402,6 +402,7 @@ mod tests {
                 "export",
                 "--quiet",
                 "--locked",
+                "--all-packages",
                 "--all-extras",
                 "--all-groups",
                 "--no-emit-workspace",

@@ -427,6 +427,7 @@
               toolchain.gitleaks
               toolchain.ruff
               toolchain.ty
+              toolchain.uv
             ];
             preCheck = ''
               assert_locked_identity() {
