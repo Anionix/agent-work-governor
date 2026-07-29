@@ -563,6 +563,113 @@ class AuthorityTests(unittest.TestCase):
                     (result.status, result.code),
                 )
 
+    def test_pagination_relations_prove_no_same_head_page_is_hidden(self) -> None:
+        hidden_duplicate: dict[int, object] = {
+            1: [self.pull()],
+            2: [self.pull(number=34, head_sha=self.head_sha)],
+        }
+        last_without_next = f'<{self.list_url(2)}>; rel="last"'
+        result = self.validate(
+            pages=hidden_duplicate,
+            page_links={1: last_without_next},
+        )
+        self.assertEqual(
+            ("INCONCLUSIVE", "AUTHORITY_LINK_INVALID"),
+            (result.status, result.code),
+        )
+
+        contradictory = (
+            f'<{self.list_url(2)}>; rel="next", <{self.list_url(1)}>; rel="last"'
+        )
+        result = self.validate(
+            pages={1: [self.pull()], 2: []},
+            page_links={1: contradictory},
+        )
+        self.assertEqual(
+            ("INCONCLUSIVE", "AUTHORITY_LINK_INVALID"),
+            (result.status, result.code),
+        )
+
+        promised_last = (
+            f'<{self.list_url(2)}>; rel="next", <{self.list_url(3)}>; rel="last"'
+        )
+        shortened_last = f'<{self.list_url(2)}>; rel="last"'
+        cross_page_cases: tuple[dict[int, str | None], ...] = (
+            {1: promised_last, 2: shortened_last},
+            {1: promised_last, 2: None},
+        )
+        pages_with_hidden_duplicate: dict[int, object] = {
+            1: [self.pull()],
+            2: [self.pull(number=34, head_sha="c" * 40)],
+            3: [self.pull(number=35, head_sha=self.head_sha)],
+        }
+        for links in cross_page_cases:
+            with self.subTest(links=links):
+                result = self.validate(
+                    pages=pages_with_hidden_duplicate,
+                    page_links=links,
+                )
+                self.assertEqual(
+                    ("INCONCLUSIVE", "AUTHORITY_LINK_INVALID"),
+                    (result.status, result.code),
+                )
+
+    def test_canonical_first_middle_and_final_links_complete(self) -> None:
+        links: dict[int, str | None] = {
+            1: (f'<{self.list_url(2)}>; rel="next", <{self.list_url(3)}>; rel="last"'),
+            2: (
+                f'<{self.list_url(1)}>; rel="prev", '
+                f'<{self.list_url(3)}>; rel="next", '
+                f'<{self.list_url(1)}>; rel="first"'
+            ),
+            3: (
+                f'<{self.list_url(2)}>; rel="prev", '
+                f'<{self.list_url(3)}>; rel="last", '
+                f'<{self.list_url(1)}>; rel="first"'
+            ),
+        }
+        result = self.validate(
+            pages={
+                1: [self.pull()],
+                2: [self.pull(number=34, head_sha="c" * 40)],
+                3: [],
+            },
+            page_links=links,
+        )
+        self.assertEqual("PASS", result.status)
+
+    def test_all_pagination_relations_are_unique_canonical_and_bounded(self) -> None:
+        invalid_links = (
+            (
+                f'<{self.list_url(2)}>; rel="next", '
+                f'<{self.list_url(2)}>; rel="last", '
+                f'<{self.list_url(2)}>; rel="last"'
+            ),
+            '<https://attacker.example/pulls?page=2>; rel="last"',
+            f'<{self.list_url(2)}&page=2>; rel="last"',
+            f'<{self.list_url(2)}>; rel="unknown"',
+        )
+        for link in invalid_links:
+            with self.subTest(link=link):
+                result = self.validate(
+                    pages={1: [self.pull()], 2: []},
+                    page_links={1: link},
+                )
+                self.assertEqual(
+                    ("INCONCLUSIVE", "AUTHORITY_LINK_INVALID"),
+                    (result.status, result.code),
+                )
+
+        overflow = f'<{self.list_url(validate_pr_authority.MAX_PAGES + 1)}>; rel="last"'
+        result = self.validate(
+            pages={1: [self.pull()]},
+            page_links={1: overflow},
+        )
+        self.assertEqual(
+            ("INCONCLUSIVE", "AUTHORITY_PAGINATION_INCOMPLETE"),
+            (result.status, result.code),
+        )
+
     def test_invalid_inputs_never_fetch(self) -> None:
         for repository, token, api_url in (
             ("../repo", "secret", self.api),

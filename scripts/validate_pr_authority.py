@@ -227,59 +227,99 @@ def _pull_list_url(repository_url: str, page: int) -> str:
     )
 
 
-# Primary source: https://github.com/github/docs/blob/72ef2d329866e5d0d52829f105f853da9bcf4260/content/rest/using-the-rest-api/using-pagination-in-the-rest-api.md
 def _next_page(
     link: str | None,
     identity: EventIdentity,
     current_page: int,
-) -> int | None:
+    expected_last: int | None,
+) -> tuple[int | None, int | None]:
+    # LLM-CONTRACT
+    # id: agent-work-governor.pagination-completeness
+    # state: LINK_HEADER -> UNIQUE_RELATIONS -> CANONICAL_PAGES -> NEXT_PAGE | COMPLETE
+    # preconditions: current_page and expected_last describe the bounded traversal
+    # invariant: last cannot advertise or later hide unseen pages without exact next
+    # failure: malformed, duplicate, contradictory, or over-bound relations are inconclusive
+    # source: https://github.com/github/docs/blob/72ef2d329866e5d0d52829f105f853da9bcf4260/content/rest/using-the-rest-api/using-pagination-in-the-rest-api.md
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: _live_snapshot
+    # test: bundle:tests/test_pr_authority.py
     if link is None:
-        return None
+        if expected_last is not None and current_page != expected_last:
+            raise _Uncertain("AUTHORITY_LINK_INVALID")
+        return None, expected_last
     if not isinstance(link, str) or not link or len(link) > MAX_LINK_CHARS:
         raise _Uncertain("AUTHORITY_LINK_INVALID")
-    next_urls: list[str] = []
+
+    relations: dict[str, str] = {}
     for entry in link.split(","):
         match = LINK_RE.fullmatch(entry)
         if match is None:
             raise _Uncertain("AUTHORITY_LINK_INVALID")
-        if match.group("rel") == "next":
-            next_urls.append(match.group("url"))
-    if not next_urls:
-        return None
-    if len(next_urls) != 1:
-        raise _Uncertain("AUTHORITY_LINK_INVALID")
+        relation = match.group("rel")
+        if relation not in {"first", "prev", "next", "last"} or relation in relations:
+            raise _Uncertain("AUTHORITY_LINK_INVALID")
+        relations[relation] = match.group("url")
 
     allowed_paths = {
         f"/repos/{identity.repository}/pulls",
         f"/repositories/{identity.repository_id}/pulls",
     }
-    try:
-        target = urlsplit(next_urls[0])
-        query = parse_qsl(
-            target.query,
-            keep_blank_values=True,
-            strict_parsing=True,
-            max_num_fields=8,
-        )
-    except ValueError as error:
-        raise _Uncertain("AUTHORITY_LINK_INVALID") from error
-    expected = {
+    expected_query = {
         "state": "open",
         "sort": "created",
         "direction": "asc",
         "per_page": str(PAGE_SIZE),
-        "page": str(current_page + 1),
     }
-    if (
-        target.scheme != "https"
-        or target.netloc != "api.github.com"
-        or target.path not in allowed_paths
-        or target.fragment
-        or len(query) != len(expected)
-        or dict(query) != expected
+    pages: dict[str, int] = {}
+    for relation, url in relations.items():
+        try:
+            target = urlsplit(url)
+            query = parse_qsl(
+                target.query,
+                keep_blank_values=True,
+                strict_parsing=True,
+                max_num_fields=8,
+            )
+        except ValueError as error:
+            raise _Uncertain("AUTHORITY_LINK_INVALID") from error
+        query_values = dict(query)
+        page_value = query_values.pop("page", None)
+        if (
+            target.scheme != "https"
+            or target.netloc != "api.github.com"
+            or target.path not in allowed_paths
+            or target.fragment
+            or len(query) != len(expected_query) + 1
+            or query_values != expected_query
+            or not isinstance(page_value, str)
+            or re.fullmatch(r"[1-9][0-9]{0,9}", page_value) is None
+        ):
+            raise _Uncertain("AUTHORITY_LINK_INVALID")
+        pages[relation] = int(page_value)
+
+    if pages.get("first", 1) != 1:
+        raise _Uncertain("AUTHORITY_LINK_INVALID")
+    if "prev" in pages and (current_page == 1 or pages["prev"] != current_page - 1):
+        raise _Uncertain("AUTHORITY_LINK_INVALID")
+    if "next" in pages and pages["next"] != current_page + 1:
+        raise _Uncertain("AUTHORITY_LINK_INVALID")
+
+    last_page = pages.get("last")
+    next_page = pages.get("next")
+    if last_page is not None:
+        if last_page > MAX_PAGES:
+            raise _Uncertain("AUTHORITY_PAGINATION_INCOMPLETE")
+        if last_page < current_page or (
+            expected_last is not None and last_page != expected_last
+        ):
+            raise _Uncertain("AUTHORITY_LINK_INVALID")
+        expected_last = last_page
+    if expected_last is not None and (
+        (expected_last > current_page and next_page is None)
+        or (next_page is not None and next_page > expected_last)
     ):
         raise _Uncertain("AUTHORITY_LINK_INVALID")
-    return current_page + 1
+    return next_page, expected_last
 
 
 def _live_snapshot(
@@ -333,6 +373,7 @@ def _live_snapshot(
     listed_pulls: list[tuple[int, str]] = []
     seen_numbers: set[int] = set()
     page = 1
+    expected_last: int | None = None
     for _ in range(MAX_PAGES):
         response = _call(_pull_list_url(repository_url, page), token, fetcher)
         document = response.document
@@ -364,7 +405,12 @@ def _live_snapshot(
             listed_pulls.append((candidate_number, candidate_sha))
             if candidate_sha == head_sha:
                 candidates.append(candidate_number)
-        next_page = _next_page(response.link, identity, page)
+        next_page, expected_last = _next_page(
+            response.link,
+            identity,
+            page,
+            expected_last,
+        )
         if next_page is None:
             break
         page = next_page
