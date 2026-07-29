@@ -69,22 +69,60 @@
           "rust"
         ]
       ) typedTools;
+      # LLM contract: tool ID + declared identity -> canonical kind/repository or evaluation failure.
+      canonicalGitRepositories = {
+        "cachix/install-nix-action" = "https://github.com/cachix/install-nix-action";
+        cargo = "https://github.com/rust-lang/cargo";
+        clippy = "https://github.com/rust-lang/rust";
+        ruff = "https://github.com/astral-sh/ruff";
+        rust = "https://github.com/rust-lang/rust";
+        rustfmt = "https://github.com/rust-lang/rust";
+        ty = "https://github.com/astral-sh/ty";
+        uv = "https://github.com/astral-sh/uv";
+      };
       validPin =
         entry:
         let
           gitDigest = builtins.match "git:([0-9a-f]{40})" entry.source_digest;
           shaDigest = builtins.match "sha256:[0-9a-f]{64}" entry.source_digest;
           gitCommit = if gitDigest == null then "" else builtins.head gitDigest;
+          gitRepository =
+            if builtins.hasAttr entry.id canonicalGitRepositories then
+              builtins.getAttr entry.id canonicalGitRepositories
+            else
+              null;
         in
         builtins.match "(v?[0-9]+(\\.[0-9]+){1,3}([-+][A-Za-z0-9.]+)?|[0-9a-f]{40})" entry.version != null
         && builtins.match "https://.+" entry.source != null
         && (
-          shaDigest != null
-          || (gitDigest != null && builtins.match "https://.*${gitCommit}.*" entry.source != null)
+          if gitRepository != null then
+            gitDigest != null && entry.source == "${gitRepository}/commit/${gitCommit}"
+          else
+            shaDigest != null
         );
+      gitRepositoryBindingSelfTest =
+        let
+          commit = "0000000000000000000000000000000000000000";
+          rejectsRepository = !validPin {
+            id = "cachix/install-nix-action";
+            version = "v1.0.0";
+            source = "https://github.com/unrelated/repository/commit/${commit}";
+            source_digest = "git:${commit}";
+          };
+          rejectsDigestDowngrade = !validPin {
+            id = "cachix/install-nix-action";
+            version = "v1.0.0";
+            source = "https://github.com/cachix/install-nix-action/commit/${commit}";
+            source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+          };
+        in
+        if rejectsRepository && rejectsDigestDowngrade then
+          true
+        else
+          fail "TOOLCHAIN_GIT_REPOSITORY_SELF_TEST_FAILED" "cachix/install-nix-action";
       invalidPins = builtins.filter (entry: !validPin entry) typedTools;
       missingRequired = builtins.filter (toolId: !builtins.elem toolId toolIds) requiredIds;
-      checkedTools =
+      checkedTools = builtins.seq gitRepositoryBindingSelfTest (
         if hasDuplicates toolIds || hasDuplicates requiredIds then
           fail "TOOLCHAIN_DUPLICATE_ID" ""
         else if invalidPins != [ ] then
@@ -94,7 +132,8 @@
         else if missingRequired != [ ] then
           fail "REQUIRED_TOOL_NOT_LOCKED" (builtins.head missingRequired)
         else
-          typedTools;
+          typedTools
+      );
       pin =
         toolId:
         let

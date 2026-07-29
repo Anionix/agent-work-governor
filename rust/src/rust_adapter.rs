@@ -274,7 +274,7 @@ mod tests {
         assert_eq!("0.1", encoded["catalog_version"]);
         assert_eq!(RECIPE_SHA256, encoded["catalog_sha256"]);
         assert_eq!(
-            "f123483a002951bec0907eb883c67ecdf3987561630947165f5ae30c3b34467a",
+            "c59d3d37873cc03f65150498af03a107f0411c5e6d59d360d19eca1408161b58",
             encoded["toolchain_sha256"]
         );
         assert_eq!("0.22.2", checks[0]["tool"]["version"]);

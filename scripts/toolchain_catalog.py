@@ -8,7 +8,7 @@ import json
 import re
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, TypedDict, cast
+from typing import Any, Final, TypedDict, cast
 
 # LLM-CONTRACT
 # id: agent-work-governor.toolchain-catalog
@@ -31,6 +31,16 @@ DIGEST_PATTERN = re.compile(r"(?:git:[0-9a-f]{40}|sha256:[0-9a-f]{64})")
 SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 PIN_FIELDS = frozenset({"id", "language", "version", "source", "source_digest"})
 FLOATING_VERSIONS = frozenset({"head", "latest", "main", "master", "nightly", "stable"})
+CANONICAL_GIT_REPOSITORIES: Final[dict[str, str]] = {
+    "cachix/install-nix-action": "https://github.com/cachix/install-nix-action",
+    "cargo": "https://github.com/rust-lang/cargo",
+    "clippy": "https://github.com/rust-lang/rust",
+    "ruff": "https://github.com/astral-sh/ruff",
+    "rust": "https://github.com/rust-lang/rust",
+    "rustfmt": "https://github.com/rust-lang/rust",
+    "ty": "https://github.com/astral-sh/ty",
+    "uv": "https://github.com/astral-sh/uv",
+}
 
 
 class Finding(TypedDict):
@@ -56,6 +66,42 @@ def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 def _finding(code: str, tool_id: str = "", field: str = "") -> Finding:
     return {"code": code, "tool_id": tool_id, "field": field}
+
+
+# LLM-CONTRACT
+# id: agent-work-governor.canonical-git-tool-source
+# state: TOOL_ID + DECLARED_IDENTITY + SOURCE_URL -> CANONICAL_GIT_SOURCE | SOURCE_REJECTED
+# preconditions: generic catalog shape and exact digest validation have passed
+# invariant: validator-owned Git tools retain both Git identity kind and repository identity
+# failure: emit one stable source finding before any catalogued tool executes
+# source: https://github.com/git/git/blob/13c7afec212fc97ce257d15601659314c6673d6c/Documentation/gitrepository-layout.adoc
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: _git_source_repository_finding
+# test: bundle:tests/test_repo_bundle.py
+def _git_source_repository_finding(
+    tool_id: str,
+    source: str,
+    digest: str,
+) -> Finding | None:
+    repository = CANONICAL_GIT_REPOSITORIES.get(tool_id)
+    if repository is None:
+        if digest.startswith("git:"):
+            return _finding(
+                "TOOLCHAIN_SOURCE_REPOSITORY_MISMATCH",
+                tool_id,
+                "source",
+            )
+        return None
+    if not digest.startswith("git:"):
+        return _finding(
+            "TOOLCHAIN_SOURCE_REPOSITORY_MISMATCH",
+            tool_id,
+            "source_digest",
+        )
+    expected = f"{repository}/commit/{digest[4:]}"
+    if source != expected:
+        return _finding("TOOLCHAIN_SOURCE_REPOSITORY_MISMATCH", tool_id, "source")
+    return None
 
 
 def _rust_component_findings(pins: dict[str, dict[str, Any]]) -> list[Finding]:
@@ -205,6 +251,12 @@ def validate_catalog(
             or ("artifacts" in entry and not _valid_artifacts(entry["artifacts"]))
         ):
             findings.append(_finding("TOOLCHAIN_ENTRY_INVALID", tool_id))
+        elif git_source_finding := _git_source_repository_finding(
+            tool_id,
+            source,
+            digest,
+        ):
+            findings.append(git_source_finding)
         if tool_id in pins:
             findings.append(_finding("TOOLCHAIN_DUPLICATE_ID", tool_id))
         else:

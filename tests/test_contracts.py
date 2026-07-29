@@ -1447,6 +1447,16 @@ class SourceHygieneTests(unittest.TestCase):
         workflow_actions = dict(
             re.findall(r"uses:\s+([^@\s]+)@([0-9a-f]{40})", workflow)
         )
+        bootstrap_checkout = workflow_actions.pop("actions/checkout")
+        self.assertEqual(
+            "3d3c42e5aac5ba805825da76410c181273ba90b1",
+            bootstrap_checkout,
+        )
+        self.assertNotIn("actions/checkout", pins)
+        self.assertIn(
+            "actions/checkout is intentionally outside toolchain.lock.json",
+            workflow,
+        )
         catalog_actions = {
             tool_id: pin["source_digest"].removeprefix("git:")
             for tool_id, pin in pins.items()
@@ -1483,6 +1493,7 @@ class SourceHygieneTests(unittest.TestCase):
             "pkgs.pythonManylinuxPackages.manylinux2014",
             "clippyPin.source == rustPin.source",
             "rustfmtPin.source == rustPin.source",
+            "TOOLCHAIN_GIT_REPOSITORY_SELF_TEST_FAILED",
             "TOOLCHAIN_RUST_COMPONENT_SELF_TEST_FAILED",
             "TOOLCHAIN_PACKAGE_SOURCE_URL_MISMATCH",
             "TOOLCHAIN_PACKAGE_SOURCE_DIGEST_MISMATCH",
