@@ -356,6 +356,72 @@ jobs:
                           )
               return sorted(found, key=lambda item: item["identifier"])
 
+          # LLM contract: isolated rust.tests evidence -> finite public
+          # diagnostic vocabulary; arbitrary candidate output is never emitted.
+          # Primary source: https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages
+          def rust_failure_diagnostics(value):
+              checks = value.get("checks", []) if isinstance(value, dict) else []
+              failed = next(
+                  (
+                      item
+                      for item in checks
+                      if isinstance(item, dict)
+                      and item.get("identifier") == "rust.tests"
+                      and item.get("outcome") != {"EXITED": {"exit_code": 0}}
+                  ),
+                  None,
+              )
+              if failed is None:
+                  return None
+              data, _ = content(runtime / "evidence" / "rust.tests.log")
+              if data is None or len(data) > 1_048_576:
+                  return {"signals": ["EVIDENCE_UNAVAILABLE"]}
+              text = data.decode("utf-8", errors="replace")
+              lowered = text.lower()
+              signals = {
+                  code
+                  for needle, code in (
+                      ("blocking waiting for file lock", "CARGO_LOCK_WAIT"),
+                      ("could not execute process", "PROCESS_EXEC_FAILED"),
+                      ("could not compile", "RUST_COMPILE_FAILED"),
+                      ("failed to run custom build command", "BUILD_SCRIPT_FAILED"),
+                      ("library not found for -l", "LINKER_LIBRARY_NOT_FOUND"),
+                      ("cannot find -l", "LINKER_LIBRARY_NOT_FOUND"),
+                      ("library not found for -liconv", "LINKER_ICONV_NOT_FOUND"),
+                      ("linking with", "LINKER_FAILED"),
+                      ("module not found", "PYTHON_IMPORT_FAILED"),
+                      ("modulenotfounderror", "PYTHON_IMPORT_FAILED"),
+                      ("no space left on device", "NO_SPACE"),
+                      ("no such file or directory", "PATH_NOT_FOUND"),
+                      ("operation not permitted", "OPERATION_NOT_PERMITTED"),
+                      ("permission denied", "PERMISSION_DENIED"),
+                      ("panicked at", "RUST_PANIC"),
+                      ("read-only file system", "READ_ONLY_FILESYSTEM"),
+                      ("test result: failed", "RUST_TEST_FAILED"),
+                  )
+                  if needle in lowered
+              }
+              permission_scopes = (
+                  sorted(
+                      code
+                      for needle, code in (
+                          (".global-cache", "CARGO_GLOBAL_CACHE"),
+                          (".package-cache", "CARGO_PACKAGE_CACHE"),
+                          ("cargo-target", "CARGO_TARGET"),
+                          ("cargo-home", "CARGO_HOME"),
+                      )
+                      if needle in lowered
+                  )
+                  if "PERMISSION_DENIED" in signals
+                  else []
+              )
+              if not signals:
+                  signals.add("UNKNOWN_NONZERO")
+              return {
+                  "permission_scopes": permission_scopes,
+                  "signals": sorted(signals),
+              }
+
           plan, plan_digest = document(output / "plan.json")
           receipt, receipt_digest = document(runtime / "run.json")
           fault, _ = document(runtime / "run.json.fault.json")
@@ -403,6 +469,7 @@ jobs:
               ),
               "legacy_conclusion": "success",
               "observed_check_outcomes": observed_outcomes(receipt),
+              "rust_failure_diagnostics": rust_failure_diagnostics(receipt),
               "plan_report_sha256": plan_digest,
               "reason_codes": sorted(reason_codes),
               "receipt_sha256": receipt_digest,

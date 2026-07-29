@@ -2034,6 +2034,8 @@ class SourceHygieneTests(unittest.TestCase):
             "SHADOW_INCONCLUSIVE",
             '"reason_codes"',
             '"observed_check_outcomes"',
+            '"rust_failure_diagnostics"',
+            '"UNKNOWN_NONZERO"',
             '"candidate_archive_sha256"',
             '"candidate_store_sha256"',
             '"plan_report_sha256"',
