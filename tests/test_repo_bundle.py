@@ -119,7 +119,6 @@ def load_gate() -> RepositoryGate:
 class PortableBundleTests(unittest.TestCase):
     @staticmethod
     def minimal_catalog() -> dict[str, object]:
-        python_sha = "a" * 40
         rust_sha = "b" * 40
         return {
             "locked_at": "2026-07-29",
@@ -130,8 +129,10 @@ class PortableBundleTests(unittest.TestCase):
                     "id": "python",
                     "language": "python",
                     "version": "3.14.6",
-                    "source": f"https://github.com/python/cpython/commit/{python_sha}",
-                    "source_digest": f"git:{python_sha}",
+                    "source": (
+                        "https://www.python.org/ftp/python/3.14.6/Python-3.14.6.tar.xz"
+                    ),
+                    "source_digest": f"sha256:{'a' * 64}",
                 },
                 {
                     "id": "rust",
@@ -304,6 +305,7 @@ class PortableBundleTests(unittest.TestCase):
             workflow.index("python .agent-work-governor/validate.py"),
         )
         for evidence in (
+            "actions/checkout is intentionally outside the copied tool catalog",
             "--tool-source nix",
             "--tool-source cachix/install-nix-action",
             "TOOLCHAIN_ACTION_IDENTITY_MISMATCH",
@@ -445,7 +447,7 @@ class PortableBundleTests(unittest.TestCase):
         sha = "a" * 40
         cases = (
             ("source", "http://github.com/python/cpython/commit/" + sha),
-            ("source", "https://github.com/python/cpython/releases/latest"),
+            ("source", ""),
             ("source_digest", "git:main"),
             ("source_digest", "git:" + "b" * 40),
             ("source_digest", "sha256:" + "0" * 63),
@@ -459,6 +461,98 @@ class PortableBundleTests(unittest.TestCase):
                     "TOOLCHAIN_ENTRY_INVALID",
                     self.finding_codes(document),
                 )
+
+    def test_catalog_binds_git_pins_to_canonical_repositories(self) -> None:
+        # LLM contract: valid object ID + wrong repository -> stable rejection.
+        catalog = json.loads(toolchain_catalog_path().read_text(encoding="utf-8"))
+        categories = {
+            "github_actions": ("cachix/install-nix-action",),
+            "python_wheels": ("ruff", "ty", "uv"),
+            "rust_components": ("cargo", "clippy", "rust", "rustfmt"),
+        }
+
+        for category, tool_ids in categories.items():
+            for tool_id in tool_ids:
+                with self.subTest(category=category, tool=tool_id):
+                    document = cast(
+                        dict[str, object],
+                        json.loads(json.dumps(catalog)),
+                    )
+                    tool = next(
+                        item
+                        for item in self.catalog_tools(document)
+                        if item["id"] == tool_id
+                    )
+                    digest = cast(str, tool["source_digest"])
+                    tool["source"] = (
+                        "https://github.com/unrelated/repository/commit/"
+                        f"{digest.removeprefix('git:')}"
+                    )
+
+                    _, findings = self.validate_catalog_fixture(document)
+
+                    self.assertIn(
+                        (
+                            "TOOLCHAIN_SOURCE_REPOSITORY_MISMATCH",
+                            tool_id,
+                            "source",
+                        ),
+                        {
+                            (item["code"], item["tool_id"], item["field"])
+                            for item in findings
+                        },
+                    )
+
+                    downgraded = cast(
+                        dict[str, object],
+                        json.loads(json.dumps(catalog)),
+                    )
+                    downgraded_tool = next(
+                        item
+                        for item in self.catalog_tools(downgraded)
+                        if item["id"] == tool_id
+                    )
+                    downgraded_tool["source_digest"] = f"sha256:{'0' * 64}"
+
+                    _, downgraded_findings = self.validate_catalog_fixture(downgraded)
+
+                    self.assertIn(
+                        (
+                            "TOOLCHAIN_SOURCE_REPOSITORY_MISMATCH",
+                            tool_id,
+                            "source_digest",
+                        ),
+                        {
+                            (item["code"], item["tool_id"], item["field"])
+                            for item in downgraded_findings
+                        },
+                    )
+
+        unregistered = cast(
+            dict[str, object],
+            json.loads(json.dumps(catalog)),
+        )
+        actionlint = next(
+            item
+            for item in self.catalog_tools(unregistered)
+            if item["id"] == "actionlint"
+        )
+        actionlint_sha = "f" * 40
+        actionlint["source"] = (
+            f"https://github.com/rhysd/actionlint/commit/{actionlint_sha}"
+        )
+        actionlint["source_digest"] = f"git:{actionlint_sha}"
+
+        _, findings = self.validate_catalog_fixture(unregistered)
+
+        self.assertIn(
+            (
+                "TOOLCHAIN_SOURCE_REPOSITORY_MISMATCH",
+                "actionlint",
+                "source",
+            ),
+            {(item["code"], item["tool_id"], item["field"]) for item in findings},
+        )
 
     def test_catalog_rejects_incomplete_or_malformed_artifacts(self) -> None:
         valid = {

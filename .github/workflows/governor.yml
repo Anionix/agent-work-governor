@@ -36,8 +36,10 @@ jobs:
       EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       PR_BODY: ${{ github.event.pull_request.body || '' }}
     steps:
-      # LLM contract: repository input -> VALIDATED or job failure; there is no
-      # implicit allow path. Source: https://github.com/actions/checkout/releases/tag/v7.0.1
+      # LLM contract: SHA-pinned workflow bootstrap -> REVIEWED_REVISION or job failure.
+      # Preconditions: actions/checkout is intentionally outside toolchain.lock.json.
+      # Invariant: this is the only action allowed before catalog validation.
+      # Source: https://github.com/actions/checkout/releases/tag/v7.0.1
       - name: Check out the reviewed revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

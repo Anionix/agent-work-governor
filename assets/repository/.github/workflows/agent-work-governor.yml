@@ -24,6 +24,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      # LLM contract: SHA-pinned workflow bootstrap -> REPOSITORY_BYTES or job failure.
+      # Preconditions: actions/checkout is intentionally outside the copied tool catalog.
+      # Invariant: this is the only action allowed before catalog validation.
+      # Source: https://github.com/actions/checkout/releases/tag/v7.0.1
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
