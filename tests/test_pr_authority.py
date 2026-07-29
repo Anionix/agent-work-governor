@@ -19,11 +19,11 @@ import validate_pr_authority
 
 # LLM-CONTRACT
 # id: agent-work-governor.live-pr-authority-tests
-# state: AUTHORITY_FIXTURE -> TWO_LIVE_SNAPSHOTS -> COMMIT_TRAILER -> EXPECTED_VERDICT
+# state: AUTHORITY_FIXTURE -> TWO_LIVE_SNAPSHOTS -> COMMIT_TRAILER -> BODY_EVIDENCE -> REPOSITORY_ISSUE -> EXPECTED_VERDICT
 # preconditions: transport is isolated and every requested page is explicit
 # invariant: tests never use a credential or mutate repository and GitHub state
 # failure: unittest exposes the exact fail-closed classification drift
-# source: https://github.com/github/docs/blob/72ef2d329866e5d0d52829f105f853da9bcf4260/content/rest/pulls/pulls.md
+# source: https://github.com/github/docs/blob/72ef2d329866e5d0d52829f105f853da9bcf4260/content/rest/issues/issues.md
 # knowledge: bundle:knowledge/policies/work-governor.md
 # enforced_by: AuthorityTests
 # test: bundle:tests/test_pr_authority.py
@@ -57,7 +57,7 @@ class AuthorityTests(unittest.TestCase):
         state: str = "open",
         head_sha: str | None = None,
         base_sha: str | None = None,
-        body: str = "live body",
+        body: str = "Issue/spec: #33",
         repository_id: int | None = None,
         head_repository: str | None = None,
         base_ref: str = "main",
@@ -80,6 +80,21 @@ class AuthorityTests(unittest.TestCase):
             },
         }
 
+    def repository_issue(
+        self,
+        *,
+        number: int = 33,
+        state: str = "open",
+    ) -> dict[str, object]:
+        repository_url = f"{self.api}/repos/{self.repository}"
+        return {
+            "id": 3300,
+            "number": number,
+            "state": state,
+            "url": f"{repository_url}/issues/33",
+            "repository_url": repository_url,
+        }
+
     def validate(
         self,
         *,
@@ -91,8 +106,10 @@ class AuthorityTests(unittest.TestCase):
         second_page_links: dict[int, str | None] | None = None,
         error: BaseException | None = None,
         commit_error: BaseException | None = None,
+        issue_error: BaseException | None = None,
         second_live: object | None = None,
         commit: object | None = None,
+        issue: object | None = None,
         commit_repository: str | None = None,
     ) -> validate_pr_authority.Result:
         pull_url = f"{self.api}/repos/{self.repository}/pulls/33"
@@ -100,6 +117,7 @@ class AuthorityTests(unittest.TestCase):
             f"{self.api}/repos/{commit_repository or self.repository}"
             f"/commits/{self.head_sha}"
         )
+        issue_url = f"{self.api}/repos/{self.repository}/issues/33"
         calls = 0
         first_live = self.pull() if live is None else live
         live_documents = [
@@ -132,6 +150,11 @@ class AuthorityTests(unittest.TestCase):
                     else commit
                 )
                 return validate_pr_authority.ApiResponse(document)
+            if url == issue_url:
+                if issue_error is not None:
+                    raise issue_error
+                document = self.repository_issue() if issue is None else issue
+                return validate_pr_authority.ApiResponse(document)
             selected_pages = page_documents if calls == 1 else second_page_documents
             selected_links = first_links if calls == 1 else later_links
             for page, document in selected_pages.items():
@@ -162,7 +185,14 @@ class AuthorityTests(unittest.TestCase):
     def test_pass_uses_live_body_after_two_stable_snapshots(self) -> None:
         result = self.validate()
         self.assertEqual(
-            ("PASS", "AUTHORITY_VERIFIED", 33, self.head_sha, 33, "live body"),
+            (
+                "PASS",
+                "AUTHORITY_VERIFIED",
+                33,
+                self.head_sha,
+                33,
+                "Issue/spec: #33",
+            ),
             (
                 result.status,
                 result.code,
@@ -308,6 +338,109 @@ class AuthorityTests(unittest.TestCase):
             ("INCONCLUSIVE", "AUTHORITY_COMMIT_RESPONSE_INVALID"),
             (result.status, result.code),
         )
+
+    def test_body_issue_evidence_is_exact_and_matches_the_trailer(self) -> None:
+        invalid_bodies = (
+            "",
+            "Issue/spec: none",
+            "Issue/spec: other/repository#33",
+            "Issue/spec: #0",
+            "Issue/spec: #9999999999",
+            "Issue/spec: #33 #34",
+            "Issue/spec: #33\nIssue/spec: #33",
+            "Issue/spec: #33\n  Issue/spec: #33",
+        )
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                result = self.validate(live=self.pull(body=body))
+                self.assertEqual(
+                    ("FAIL", "AUTHORITY_BODY_ISSUE_INVALID"),
+                    (result.status, result.code),
+                )
+
+        result = self.validate(live=self.pull(body="Issue/spec: #24"))
+        self.assertEqual(
+            ("FAIL", "AUTHORITY_BODY_ISSUE_MISMATCH"),
+            (result.status, result.code),
+        )
+
+    def test_issue_must_exist_in_the_repository_and_not_be_a_pull_request(
+        self,
+    ) -> None:
+        pull_request = self.repository_issue()
+        pull_request["pull_request"] = {
+            "url": f"{self.api}/repos/{self.repository}/pulls/33"
+        }
+        result = self.validate(issue=pull_request)
+        self.assertEqual(
+            ("FAIL", "AUTHORITY_ISSUE_IS_PULL_REQUEST"),
+            (result.status, result.code),
+        )
+
+        result = self.validate(issue=self.repository_issue(number=34))
+        self.assertEqual(
+            ("INCONCLUSIVE", "AUTHORITY_ISSUE_RESPONSE_INVALID"),
+            (result.status, result.code),
+        )
+
+        result = self.validate(issue=self.repository_issue(state="future"))
+        self.assertEqual(
+            ("INCONCLUSIVE", "AUTHORITY_ISSUE_RESPONSE_INVALID"),
+            (result.status, result.code),
+        )
+
+        result = self.validate(issue=self.repository_issue(state="closed"))
+        self.assertEqual("PASS", result.status)
+
+        malformed_issue = self.repository_issue()
+        malformed_issue.pop("repository_url")
+        result = self.validate(issue=malformed_issue)
+        self.assertEqual(
+            ("INCONCLUSIVE", "AUTHORITY_ISSUE_RESPONSE_INVALID"),
+            (result.status, result.code),
+        )
+
+        for field in ("url", "repository_url"):
+            contradictory = self.repository_issue()
+            contradictory[field] = f"{self.api}/repos/other/repository"
+            with self.subTest(field=field):
+                result = self.validate(issue=contradictory)
+                self.assertEqual(
+                    ("INCONCLUSIVE", "AUTHORITY_ISSUE_RESPONSE_INVALID"),
+                    (result.status, result.code),
+                )
+
+        malformed_markers: tuple[object, ...] = (
+            None,
+            "pull request",
+            {},
+            {"url": f"{self.api}/repos/other/repository/pulls/33"},
+        )
+        for marker in malformed_markers:
+            malformed_pull = self.repository_issue()
+            malformed_pull["pull_request"] = marker
+            with self.subTest(marker=marker):
+                result = self.validate(issue=malformed_pull)
+                self.assertEqual(
+                    ("INCONCLUSIVE", "AUTHORITY_ISSUE_RESPONSE_INVALID"),
+                    (result.status, result.code),
+                )
+
+        for code in (404, 410):
+            error = HTTPError(self.api, code, "fixture", HTTPMessage(), None)
+            result = self.validate(issue_error=error)
+            self.assertEqual(
+                ("FAIL", "AUTHORITY_ISSUE_NOT_FOUND"),
+                (result.status, result.code),
+            )
+
+        for code in (301, 403, 429, 500):
+            error = HTTPError(self.api, code, "fixture", HTTPMessage(), None)
+            result = self.validate(issue_error=error)
+            self.assertEqual(
+                ("INCONCLUSIVE", "AUTHORITY_API_ERROR"),
+                (result.status, result.code),
+            )
 
     def test_absence_fails_but_transport_uncertainty_is_inconclusive(self) -> None:
         for code in (404, 410):
@@ -488,6 +621,7 @@ class AuthorityTests(unittest.TestCase):
             "pull_request_target:",
             "branches: [main]",
             "contents: read",
+            "issues: read",
             "pull-requests: read",
             "governor / authority",
             "runs-on: ubuntu-24.04",
@@ -501,7 +635,7 @@ class AuthorityTests(unittest.TestCase):
             self.assertIn(evidence, authority)
         permission_block = authority.split("permissions:\n", 1)[1].split("\n\n", 1)[0]
         self.assertEqual(
-            "  contents: read\n  pull-requests: read",
+            "  contents: read\n  issues: read\n  pull-requests: read",
             permission_block,
         )
         for forbidden in (
