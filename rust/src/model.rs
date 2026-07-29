@@ -72,6 +72,8 @@ pub enum CheckRequest {
         expected_invocation_sha256: String,
         /// Untrusted aggregate receipt JSON bytes.
         receipt_json: Vec<u8>,
+        /// Untrusted evidence bytes supplied separately from receipt claims.
+        evidence: Vec<crate::verification::EvidenceArtifact>,
     },
 }
 

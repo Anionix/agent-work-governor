@@ -22,8 +22,8 @@ pub use okf::OkfStatus;
 pub use planning::{PlanBindings, PlanProject, PlanReport};
 use thiserror::Error;
 pub use verification::{
-    CheckReceipt, MAX_CHECK_OUTPUT_BYTES, MAX_RUN_RECEIPT_BYTES, RunReceipt, VerificationOutcome,
-    VerificationReport,
+    CheckOutcome, CheckReceipt, EvidenceArtifact, MAX_CHECK_OUTPUT_BYTES, MAX_RUN_RECEIPT_BYTES,
+    RunReceipt, VerificationOutcome, VerificationReason, VerificationReport,
 };
 
 /// Static Governor Module with one public checking Interface.
@@ -99,12 +99,14 @@ impl Governor {
                 expected_harness_sha256,
                 expected_invocation_sha256,
                 receipt_json,
+                evidence,
             } => Ok(CheckReport::Verify(verification::verify_receipt(
                 bindings,
                 project,
                 expected_harness_sha256,
                 expected_invocation_sha256,
                 &receipt_json,
+                &evidence,
             )?)),
         }
     }

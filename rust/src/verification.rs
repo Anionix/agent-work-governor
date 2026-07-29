@@ -14,6 +14,7 @@ pub const MAX_RUN_RECEIPT_BYTES: usize = 1_048_576;
 /// Maximum captured output represented by one check receipt: one mebibyte.
 pub const MAX_CHECK_OUTPUT_BYTES: u64 = 1_048_576;
 const RUN_RECEIPT_SCHEMA_VERSION: &str = "0.1";
+const EVIDENCE_PATH_PREFIX: &str = ".governance/receipts/evidence/";
 
 // LLM-CONTRACT
 // id: agent-work-governor.aggregate-receipt-verification
@@ -26,7 +27,20 @@ const RUN_RECEIPT_SCHEMA_VERSION: &str = "0.1";
 // enforced_by: verify_receipt
 // test: bundle:rust/tests/verification.rs
 
-/// Evidence emitted for one check in a bounded run.
+/// Mutually exclusive process outcome reported for one bounded check.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum CheckOutcome {
+    /// The check process exited with an operating-system status code.
+    Exited {
+        /// Exact process exit code.
+        exit_code: i32,
+    },
+    /// The bounded harness terminated the check after its deadline.
+    TimedOut,
+}
+
+/// Evidence claim emitted for one check in a bounded run.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CheckReceipt {
@@ -34,8 +48,7 @@ pub struct CheckReceipt {
     evidence_path: String,
     output_sha256: String,
     output_bytes: u64,
-    exit_code: Option<i32>,
-    timed_out: bool,
+    outcome: CheckOutcome,
 }
 
 impl CheckReceipt {
@@ -46,16 +59,32 @@ impl CheckReceipt {
         evidence_path: impl Into<String>,
         output_sha256: impl Into<String>,
         output_bytes: u64,
-        exit_code: Option<i32>,
-        timed_out: bool,
+        outcome: CheckOutcome,
     ) -> Self {
         Self {
             identifier: identifier.into(),
             evidence_path: evidence_path.into(),
             output_sha256: output_sha256.into(),
             output_bytes,
-            exit_code,
-            timed_out,
+            outcome,
+        }
+    }
+}
+
+/// Untrusted evidence bytes supplied independently of receipt digest claims.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceArtifact {
+    path: String,
+    bytes: Vec<u8>,
+}
+
+impl EvidenceArtifact {
+    /// Construct one candidate artifact; verification validates its path and bytes.
+    #[must_use]
+    pub fn new(path: impl Into<String>, bytes: Vec<u8>) -> Self {
+        Self {
+            path: path.into(),
+            bytes,
         }
     }
 }
@@ -108,6 +137,83 @@ pub enum VerificationOutcome {
     ReceiptRejected,
 }
 
+/// Closed stable reason codes for every non-PASS verification result.
+#[allow(
+    missing_docs,
+    reason = "variant names are the exact stable machine-readable reason-code contract"
+)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum VerificationReason {
+    VerifyHarnessDigestInvalid,
+    VerifyInvocationDigestInvalid,
+    ReceiptPlanRecomputeRejected,
+    ReceiptSizeExceeded,
+    ReceiptMalformed,
+    ReceiptSchemaUnsupported,
+    ReceiptDigestInvalid,
+    ReceiptRepositoryMismatch,
+    ReceiptRevisionMismatch,
+    ReceiptPolicyMismatch,
+    ReceiptToolchainMismatch,
+    ReceiptEnvironmentMismatch,
+    ReceiptPlanMismatch,
+    ReceiptHarnessMismatch,
+    ReceiptInvocationStale,
+    ReceiptCoverageMismatch,
+    ReceiptCheckDuplicate,
+    ReceiptCheckExtra,
+    ReceiptCheckMissing,
+    ReceiptEvidencePathUnsafe,
+    ReceiptEvidenceDuplicate,
+    ReceiptEvidenceExtra,
+    ReceiptEvidenceMissing,
+    ReceiptOutputDigestInvalid,
+    ReceiptOutputSizeExceeded,
+    ReceiptOutputSizeMismatch,
+    ReceiptOutputDigestMismatch,
+    ReceiptCheckTimedOut,
+    ReceiptCheckExitNonzero,
+}
+
+impl VerificationReason {
+    /// Exact machine-readable wire spelling used by [`Finding::code`].
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::VerifyHarnessDigestInvalid => "VERIFY_HARNESS_DIGEST_INVALID",
+            Self::VerifyInvocationDigestInvalid => "VERIFY_INVOCATION_DIGEST_INVALID",
+            Self::ReceiptPlanRecomputeRejected => "RECEIPT_PLAN_RECOMPUTE_REJECTED",
+            Self::ReceiptSizeExceeded => "RECEIPT_SIZE_EXCEEDED",
+            Self::ReceiptMalformed => "RECEIPT_MALFORMED",
+            Self::ReceiptSchemaUnsupported => "RECEIPT_SCHEMA_UNSUPPORTED",
+            Self::ReceiptDigestInvalid => "RECEIPT_DIGEST_INVALID",
+            Self::ReceiptRepositoryMismatch => "RECEIPT_REPOSITORY_MISMATCH",
+            Self::ReceiptRevisionMismatch => "RECEIPT_REVISION_MISMATCH",
+            Self::ReceiptPolicyMismatch => "RECEIPT_POLICY_MISMATCH",
+            Self::ReceiptToolchainMismatch => "RECEIPT_TOOLCHAIN_MISMATCH",
+            Self::ReceiptEnvironmentMismatch => "RECEIPT_ENVIRONMENT_MISMATCH",
+            Self::ReceiptPlanMismatch => "RECEIPT_PLAN_MISMATCH",
+            Self::ReceiptHarnessMismatch => "RECEIPT_HARNESS_MISMATCH",
+            Self::ReceiptInvocationStale => "RECEIPT_INVOCATION_STALE",
+            Self::ReceiptCoverageMismatch => "RECEIPT_COVERAGE_MISMATCH",
+            Self::ReceiptCheckDuplicate => "RECEIPT_CHECK_DUPLICATE",
+            Self::ReceiptCheckExtra => "RECEIPT_CHECK_EXTRA",
+            Self::ReceiptCheckMissing => "RECEIPT_CHECK_MISSING",
+            Self::ReceiptEvidencePathUnsafe => "RECEIPT_EVIDENCE_PATH_UNSAFE",
+            Self::ReceiptEvidenceDuplicate => "RECEIPT_EVIDENCE_DUPLICATE",
+            Self::ReceiptEvidenceExtra => "RECEIPT_EVIDENCE_EXTRA",
+            Self::ReceiptEvidenceMissing => "RECEIPT_EVIDENCE_MISSING",
+            Self::ReceiptOutputDigestInvalid => "RECEIPT_OUTPUT_DIGEST_INVALID",
+            Self::ReceiptOutputSizeExceeded => "RECEIPT_OUTPUT_SIZE_EXCEEDED",
+            Self::ReceiptOutputSizeMismatch => "RECEIPT_OUTPUT_SIZE_MISMATCH",
+            Self::ReceiptOutputDigestMismatch => "RECEIPT_OUTPUT_DIGEST_MISMATCH",
+            Self::ReceiptCheckTimedOut => "RECEIPT_CHECK_TIMED_OUT",
+            Self::ReceiptCheckExitNonzero => "RECEIPT_CHECK_EXIT_NONZERO",
+        }
+    }
+}
+
 /// Result of verifying one aggregate receipt against a recomputed plan.
 #[derive(Clone, Debug, Serialize)]
 pub struct VerificationReport {
@@ -119,6 +225,8 @@ pub struct VerificationReport {
     findings: Vec<Finding>,
     mutation_count: u64,
     outcome: VerificationOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<VerificationReason>,
     status: Status,
 }
 
@@ -147,10 +255,40 @@ impl VerificationReport {
         self.outcome
     }
 
+    /// Closed reason code for a rejected or failed receipt.
+    #[must_use]
+    pub const fn reason(&self) -> Option<VerificationReason> {
+        self.reason
+    }
+
     /// Overall status; only [`VerificationOutcome::VerifiedPass`] is `PASS`.
     #[must_use]
     pub const fn status(&self) -> Status {
         self.status
+    }
+}
+
+struct DecisionFinding {
+    field: String,
+    message: String,
+    reason: VerificationReason,
+}
+
+impl DecisionFinding {
+    fn new(
+        reason: VerificationReason,
+        field: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            field: field.into(),
+            message: message.into(),
+            reason,
+        }
+    }
+
+    fn into_finding(self) -> Finding {
+        Finding::policy(self.reason.as_str(), &self.field, self.message)
     }
 }
 
@@ -177,12 +315,18 @@ impl VerificationContext {
     }
 
     fn finish(self, decision: ReceiptDecision) -> VerificationReport {
-        let (outcome, findings) = match decision {
-            ReceiptDecision::Pass => (VerificationOutcome::VerifiedPass, Vec::new()),
-            ReceiptDecision::Fail(finding) => (VerificationOutcome::VerifiedFail, vec![finding]),
-            ReceiptDecision::Reject(finding) => {
-                (VerificationOutcome::ReceiptRejected, vec![finding])
-            }
+        let (outcome, reason, findings) = match decision {
+            ReceiptDecision::Pass => (VerificationOutcome::VerifiedPass, None, Vec::new()),
+            ReceiptDecision::Fail(finding) => (
+                VerificationOutcome::VerifiedFail,
+                Some(finding.reason),
+                vec![finding.into_finding()],
+            ),
+            ReceiptDecision::Reject(finding) => (
+                VerificationOutcome::ReceiptRejected,
+                Some(finding.reason),
+                vec![finding.into_finding()],
+            ),
         };
         VerificationReport {
             bindings: self.bindings,
@@ -192,6 +336,7 @@ impl VerificationContext {
             findings,
             mutation_count: 0,
             outcome,
+            reason,
             status: if outcome == VerificationOutcome::VerifiedPass {
                 Status::Pass
             } else {
@@ -210,6 +355,7 @@ impl CheckRequest {
         expected_harness_sha256: impl Into<String>,
         expected_invocation_sha256: impl Into<String>,
         receipt_json: Vec<u8>,
+        evidence: Vec<EvidenceArtifact>,
     ) -> Self {
         Self::Verify {
             bindings,
@@ -217,6 +363,7 @@ impl CheckRequest {
             expected_harness_sha256: expected_harness_sha256.into(),
             expected_invocation_sha256: expected_invocation_sha256.into(),
             receipt_json,
+            evidence,
         }
     }
 }
@@ -227,6 +374,7 @@ pub(crate) fn verify_receipt(
     expected_harness_sha256: String,
     expected_invocation_sha256: String,
     receipt_json: &[u8],
+    evidence: &[EvidenceArtifact],
 ) -> Result<VerificationReport, GovernorError> {
     let plan_report = planning::build_plan(bindings.clone(), project)?;
     let Some(plan) = plan_report.execution_plan() else {
@@ -240,11 +388,11 @@ pub(crate) fn verify_receipt(
             expected_harness_sha256,
             expected_invocation_sha256,
         )
-        .finish(ReceiptDecision::Reject(Finding::policy(
-            "RECEIPT_PLAN_RECOMPUTE_REJECTED",
+        .finish(reject(
+            VerificationReason::ReceiptPlanRecomputeRejected,
             "plan",
             format!("recomputed plan was rejected: {reason}"),
-        ))));
+        )));
     };
     let context = VerificationContext::new(
         bindings,
@@ -260,18 +408,18 @@ pub(crate) fn verify_receipt(
         return Ok(context.finish(ReceiptDecision::Reject(finding)));
     }
     if receipt_json.len() > MAX_RUN_RECEIPT_BYTES {
-        return Ok(context.finish(ReceiptDecision::Reject(Finding::policy(
-            "RECEIPT_SIZE_EXCEEDED",
+        return Ok(context.finish(reject(
+            VerificationReason::ReceiptSizeExceeded,
             "receipt_json",
             "aggregate receipt exceeds the one-mebibyte limit",
-        ))));
+        )));
     }
     let Ok(receipt) = serde_json::from_slice::<RunReceipt>(receipt_json) else {
-        return Ok(context.finish(ReceiptDecision::Reject(Finding::policy(
-            "RECEIPT_MALFORMED",
+        return Ok(context.finish(reject(
+            VerificationReason::ReceiptMalformed,
             "receipt_json",
             "receipt is not valid JSON in the closed aggregate schema",
-        ))));
+        )));
     };
 
     let decision = validate_receipt(
@@ -280,28 +428,29 @@ pub(crate) fn verify_receipt(
         plan,
         &context.expected_harness_sha256,
         &context.expected_invocation_sha256,
+        evidence,
     );
     Ok(context.finish(decision))
 }
 
-fn invalid_expectation_digest(harness: &str, invocation: &str) -> Option<Finding> {
+fn invalid_expectation_digest(harness: &str, invocation: &str) -> Option<DecisionFinding> {
     [
         (
-            "VERIFY_HARNESS_DIGEST_INVALID",
+            VerificationReason::VerifyHarnessDigestInvalid,
             "expected_harness_sha256",
             harness,
         ),
         (
-            "VERIFY_INVOCATION_DIGEST_INVALID",
+            VerificationReason::VerifyInvocationDigestInvalid,
             "expected_invocation_sha256",
             invocation,
         ),
     ]
     .into_iter()
     .find(|(_, _, value)| !is_sha256(value))
-    .map(|(code, field, _)| {
-        Finding::policy(
-            code,
+    .map(|(reason, field, _)| {
+        DecisionFinding::new(
+            reason,
             field,
             "expected exactly 64 lowercase hexadecimal characters",
         )
@@ -310,8 +459,8 @@ fn invalid_expectation_digest(harness: &str, invocation: &str) -> Option<Finding
 
 enum ReceiptDecision {
     Pass,
-    Fail(Finding),
-    Reject(Finding),
+    Fail(DecisionFinding),
+    Reject(DecisionFinding),
 }
 
 fn validate_receipt(
@@ -320,10 +469,11 @@ fn validate_receipt(
     plan: &CanonicalExecutionPlan,
     expected_harness_sha256: &str,
     expected_invocation_sha256: &str,
+    evidence: &[EvidenceArtifact],
 ) -> ReceiptDecision {
     if receipt.schema_version != RUN_RECEIPT_SCHEMA_VERSION {
         return reject(
-            "RECEIPT_SCHEMA_UNSUPPORTED",
+            VerificationReason::ReceiptSchemaUnsupported,
             "schema_version",
             "receipt schema version is not supported",
         );
@@ -340,10 +490,10 @@ fn validate_receipt(
     ) {
         return ReceiptDecision::Reject(finding);
     }
-    validate_checks(receipt, plan)
+    validate_checks(receipt, plan, evidence)
 }
 
-fn invalid_run_digest(receipt: &RunReceipt) -> Option<Finding> {
+fn invalid_run_digest(receipt: &RunReceipt) -> Option<DecisionFinding> {
     receipt
         .bindings
         .fields()
@@ -366,8 +516,8 @@ fn invalid_run_digest(receipt: &RunReceipt) -> Option<Finding> {
         ])
         .find(|(_, value)| !is_sha256(value))
         .map(|(field, _)| {
-            Finding::policy(
-                "RECEIPT_DIGEST_INVALID",
+            DecisionFinding::new(
+                VerificationReason::ReceiptDigestInvalid,
                 &field,
                 "expected exactly 64 lowercase hexadecimal characters",
             )
@@ -380,13 +530,13 @@ fn binding_mismatch(
     plan: &CanonicalExecutionPlan,
     expected_harness_sha256: &str,
     expected_invocation_sha256: &str,
-) -> Option<Finding> {
+) -> Option<DecisionFinding> {
     let codes = [
-        "RECEIPT_REPOSITORY_MISMATCH",
-        "RECEIPT_REVISION_MISMATCH",
-        "RECEIPT_POLICY_MISMATCH",
-        "RECEIPT_TOOLCHAIN_MISMATCH",
-        "RECEIPT_ENVIRONMENT_MISMATCH",
+        VerificationReason::ReceiptRepositoryMismatch,
+        VerificationReason::ReceiptRevisionMismatch,
+        VerificationReason::ReceiptPolicyMismatch,
+        VerificationReason::ReceiptToolchainMismatch,
+        VerificationReason::ReceiptEnvironmentMismatch,
     ];
     for (((field, actual), (_, expected)), code) in receipt
         .bindings
@@ -401,25 +551,25 @@ fn binding_mismatch(
     }
     [
         (
-            "RECEIPT_PLAN_MISMATCH",
+            VerificationReason::ReceiptPlanMismatch,
             "execution_plan_sha256",
             receipt.execution_plan_sha256.as_str(),
             plan.sha256(),
         ),
         (
-            "RECEIPT_HARNESS_MISMATCH",
+            VerificationReason::ReceiptHarnessMismatch,
             "harness_sha256",
             receipt.harness_sha256.as_str(),
             expected_harness_sha256,
         ),
         (
-            "RECEIPT_INVOCATION_STALE",
+            VerificationReason::ReceiptInvocationStale,
             "invocation_sha256",
             receipt.invocation_sha256.as_str(),
             expected_invocation_sha256,
         ),
         (
-            "RECEIPT_COVERAGE_MISMATCH",
+            VerificationReason::ReceiptCoverageMismatch,
             "coverage_sha256",
             receipt.coverage_sha256.as_str(),
             plan.coverage_sha256(),
@@ -430,29 +580,33 @@ fn binding_mismatch(
     .map(|(code, field, _, _)| binding_finding(code, field))
 }
 
-fn binding_finding(code: &str, field: &str) -> Finding {
-    Finding::policy(
-        code,
+fn binding_finding(reason: VerificationReason, field: &str) -> DecisionFinding {
+    DecisionFinding::new(
+        reason,
         field,
         "receipt binding does not match the verifier expectation",
     )
 }
 
-fn validate_checks(receipt: &RunReceipt, plan: &CanonicalExecutionPlan) -> ReceiptDecision {
+fn validate_checks(
+    receipt: &RunReceipt,
+    plan: &CanonicalExecutionPlan,
+    evidence: &[EvidenceArtifact],
+) -> ReceiptDecision {
     let expected = plan
         .check_identifiers()
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     index_checks(receipt, &expected).map_or_else(ReceiptDecision::Reject, |by_identifier| {
-        validate_indexed_checks(&expected, &by_identifier)
+        validate_indexed_checks(&expected, &by_identifier, evidence)
     })
 }
 
 fn index_checks<'a>(
     receipt: &'a RunReceipt,
     expected: &BTreeSet<&str>,
-) -> Result<BTreeMap<&'a str, &'a CheckReceipt>, Finding> {
+) -> Result<BTreeMap<&'a str, &'a CheckReceipt>, DecisionFinding> {
     let mut by_identifier = BTreeMap::<&str, Vec<&CheckReceipt>>::new();
     for check in &receipt.checks {
         by_identifier
@@ -465,9 +619,9 @@ fn index_checks<'a>(
         .iter()
         .find(|(_, receipts)| receipts.len() != 1)
     {
-        return Err(Finding::policy(
-            "RECEIPT_CHECK_DUPLICATE",
-            &format!("checks.{identifier}"),
+        return Err(DecisionFinding::new(
+            VerificationReason::ReceiptCheckDuplicate,
+            format!("checks.{identifier}"),
             "check evidence occurs more than once",
         ));
     }
@@ -475,9 +629,9 @@ fn index_checks<'a>(
         .keys()
         .find(|identifier| !expected.contains(**identifier))
     {
-        return Err(Finding::policy(
-            "RECEIPT_CHECK_EXTRA",
-            &format!("checks.{identifier}"),
+        return Err(DecisionFinding::new(
+            VerificationReason::ReceiptCheckExtra,
+            format!("checks.{identifier}"),
             "receipt contains evidence for an unplanned check",
         ));
     }
@@ -485,9 +639,9 @@ fn index_checks<'a>(
         .iter()
         .find(|identifier| !by_identifier.contains_key(**identifier))
     {
-        return Err(Finding::policy(
-            "RECEIPT_CHECK_MISSING",
-            &format!("checks.{identifier}"),
+        return Err(DecisionFinding::new(
+            VerificationReason::ReceiptCheckMissing,
+            format!("checks.{identifier}"),
             "receipt omits evidence for a planned check",
         ));
     }
@@ -505,68 +659,169 @@ fn index_checks<'a>(
 fn validate_indexed_checks(
     expected: &BTreeSet<&str>,
     by_identifier: &BTreeMap<&str, &CheckReceipt>,
+    evidence: &[EvidenceArtifact],
 ) -> ReceiptDecision {
     for identifier in expected {
         let Some(check) = by_identifier.get(identifier).copied() else {
             return reject(
-                "RECEIPT_CHECK_MISSING",
-                &format!("checks.{identifier}"),
+                VerificationReason::ReceiptCheckMissing,
+                format!("checks.{identifier}"),
                 "receipt omits evidence for a planned check",
             );
         };
         let field = format!("checks.{identifier}");
         if !safe_evidence_path(&check.evidence_path) {
             return reject(
-                "RECEIPT_EVIDENCE_PATH_UNSAFE",
+                VerificationReason::ReceiptEvidencePathUnsafe,
                 &field,
-                "evidence path must be a portable repository-relative file path",
+                "evidence path must stay in the portable governance evidence namespace",
             );
         }
         if !is_sha256(&check.output_sha256) {
             return reject(
-                "RECEIPT_OUTPUT_DIGEST_INVALID",
+                VerificationReason::ReceiptOutputDigestInvalid,
                 &field,
                 "output digest must be 64 lowercase hexadecimal characters",
             );
         }
         if check.output_bytes > MAX_CHECK_OUTPUT_BYTES {
             return reject(
-                "RECEIPT_OUTPUT_SIZE_EXCEEDED",
+                VerificationReason::ReceiptOutputSizeExceeded,
                 &field,
                 "check output exceeds the one-mebibyte limit",
             );
         }
-        if !check.timed_out && check.exit_code.is_none() {
-            return reject(
-                "RECEIPT_CHECK_EXIT_MISSING",
-                &field,
-                "a completed check must include an exit code",
-            );
-        }
+    }
+    if let Err(finding) = validate_evidence(by_identifier, evidence) {
+        return ReceiptDecision::Reject(finding);
     }
     for identifier in expected {
         let check = by_identifier[identifier];
         let field = format!("checks.{identifier}");
-        if check.timed_out {
-            return ReceiptDecision::Fail(Finding::policy(
-                "RECEIPT_CHECK_TIMED_OUT",
-                &field,
-                "a planned check timed out",
-            ));
-        }
-        if check.exit_code != Some(0) {
-            return ReceiptDecision::Fail(Finding::policy(
-                "RECEIPT_CHECK_EXIT_NONZERO",
-                &field,
-                "a planned check exited nonzero",
-            ));
+        match check.outcome {
+            CheckOutcome::TimedOut => {
+                return fail(
+                    VerificationReason::ReceiptCheckTimedOut,
+                    field,
+                    "a planned check timed out",
+                );
+            }
+            CheckOutcome::Exited { exit_code: 0 } => {}
+            CheckOutcome::Exited { .. } => {
+                return fail(
+                    VerificationReason::ReceiptCheckExitNonzero,
+                    field,
+                    "a planned check exited nonzero",
+                );
+            }
         }
     }
     ReceiptDecision::Pass
 }
 
-fn reject(code: &str, field: &str, message: &str) -> ReceiptDecision {
-    ReceiptDecision::Reject(Finding::policy(code, field, message))
+fn validate_evidence(
+    by_identifier: &BTreeMap<&str, &CheckReceipt>,
+    evidence: &[EvidenceArtifact],
+) -> Result<(), DecisionFinding> {
+    let mut receipt_by_path = BTreeMap::new();
+    for check in by_identifier.values() {
+        if receipt_by_path
+            .insert(check.evidence_path.as_str(), *check)
+            .is_some()
+        {
+            return Err(DecisionFinding::new(
+                VerificationReason::ReceiptEvidenceDuplicate,
+                &check.evidence_path,
+                "multiple check receipts claim the same evidence path",
+            ));
+        }
+    }
+    let evidence_by_path = index_evidence(evidence)?;
+    if let Some(path) = evidence_by_path
+        .keys()
+        .find(|path| !receipt_by_path.contains_key(**path))
+    {
+        return Err(DecisionFinding::new(
+            VerificationReason::ReceiptEvidenceExtra,
+            *path,
+            "verifier input contains evidence not claimed by a check receipt",
+        ));
+    }
+    if let Some(path) = receipt_by_path
+        .keys()
+        .find(|path| !evidence_by_path.contains_key(**path))
+    {
+        return Err(DecisionFinding::new(
+            VerificationReason::ReceiptEvidenceMissing,
+            *path,
+            "receipt claims evidence bytes that were not supplied to the verifier",
+        ));
+    }
+    for (path, check) in receipt_by_path {
+        let artifact = evidence_by_path[path];
+        let actual_bytes = u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX);
+        if actual_bytes > MAX_CHECK_OUTPUT_BYTES {
+            return Err(DecisionFinding::new(
+                VerificationReason::ReceiptOutputSizeExceeded,
+                path,
+                "supplied check evidence exceeds the one-mebibyte limit",
+            ));
+        }
+        if actual_bytes != check.output_bytes {
+            return Err(DecisionFinding::new(
+                VerificationReason::ReceiptOutputSizeMismatch,
+                path,
+                "supplied evidence byte count does not match the receipt claim",
+            ));
+        }
+        if crate::adapter_catalog::sha256_hex(&artifact.bytes) != check.output_sha256 {
+            return Err(DecisionFinding::new(
+                VerificationReason::ReceiptOutputDigestMismatch,
+                path,
+                "supplied evidence digest does not match the receipt claim",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn index_evidence(
+    evidence: &[EvidenceArtifact],
+) -> Result<BTreeMap<&str, &EvidenceArtifact>, DecisionFinding> {
+    let mut by_path = BTreeMap::new();
+    for artifact in evidence {
+        if !safe_evidence_path(&artifact.path) {
+            return Err(DecisionFinding::new(
+                VerificationReason::ReceiptEvidencePathUnsafe,
+                &artifact.path,
+                "evidence path must stay in the portable governance evidence namespace",
+            ));
+        }
+        if by_path.insert(artifact.path.as_str(), artifact).is_some() {
+            return Err(DecisionFinding::new(
+                VerificationReason::ReceiptEvidenceDuplicate,
+                &artifact.path,
+                "evidence bytes occur more than once for the same path",
+            ));
+        }
+    }
+    Ok(by_path)
+}
+
+fn reject(
+    reason: VerificationReason,
+    field: impl Into<String>,
+    message: impl Into<String>,
+) -> ReceiptDecision {
+    ReceiptDecision::Reject(DecisionFinding::new(reason, field, message))
+}
+
+fn fail(
+    reason: VerificationReason,
+    field: impl Into<String>,
+    message: impl Into<String>,
+) -> ReceiptDecision {
+    ReceiptDecision::Fail(DecisionFinding::new(reason, field, message))
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -577,11 +832,48 @@ fn is_sha256(value: &str) -> bool {
 }
 
 fn safe_evidence_path(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .split('/')
-            .all(|part| !part.is_empty() && part != "." && part != "..")
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+    value
+        .strip_prefix(EVIDENCE_PATH_PREFIX)
+        .is_some_and(|relative| {
+            !relative.is_empty()
+                && relative.split('/').all(|part| {
+                    !part.is_empty()
+                        && part != "."
+                        && part != ".."
+                        && !part.ends_with('.')
+                        && part.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+                        })
+                        && !windows_reserved_name(part)
+                })
+        })
+}
+
+fn windows_reserved_name(component: &str) -> bool {
+    let stem = component.split('.').next().unwrap_or(component);
+    matches!(
+        stem.to_ascii_uppercase().as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
