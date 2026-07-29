@@ -1,6 +1,6 @@
 ## Task
 
-Issue/spec:
+Issue/spec: #<issue number>
 
 Head commit trailer: `Issue-Spec: #<same issue number>`
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bind a trusted authority check to one live, unique pull request."""
+"""Bind one live pull request to an immutable, resolvable Issue authority."""
 
 from __future__ import annotations
 
@@ -17,9 +17,9 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 # LLM-CONTRACT
 # id: agent-work-governor.live-pr-authority
-# state: EVENT_LOCATOR -> LIVE_PR -> UNIQUE_OPEN_HEAD -> COMMIT_AUTHORITY -> STABLE_RECHECK -> PASS
+# state: EVENT_LOCATOR -> LIVE_PR -> UNIQUE_OPEN_HEAD -> COMMIT_AUTHORITY -> STABLE_RECHECK -> BODY_EVIDENCE -> REPOSITORY_ISSUE -> PASS
 # preconditions: the protected-base workflow supplies its repository and read-only token
-# invariant: mutable body, redirects, partial pages, non-unique head, and invalid trailer never admit
+# invariant: body/trailer drift, redirects, partial pages, non-unique head, and non-Issues never admit
 # failure: deterministic mismatch is FAIL=1; uncertain API evidence is INCONCLUSIVE=2
 # source: https://github.com/github/docs/blob/72ef2d329866e5d0d52829f105f853da9bcf4260/content/rest/pulls/pulls.md
 # knowledge: bundle:knowledge/policies/work-governor.md
@@ -39,6 +39,7 @@ MAX_INTEGER_DIGITS = len(str(MAX_GITHUB_ID))
 REPOSITORY_RE = re.compile(r"(?=.{3,201}\Z)[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}")
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 ISSUE_TRAILER_RE = re.compile(r"Issue-Spec: #(?P<number>[1-9][0-9]{0,9})")
+BODY_ISSUE_RE = re.compile(r"Issue/spec:[ \t]+#(?P<number>[1-9][0-9]{0,9})[ \t]*")
 LINK_RE = re.compile(r'\s*<(?P<url>[^<>\s]+)>;\s*rel="(?P<rel>[a-z]+)"\s*')
 
 
@@ -429,6 +430,61 @@ def _commit_issue_number(
     return number
 
 
+def _body_issue_number(body: str) -> int:
+    lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    authority_lines = [
+        line for line in lines if line.lstrip().casefold().startswith("issue/spec:")
+    ]
+    if len(authority_lines) != 1:
+        raise _Reject("AUTHORITY_BODY_ISSUE_INVALID")
+    match = BODY_ISSUE_RE.fullmatch(authority_lines[0])
+    if match is None:
+        raise _Reject("AUTHORITY_BODY_ISSUE_INVALID")
+    number = int(match.group("number"))
+    if number > MAX_PR_NUMBER:
+        raise _Reject("AUTHORITY_BODY_ISSUE_INVALID")
+    return number
+
+
+# LLM contract: stable body + immutable trailer -> SAME_REPOSITORY_ISSUE or fail closed.
+# A redirect can represent an Issue transfer, so the no-redirect transport never
+# silently changes repository authority.
+# Primary source: https://github.com/github/docs/blob/72ef2d329866e5d0d52829f105f853da9bcf4260/content/rest/issues/issues.md
+def _require_repository_issue(
+    repository: str,
+    issue_number: int,
+    token: str,
+    fetcher: Fetcher,
+) -> None:
+    code = "AUTHORITY_ISSUE_RESPONSE_INVALID"
+    repository_url = f"{CANONICAL_API_URL}/repos/{repository}"
+    issue_url = f"{repository_url}/issues/{issue_number}"
+    issue = _mapping(
+        _call(
+            issue_url,
+            token,
+            fetcher,
+            absence_code="AUTHORITY_ISSUE_NOT_FOUND",
+        ).document,
+        code,
+    )
+    _integer(issue.get("id"), code)
+    if (
+        _integer(issue.get("number"), code, MAX_PR_NUMBER) != issue_number
+        or _string(issue.get("state"), code) not in {"open", "closed"}
+        or _string(issue.get("url"), code).casefold() != issue_url.casefold()
+        or _string(issue.get("repository_url"), code).casefold()
+        != repository_url.casefold()
+    ):
+        raise _Uncertain(code)
+    if "pull_request" in issue:
+        pull_request = _mapping(issue["pull_request"], code)
+        pull_url = f"{repository_url}/pulls/{issue_number}"
+        if _string(pull_request.get("url"), code).casefold() != pull_url.casefold():
+            raise _Uncertain(code)
+        raise _Reject("AUTHORITY_ISSUE_IS_PULL_REQUEST")
+
+
 def validate_pr_authority(
     event: object,
     repository: str,
@@ -451,6 +507,14 @@ def validate_pr_authority(
         second = _live_snapshot(identity, token, fetcher)
         if first != second:
             raise _Reject("AUTHORITY_STATE_CHANGED")
+        if _body_issue_number(second.body) != issue_number:
+            raise _Reject("AUTHORITY_BODY_ISSUE_MISMATCH")
+        _require_repository_issue(
+            identity.repository,
+            issue_number,
+            token,
+            fetcher,
+        )
     except _Reject as error:
         return Result("FAIL", str(error))
     except _Uncertain as error:

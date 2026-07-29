@@ -1,8 +1,8 @@
 # LLM-CONTRACT
 # id: agent-work-governor.live-pr-authority-workflow
-# state: PR_EVENT -> TRUSTED_SHA_FETCH -> LIVE_UNIQUE_PR -> COMMIT_AUTHORITY -> PASS | JOB_FAILURE
+# state: PR_EVENT -> TRUSTED_SHA_FETCH -> LIVE_UNIQUE_PR -> COMMIT_AUTHORITY -> BODY_EVIDENCE -> REPOSITORY_ISSUE -> PASS | JOB_FAILURE
 # preconditions: pull_request_target resolves workflow code from the protected default branch
-# invariant: candidate code, mutable body authority, and incomplete API evidence never admit
+# invariant: candidate code, body/trailer drift, non-Issues, and incomplete API evidence never admit
 # failure: the unique governor / authority job exits non-zero and blocks merge
 # source: https://github.com/github/docs/blob/7e8499908e9935b0e437faea77e48dcf5284c222/content/actions/reference/security/securely-using-pull_request_target.md
 # knowledge: bundle:knowledge/policies/work-governor.md
@@ -18,6 +18,7 @@ on:
 
 permissions:
   contents: read
+  issues: read
   pull-requests: read
 
 concurrency:
