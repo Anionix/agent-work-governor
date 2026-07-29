@@ -600,6 +600,7 @@
               ty check
               actionlint .github/workflows/governor.yml \
                 .github/workflows/governor-authority.yml \
+                .github/workflows/harness-isolation.yml \
                 assets/repository/.github/workflows/agent-work-governor.yml
               gitleaks dir . --no-banner --redact --exit-code 1
             '';

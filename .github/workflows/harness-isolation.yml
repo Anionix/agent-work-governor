@@ -1,0 +1,53 @@
+# LLM-CONTRACT
+# id: agent-work-governor.harness-isolation
+# state: PROTECTED_MAIN_REVISION -> PRIVILEGE_SEPARATION_TEST -> PASS | JOB_FAILURE
+# preconditions: only a merged main revision can trigger this disposable hosted runner
+# invariant: pull requests never execute candidate harness or test bytes as root
+# failure: UID isolation, sticky-root, or detached-overwrite regression fails the job
+# source: https://github.com/github/docs/blob/ee27de73e024106c5cf1f3938cf00bb477252862/content/actions/reference/runners/github-hosted-runners.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: validate
+# test: bundle:tests/test_contracts.py
+
+name: harness-isolation
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: harness / isolation / ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15]
+    steps:
+      - name: Check out the protected revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install locked Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          enable_kvm: false
+
+      - name: Validate detached-process write isolation
+        shell: bash
+        run: |
+          # LLM contract: merged harness + nobody child -> immutable receipt or failure.
+          # Primary source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/subprocess.rst
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python="$(
+            nix develop --no-update-lock-file --no-write-lock-file --command \
+              which python
+          )"
+          sudo "$python" -B -m unittest tests.test_bounded_harness
