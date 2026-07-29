@@ -13,6 +13,7 @@ import sys
 import tempfile
 import tomllib
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -24,6 +25,7 @@ import attest_policy
 import bootstrap
 import contract_blocks
 import doctor
+import package_canonical_runtime
 import package_runtime
 import rust_dispatch
 import toolchain_catalog
@@ -521,6 +523,300 @@ class DoctorTests(unittest.TestCase):
         self.assertIn("concurrent drift", evidence)
         self.assertIsNone(report)
 
+    def test_canonical_runtime_is_deterministic_and_isolated(self) -> None:
+        entries = validate_canonical.load_lock(PLUGIN_ROOT)
+        runtime = validate_canonical.load_runtime(PLUGIN_ROOT, entries)
+        self.assertEqual(
+            hashlib.sha256(runtime.payload).hexdigest(),
+            runtime.sha256,
+        )
+        with zipfile.ZipFile(io.BytesIO(runtime.payload)) as packaged:
+            self.assertEqual(
+                list(package_canonical_runtime.ARCHIVE_MEMBERS),
+                packaged.namelist(),
+            )
+            self.assertNotIn("yaml/cyaml.py", packaged.namelist())
+            self.assertTrue(packaged.read("PyYAML-LICENSE").startswith(b"Copyright"))
+            self.assertTrue(
+                all(
+                    item.compress_type == zipfile.ZIP_STORED
+                    for item in packaged.infolist()
+                )
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            target = root / "target space ü"
+            target.mkdir()
+            (target / "input.txt").write_text("unchanged\n", encoding="utf-8")
+            poison = root / "poison"
+            poison.mkdir()
+            (poison / "yaml.py").write_text(
+                "raise RuntimeError('ambient yaml imported')\n",
+                encoding="utf-8",
+            )
+            validator = root / "validator.py"
+            validator.write_text(
+                "import sys, yaml\n"
+                "assert yaml.safe_load('enabled: true') == {'enabled': True}\n"
+                "print(sys.flags.isolated, sys.flags.no_site, "
+                "int(yaml.__with_libyaml__))\n",
+                encoding="utf-8",
+            )
+            before = {
+                path.relative_to(target): (path.read_bytes(), path.stat().st_mode)
+                for path in target.rglob("*")
+                if path.is_file()
+            }
+            with (
+                mock.patch.dict(os.environ, {"PYTHONPATH": str(poison)}),
+                mock.patch.object(
+                    validate_canonical.urllib.request,
+                    "urlopen",
+                    side_effect=AssertionError("doctor must not use the network"),
+                ),
+            ):
+                validator_status, validator_evidence = doctor.canonical_validator(
+                    validator=validator,
+                    expected_sha256=hashlib.sha256(validator.read_bytes()).hexdigest(),
+                    target=target,
+                    runtime=runtime,
+                )
+            after = {
+                path.relative_to(target): (path.read_bytes(), path.stat().st_mode)
+                for path in target.rglob("*")
+                if path.is_file()
+            }
+        self.assertEqual(("PASS", "1 1 0"), (validator_status, validator_evidence))
+        self.assertEqual(before, after)
+
+        with tempfile.TemporaryDirectory() as directory:
+            validator = Path(directory) / "validator.py"
+            validator.write_text("import missing_validator_module\n", encoding="utf-8")
+            rejected_status, rejected_evidence = doctor.canonical_validator(
+                validator=validator,
+                expected_sha256=hashlib.sha256(validator.read_bytes()).hexdigest(),
+                target=Path(directory),
+                runtime=runtime,
+            )
+        self.assertEqual("FAIL", rejected_status)
+        self.assertIn("ModuleNotFoundError", rejected_evidence)
+        self.assertNotIn("VALIDATOR_RUNTIME", rejected_evidence)
+
+        poisoned = io.BytesIO()
+        with zipfile.ZipFile(poisoned, "w") as archive:
+            archive.writestr("yaml/__init__.py", "raise RuntimeError('poisoned')\n")
+        poisoned_payload = poisoned.getvalue()
+        poisoned_runtime = validate_canonical.RuntimeSnapshot(
+            poisoned_payload,
+            runtime.runner,
+            hashlib.sha256(poisoned_payload).hexdigest(),
+            "fixture",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            validator = Path(directory) / "validator.py"
+            validator.write_text("import yaml\n", encoding="utf-8")
+            with self.assertRaises(validate_canonical.CanonicalRuntimeError) as blocked:
+                validate_canonical.run_validator(
+                    validator,
+                    hashlib.sha256(validator.read_bytes()).hexdigest(),
+                    poisoned_runtime,
+                    Path(directory),
+                )
+        self.assertEqual(
+            "VALIDATOR_RUNTIME_IMPORT_FAILED:RuntimeError",
+            blocked.exception.code,
+        )
+
+    def test_canonical_runtime_faults_are_typed_and_fail_closed(self) -> None:
+        entries = validate_canonical.load_lock(PLUGIN_ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock_target = root / "references/canonical-runtime.lock.json"
+            lock_target.parent.mkdir()
+            shutil.copy2(
+                PLUGIN_ROOT / "references/canonical-runtime.lock.json",
+                lock_target,
+            )
+            builder_target = root / "scripts/package_canonical_runtime.py"
+            builder_target.parent.mkdir()
+            shutil.copy2(
+                PLUGIN_ROOT / "scripts/package_canonical_runtime.py",
+                builder_target,
+            )
+            runner_target = root / "scripts/canonical_runtime_runner.py"
+            shutil.copy2(
+                PLUGIN_ROOT / "scripts/canonical_runtime_runner.py",
+                runner_target,
+            )
+
+            fifo_probe = """
+import importlib.util
+import sys
+from pathlib import Path
+
+spec = importlib.util.spec_from_file_location("validate_canonical_probe", sys.argv[1])
+assert spec is not None and spec.loader is not None
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+operation = sys.argv[2]
+expected = sys.argv[3]
+try:
+    if operation == "lock":
+        module.load_lock(Path(sys.argv[4]))
+    elif operation == "runtime":
+        entries = module.load_lock(Path(sys.argv[4]))
+        module.load_runtime(Path(sys.argv[5]), entries)
+    else:
+        raise SystemExit(4)
+except module.CanonicalRuntimeError as error:
+    print(error.code)
+    raise SystemExit(0 if error.code == expected else 2)
+raise SystemExit(3)
+"""
+
+            def run_fifo_probe(*arguments: str) -> subprocess.CompletedProcess[str]:
+                return subprocess.run(
+                    [
+                        sys.executable,
+                        "-I",
+                        "-S",
+                        "-c",
+                        fifo_probe,
+                        str(PLUGIN_ROOT / "scripts/validate_canonical.py"),
+                        *arguments,
+                    ],
+                    capture_output=True,
+                    check=False,
+                    text=True,
+                    timeout=2,
+                )
+
+            validator_lock_target = root / "references/canonical-validators.lock.json"
+            os.mkfifo(validator_lock_target)
+            validator_lock_result = run_fifo_probe(
+                "lock",
+                "CANONICAL_VALIDATOR_LOCK_INVALID",
+                str(root),
+            )
+            self.assertEqual(
+                0,
+                validator_lock_result.returncode,
+                validator_lock_result.stderr,
+            )
+            self.assertEqual(
+                "CANONICAL_VALIDATOR_LOCK_INVALID",
+                validator_lock_result.stdout.strip(),
+            )
+            validator_lock_target.unlink()
+
+            with self.assertRaises(validate_canonical.CanonicalRuntimeError) as missing:
+                validate_canonical.load_runtime(root, entries)
+            self.assertEqual("VALIDATOR_RUNTIME_MISSING", missing.exception.code)
+            self.assertTrue(missing.exception.inconclusive)
+
+            runtime_target = root / "vendor/pyyaml-6.0.3.zip"
+            runtime_target.parent.mkdir()
+            runtime_target.write_bytes(b"corrupt")
+            with self.assertRaises(
+                validate_canonical.CanonicalRuntimeError
+            ) as mismatch:
+                validate_canonical.load_runtime(root, entries)
+            self.assertEqual(
+                "VALIDATOR_RUNTIME_DIGEST_MISMATCH",
+                mismatch.exception.code,
+            )
+            self.assertFalse(mismatch.exception.inconclusive)
+
+            runtime_target.unlink()
+            runtime_target.symlink_to(PLUGIN_ROOT / "vendor/pyyaml-6.0.3.zip")
+            with self.assertRaises(validate_canonical.CanonicalRuntimeError) as symlink:
+                validate_canonical.load_runtime(root, entries)
+            self.assertTrue(
+                symlink.exception.code.startswith("VALIDATOR_RUNTIME_INVALID")
+            )
+
+            runtime_target.unlink()
+            runtime_target.mkdir()
+            with self.assertRaises(
+                validate_canonical.CanonicalRuntimeError
+            ) as directory_error:
+                validate_canonical.load_runtime(root, entries)
+            self.assertEqual(
+                "VALIDATOR_RUNTIME_INVALID",
+                directory_error.exception.code,
+            )
+
+            runtime_target.rmdir()
+            os.mkfifo(runtime_target)
+            fifo_result = run_fifo_probe(
+                "runtime",
+                "VALIDATOR_RUNTIME_INVALID",
+                str(PLUGIN_ROOT),
+                str(root),
+            )
+            self.assertEqual(0, fifo_result.returncode, fifo_result.stderr)
+            self.assertEqual(
+                "VALIDATOR_RUNTIME_INVALID",
+                fifo_result.stdout.strip(),
+            )
+
+            runtime_target.unlink()
+            lock_target.write_text("{}\n", encoding="utf-8")
+            with self.assertRaises(
+                validate_canonical.CanonicalRuntimeError
+            ) as invalid_lock:
+                validate_canonical.load_runtime(root, entries)
+            self.assertEqual(
+                "VALIDATOR_RUNTIME_LOCK_INVALID",
+                invalid_lock.exception.code,
+            )
+
+    def test_canonical_runtime_snapshot_survives_source_replacement(self) -> None:
+        entries = validate_canonical.load_lock(PLUGIN_ROOT)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative in (
+                Path("references/canonical-runtime.lock.json"),
+                Path("scripts/canonical_runtime_runner.py"),
+                Path("scripts/package_canonical_runtime.py"),
+                Path("vendor/pyyaml-6.0.3.zip"),
+            ):
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(PLUGIN_ROOT / relative, target)
+            runtime = validate_canonical.load_runtime(root, entries)
+            validator_path = root / "validator.py"
+            validator_path.write_text(
+                "import yaml\nprint(yaml.safe_load('value: 7')['value'])\n",
+                encoding="utf-8",
+            )
+            validator_sha = hashlib.sha256(validator_path.read_bytes()).hexdigest()
+            real_run = subprocess.run
+
+            def replace_sources(*args, **kwargs):
+                (root / "vendor/pyyaml-6.0.3.zip").write_bytes(b"replaced")
+                validator_path.write_text(
+                    "raise RuntimeError('replaced')\n",
+                    encoding="utf-8",
+                )
+                return real_run(*args, **kwargs)
+
+            with mock.patch.object(
+                validate_canonical.subprocess,
+                "run",
+                side_effect=replace_sources,
+            ):
+                process = validate_canonical.run_validator(
+                    validator_path,
+                    validator_sha,
+                    runtime,
+                    root,
+                )
+        self.assertEqual(0, process.returncode, process.stderr)
+        self.assertEqual("7", process.stdout.strip())
+
     def test_packaged_doctor_runtime_checks_pass(self) -> None:
         bundled_runtime_or_skip(self)
         report = doctor.audit(PLUGIN_ROOT)
@@ -531,6 +827,11 @@ class DoctorTests(unittest.TestCase):
 
     def test_canonical_validator_locks_match_installed_sources(self) -> None:
         lock = validate_canonical.load_lock(PLUGIN_ROOT)
+        runtime = validate_canonical.load_runtime(PLUGIN_ROOT, lock)
+        targets = {
+            "plugin_validator": PLUGIN_ROOT,
+            "skill_validator": PLUGIN_ROOT / "skills/check-governor-policy",
+        }
         for key in ("plugin_validator", "skill_validator"):
             path = Path.home() / lock[key]["path"]
             self.assertEqual(
@@ -545,6 +846,15 @@ class DoctorTests(unittest.TestCase):
                     lock[key]["sha256"],
                     hashlib.sha256(path.read_bytes()).hexdigest(),
                 )
+                validator = validate_canonical.verified_installed_validator(lock[key])
+                assert validator is not None
+                process = validate_canonical.run_validator(
+                    validator,
+                    lock[key]["sha256"],
+                    runtime,
+                    targets[key],
+                )
+                self.assertEqual(0, process.returncode, process.stderr)
 
     def test_code_review_source_lock_matches_installed_source(self) -> None:
         lock = json.loads(

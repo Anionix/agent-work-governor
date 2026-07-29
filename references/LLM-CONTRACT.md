@@ -10,6 +10,17 @@
 # test: repo:tests/test_contracts.py
 
 # LLM-CONTRACT
+# id: agent-work-governor.canonical-runtime-reference-lock
+# state: PYYAML_SOURCE -> DETERMINISTIC_ARCHIVE -> VERIFIED_RUNTIME | CLOSED_BLOCKER
+# preconditions: the lock binds the PyPI source artifact and packaged pure-Python bytes
+# invariant: missing, symlinked, or digest-mismatched runtime bytes never enter sys.path
+# failure: report a typed canonical validator runtime blocker before validator execution
+# source: repo:references/canonical-runtime.lock.json
+# knowledge: repo:knowledge/policies/work-governor.md
+# enforced_by: load_runtime
+# test: repo:tests/test_contracts.py
+
+# LLM-CONTRACT
 # id: agent-work-governor.canonical-validator-reference-lock
 # state: VALIDATOR_SOURCE -> IMMUTABLE_REVISION -> VERIFIED_VALIDATOR | STALE_INPUT
 # preconditions: each validator lock names an immutable source URL and SHA-256 digest
@@ -42,4 +53,5 @@
 # enforced_by: validate_okf
 # test: repo:tests/test_contracts.py
 
-The verification paths are `audit`, `load_lock`, `validate_pre_pr_receipt`, and `validate_okf`.
+The verification paths are `audit`, `load_lock`, `load_runtime`,
+`validate_pre_pr_receipt`, and `validate_okf`.
