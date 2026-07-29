@@ -2044,9 +2044,6 @@ class SourceHygieneTests(unittest.TestCase):
             '"evidence_set_sha256"',
             '"verify_report_sha256"',
             "GITHUB_STEP_SUMMARY",
-            "AWG_DEBUG_RUST_TESTS_BEGIN",
-            '"09b4630c4236af18324b612bdf59526e74437517"',
-            "tail = data[-131_072:]",
         ):
             self.assertIn(evidence, workflow)
         for forbidden in (

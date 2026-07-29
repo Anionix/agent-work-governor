@@ -84,11 +84,12 @@ class RunIdentity:
 
 @dataclass(frozen=True)
 class RuntimePaths:
-    """Harness-owned paths that candidate checks cannot replace."""
+    """Protected evidence paths plus one candidate-owned temporary workspace."""
 
     receipt: Path
     evidence: Path
     artifacts: Path
+    temporary: Path
 
 
 SAFE_ENVIRONMENT = frozenset(
@@ -331,7 +332,7 @@ def _isolation_identity() -> RunIdentity:
 
 
 def _candidate_environment(
-    artifacts: Path, cargo_home: Path | None = None
+    artifacts: Path, temporary: Path, cargo_home: Path | None = None
 ) -> dict[str, str]:
     # LLM contract: trusted Nix shell + wrapper target marker -> preserved
     # compiler semantics; malformed or non-unit ambient markers are discarded.
@@ -353,7 +354,7 @@ def _candidate_environment(
             "HOME": str(artifacts),
             "PIP_CACHE_DIR": str(artifacts / "pip-cache"),
             "RUFF_CACHE_DIR": str(artifacts / "ruff-cache"),
-            "TMPDIR": str(artifacts),
+            "TMPDIR": str(temporary),
             "UV_CACHE_DIR": str(artifacts / "uv-cache"),
             "XDG_CACHE_HOME": str(artifacts),
         }
@@ -378,6 +379,7 @@ async def _spawn(
     argv: list[str],
     cwd: Path,
     artifacts: Path,
+    temporary: Path,
     cargo_home: Path | None,
     identity: RunIdentity | None,
 ) -> asyncio.subprocess.Process:
@@ -393,7 +395,7 @@ async def _spawn(
     return await asyncio.create_subprocess_exec(
         *argv,
         cwd=cwd,
-        env=_candidate_environment(artifacts, cargo_home),
+        env=_candidate_environment(artifacts, temporary, cargo_home),
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
@@ -409,6 +411,7 @@ async def _execute_check(
     repository: Path,
     evidence_root: Path,
     artifacts: Path,
+    temporary: Path,
     events: dict[str, asyncio.Event],
     semaphore: asyncio.Semaphore,
     state: dict[str, CheckPhase],
@@ -432,6 +435,7 @@ async def _execute_check(
                 argv,
                 _inside(repository, check["path"]),
                 artifacts,
+                temporary,
                 cargo_home,
                 identity,
             )
@@ -672,6 +676,7 @@ def _prepare_runtime(
             _require(receipts.is_relative_to(repository), "HARNESS_RECEIPT_PATH_UNSAFE")
             evidence = _runtime_dir(receipts, "evidence")
             artifacts = _runtime_dir(receipts, "artifacts")
+            temporary = artifacts
         else:
             _validate_subject(repository, identity)
             _require(
@@ -703,11 +708,33 @@ def _prepare_runtime(
             artifacts = _runtime_dir(runtime_root, "artifacts")
             os.chown(artifacts, identity.uid, identity.gid)
             artifacts.chmod(0o700)
+            # LLM contract: protected 0711 runtime + root-owned readable anchor
+            # -> candidate-only temporary workspace | typed preparation failure.
+            # Primary source: https://pubs.opengroup.org/onlinepubs/9799919799/functions/open.html
+            temporary_anchor = parent / f"{runtime_root.name}-candidate"
+            temporary_anchor.mkdir(mode=0o755)
+            metadata = temporary_anchor.lstat()
+            _require(
+                metadata.st_uid == 0
+                and stat.S_ISDIR(metadata.st_mode)
+                and stat.S_IMODE(metadata.st_mode) == 0o755,
+                "HARNESS_RUNTIME_ROOT_UNSAFE",
+            )
+            temporary = _runtime_dir(temporary_anchor, "tmp")
+            os.chown(temporary, identity.uid, identity.gid)
+            temporary.chmod(0o700)
+            metadata = temporary.lstat()
+            _require(
+                metadata.st_uid == identity.uid
+                and stat.S_ISDIR(metadata.st_mode)
+                and stat.S_IMODE(metadata.st_mode) == 0o700,
+                "HARNESS_RUNTIME_ROOT_UNSAFE",
+            )
         receipt.unlink(missing_ok=True)
         receipt.with_name(f"{receipt.name}.fault.json").unlink(missing_ok=True)
     except (OSError, ValueError) as error:
         raise HarnessError("HARNESS_RUNTIME_PREPARATION_FAILED") from error
-    return repository, RuntimePaths(receipt, evidence, artifacts)
+    return repository, RuntimePaths(receipt, evidence, artifacts, temporary)
 
 
 async def execute(
@@ -730,6 +757,7 @@ async def execute(
     receipt = runtime.receipt
     evidence_root = runtime.evidence
     artifacts = runtime.artifacts
+    temporary = runtime.temporary
     order = [check["identifier"] for check in checks]
     state = dict.fromkeys(order, CheckPhase.NOT_STARTED)
     events = {identifier: asyncio.Event() for identifier in order}
@@ -741,6 +769,7 @@ async def execute(
                 repository,
                 evidence_root,
                 artifacts,
+                temporary,
                 events,
                 semaphore,
                 state,
