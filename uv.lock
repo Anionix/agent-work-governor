@@ -11,9 +11,11 @@ source = { virtual = "." }
 dev = [
     { name = "pip-audit" },
     { name = "pyrefly" },
-    { name = "pyyaml" },
     { name = "ruff" },
     { name = "ty" },
+]
+runtime-build = [
+    { name = "pyyaml" },
 ]
 
 [package.metadata]
@@ -22,10 +24,10 @@ dev = [
 dev = [
     { name = "pip-audit", specifier = "==2.10.1" },
     { name = "pyrefly", specifier = "==1.1.1" },
-    { name = "pyyaml", specifier = "==6.0.3" },
     { name = "ruff", specifier = "==0.16.0" },
     { name = "ty", specifier = "==0.0.64" },
 ]
+runtime-build = [{ name = "pyyaml", specifier = "==6.0.3" }]
 
 [[package]]
 name = "boolean-py"

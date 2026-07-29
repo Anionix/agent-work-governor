@@ -28,7 +28,9 @@ MANIFEST = Path("bin/manifest.json")
 SOURCE_INPUTS = (
     Path("flake.lock"),
     Path("flake.nix"),
+    Path("pyproject.toml"),
     Path("toolchain.lock.json"),
+    Path("uv.lock"),
     Path("rust/Cargo.lock"),
     Path("rust/Cargo.toml"),
     Path("rust/clippy.toml"),

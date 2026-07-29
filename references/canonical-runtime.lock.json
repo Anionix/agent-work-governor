@@ -1,19 +1,22 @@
 {
-  "schema_version": "0.1",
+  "schema_version": "0.2",
+  "dependency": {
+    "name": "pyyaml",
+    "group": "runtime-build",
+    "lock_path": "uv.lock"
+  },
   "runtime": {
     "distribution": "PyYAML",
-    "version": "6.0.3",
     "relative_path": "vendor/pyyaml-6.0.3.zip",
     "sha256": "ead6da5d6b270fe2c9064c9e5e76c36e585148ad1eb8d3ed4c60968bfce25cf5",
     "size": 216586,
-    "source_url": "https://files.pythonhosted.org/packages/05/8e/961c0007c59b8dd7729d542c61a4d537767a59645b82a0b521206e1e25c2/pyyaml-6.0.3.tar.gz",
-    "source_sha256": "d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f",
     "license": "MIT",
     "license_member": "PyYAML-LICENSE",
     "builder_path": "scripts/package_canonical_runtime.py",
-    "builder_sha256": "8cda6d67649ac6480a095299de868d950e63dd99cc7ef7aa2cd4dc1ff49da471",
+    "builder_sha256": "2d0cefdab14d355f98418a21f0f8dd855ed5ca6dcbfe6474a247e139db48357e",
+    "dependency_identity_sha256": "93f2437030e54874ebe2cf9dbdbbeaac053758cc1c2c7480aae8fc94ea5a7bda",
     "runner_path": "scripts/canonical_runtime_runner.py",
-    "runner_sha256": "eb7208955f06fe025962e3fa2631342106c18de2529a8a6842bf14146b2c5949",
+    "runner_sha256": "e17ab6055933bf406debd7e3292db8af74feed0bcf22e970079356f4039077c9",
     "compatible_validator_sha256": [
       "6cc9dc3199c935916cf6f73fcbbbb0e3bb1b58c8f5109fefa499978908164f51",
       "ebda00d55d7518b127f675f062fb5c6e7a1ffdc0a99df1a55ac594400d7d3228"

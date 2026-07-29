@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import io
+import re
 import sys
 import tarfile
 import zipfile
@@ -14,15 +15,14 @@ from pathlib import Path
 # LLM-CONTRACT
 # id: agent-work-governor.canonical-runtime-package
 # state: PINNED_PYYAML_SOURCE -> CANONICAL_ZIP_BYTES -> HASH_BOUND_RUNTIME | REJECTED
-# preconditions: Nix supplies the SHA-256-locked PyYAML 6.0.3 source distribution
+# preconditions: Nix supplies the uv.lock-derived version and source SHA-256
 # invariant: selected source bytes, names, metadata, ordering, and output bytes are deterministic
 # failure: reject source/archive drift or unsafe members before writing output
-# source: bundle:references/canonical-runtime.lock.json
+# source: bundle:uv.lock
 # knowledge: bundle:knowledge/policies/work-governor.md
 # enforced_by: build_archive
 # test: bundle:tests/test_contracts.py
 
-SOURCE_SHA256 = "d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f"
 MODULE_NAMES = """
 __init__.py composer.py constructor.py dumper.py emitter.py error.py events.py
 loader.py nodes.py parser.py reader.py representer.py resolver.py scanner.py
@@ -33,20 +33,50 @@ ARCHIVE_MEMBERS = tuple(
     sorted(["PyYAML-LICENSE", *(f"yaml/{name}" for name in MODULES)])
 )
 FIXED_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+VERSION_RE = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}$")
+MAX_SOURCE_BYTES = 2_000_000
 
 
-def build_archive(payload: bytes) -> bytes:
-    if hashlib.sha256(payload).hexdigest() != SOURCE_SHA256:
+def build_archive(
+    payload: bytes,
+    source_sha256: str,
+    source_size: int,
+    version: str,
+) -> bytes:
+    if not SHA256_RE.fullmatch(source_sha256):
+        raise ValueError("invalid PyYAML source digest")
+    if not VERSION_RE.fullmatch(version):
+        raise ValueError("invalid PyYAML version")
+    if isinstance(source_size, bool) or not 0 < source_size <= MAX_SOURCE_BYTES:
+        raise ValueError("invalid PyYAML source size")
+    if len(payload) != source_size:
+        raise ValueError("PyYAML source size mismatch")
+    if hashlib.sha256(payload).hexdigest() != source_sha256:
         raise ValueError("PyYAML source digest mismatch")
+    source_root = f"pyyaml-{version}"
+    source_names = {
+        output_name: (
+            f"{source_root}/LICENSE"
+            if output_name == "PyYAML-LICENSE"
+            else f"{source_root}/lib/{output_name}"
+        )
+        for output_name in ARCHIVE_MEMBERS
+    }
     with tarfile.open(fileobj=io.BytesIO(payload), mode="r:gz") as source:
         entries: dict[str, bytes] = {}
-        for output_name in ARCHIVE_MEMBERS:
-            source_name = (
-                "pyyaml-6.0.3/LICENSE"
-                if output_name == "PyYAML-LICENSE"
-                else f"pyyaml-6.0.3/lib/{output_name}"
-            )
-            member = source.getmember(source_name)
+        required = {name: output for output, name in source_names.items()}
+        selected: dict[str, tarfile.TarInfo] = {}
+        for member in source.getmembers():
+            if member.name not in required:
+                continue
+            if member.name in selected:
+                raise ValueError(f"duplicate source member: {member.name}")
+            selected[member.name] = member
+        if selected.keys() != required.keys():
+            raise ValueError("required PyYAML source members are missing")
+        for source_name, output_name in required.items():
+            member = selected[source_name]
             if not member.isfile() or member.size > 512_000:
                 raise ValueError(f"unsafe source member: {source_name}")
             handle = source.extractfile(member)
@@ -67,11 +97,19 @@ def build_archive(payload: bytes) -> bytes:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
+    parser.add_argument("--source-sha256", required=True)
+    parser.add_argument("--source-size", type=int, required=True)
+    parser.add_argument("--version", required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--expected-sha256", required=True)
     args = parser.parse_args(argv)
     try:
-        payload = build_archive(args.source.read_bytes())
+        payload = build_archive(
+            args.source.read_bytes(),
+            args.source_sha256,
+            args.source_size,
+            args.version,
+        )
         observed = hashlib.sha256(payload).hexdigest()
         if observed != args.expected_sha256:
             raise ValueError(

@@ -1,10 +1,12 @@
 Agent Work Governor
 Copyright 2026 Anionix
 
-This product includes a deterministic pure-Python runtime archive derived from
-PyYAML 6.0.3, Copyright Kirill Simonov, distributed under the MIT License.
+This product includes a reviewed offline pure-Python runtime archive derived
+deterministically from PyYAML 6.0.3, Copyright Kirill Simonov, distributed
+under the MIT License. It is not an ambient Python installation.
 The complete PyYAML license text is stored as `PyYAML-LICENSE` inside
 `vendor/pyyaml-6.0.3.zip`.
 
-Source and digest provenance are recorded in
-`references/canonical-runtime.lock.json`.
+The upstream sdist identity is locked once in `uv.lock`; deterministic output
+identity and isolated execution metadata are recorded in
+`references/canonical-runtime.lock.json` and re-proved by Nix.
