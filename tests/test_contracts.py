@@ -964,6 +964,12 @@ class RustDispatchTests(unittest.TestCase):
             with self.assertRaises(rust_dispatch.IntegrityError):
                 rust_dispatch.resolve_binary(root)
 
+            self.runtime_bundle(root)
+            catalog = root / "toolchain.lock.json"
+            catalog.write_bytes(catalog.read_bytes() + b"drift")
+            with self.assertRaises(rust_dispatch.IntegrityError):
+                rust_dispatch.resolve_binary(root)
+
             binary = self.runtime_bundle(root)
             outside = root / "outside"
             shutil.copy2(binary, outside)
@@ -1696,7 +1702,7 @@ class SourceHygieneTests(unittest.TestCase):
         uv_versions = {
             package["name"]: package["version"] for package in uv_document["package"]
         }
-        for tool in ("ruff", "ty", "pip-audit"):
+        for tool in ("pyrefly", "ruff", "ty", "pip-audit"):
             self.assertEqual(pins[tool]["version"], development_pins[tool])
             self.assertEqual(pins[tool]["version"], uv_versions[tool])
         self.assertEqual(
@@ -1722,17 +1728,26 @@ class SourceHygieneTests(unittest.TestCase):
             rust_toolchain["toolchain"]["channel"],
         )
         self.assertEqual(pins["rust"]["version"], pins["cargo"]["version"])
-        for component in ("clippy", "rustfmt"):
+        self.assertEqual(
+            {"clippy", "rust-analyzer", "rust-src", "rustfmt"},
+            set(rust_toolchain["toolchain"]["components"]),
+        )
+        self.assertEqual(pins["rust"]["version"], pins["rust-src"]["version"])
+        for component in ("clippy", "rust-analyzer", "rust-src", "rustfmt"):
             self.assertEqual(pins["rust"]["source"], pins[component]["source"])
             self.assertEqual(
                 pins["rust"]["source_digest"],
                 pins[component]["source_digest"],
             )
-
         flake_lock = json.loads(
             (PLUGIN_ROOT / "flake.lock").read_text(encoding="utf-8")
         )
         root_inputs = flake_lock["nodes"][flake_lock["root"]]["inputs"]
+        rust_overlay = flake_lock["nodes"][root_inputs["rust-overlay"]]
+        self.assertEqual(
+            [root_inputs["nixpkgs"]],
+            rust_overlay["inputs"]["nixpkgs"],
+        )
         for tool in ("nixpkgs", "rust-overlay"):
             input_node = flake_lock["nodes"][root_inputs[tool]]
             locked = input_node["locked"]
@@ -1783,6 +1798,9 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertIn("--proto-redir '=https'", workflow)
         self.assertNotIn(".venv/bin/", workflow)
         self.assertIn("run_locked ruff format --check .", workflow)
+        self.assertIn("run_locked pyrefly check", workflow)
+        self.assertIn("assert_version rust-analyzer", workflow)
+        self.assertIn("TOOLCHAIN_COMPONENT_MISSING::rust-src", workflow)
         self.assertIn("run_locked pip-audit", workflow)
         self.assertLess(
             workflow.index("command -v nix >/dev/null 2>&1"),

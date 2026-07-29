@@ -138,7 +138,7 @@ def load_gate() -> RepositoryGate:
 class PortableBundleTests(unittest.TestCase):
     @staticmethod
     def minimal_catalog() -> dict[str, object]:
-        rust_sha = "b" * 40
+        rust_sha = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
         return {
             "locked_at": "2026-07-29",
             "required": ["python", "rust"],
@@ -182,6 +182,20 @@ class PortableBundleTests(unittest.TestCase):
                     "id": "clippy",
                     "language": "rust",
                     "version": "0.1.97",
+                    "source": rust["source"],
+                    "source_digest": rust["source_digest"],
+                },
+                {
+                    "id": "rust-analyzer",
+                    "language": "rust",
+                    "version": rust["version"],
+                    "source": rust["source"],
+                    "source_digest": rust["source_digest"],
+                },
+                {
+                    "id": "rust-src",
+                    "language": "rust",
+                    "version": rust["version"],
                     "source": rust["source"],
                     "source_digest": rust["source_digest"],
                 },
@@ -275,6 +289,100 @@ class PortableBundleTests(unittest.TestCase):
         self.assertEqual([], findings)
         self.assertEqual("python", pins["python"]["language"])
         self.assertEqual("rust", pins["rust"]["language"])
+
+    def test_bundled_catalog_has_locked_analyzers(self) -> None:
+        pins, findings = toolchain_catalog.validate_catalog(
+            toolchain_catalog_path(),
+            ("pyrefly", "rust-analyzer", "rust-src"),
+        )
+        self.assertEqual([], findings)
+        self.assertEqual("1.1.1", pins["pyrefly"]["version"])
+        self.assertEqual(
+            set(toolchain_catalog.SYSTEMS), set(pins["pyrefly"]["artifacts"])
+        )
+        for component in ("rust-analyzer", "rust-src"):
+            self.assertEqual(pins["rust"]["source"], pins[component]["source"])
+            self.assertEqual(
+                pins["rust"]["source_digest"],
+                pins[component]["source_digest"],
+            )
+
+    def test_catalog_rejects_pyrefly_identity_drift(self) -> None:
+        catalog = json.loads(toolchain_catalog_path().read_text(encoding="utf-8"))
+        cases = (
+            ("missing-artifacts", "TOOLCHAIN_ANALYZER_IDENTITY_MISMATCH"),
+            ("floating-version", "TOOLCHAIN_ENTRY_INVALID"),
+            ("wrong-source", "TOOLCHAIN_ANALYZER_IDENTITY_MISMATCH"),
+            ("wrong-version", "TOOLCHAIN_ANALYZER_IDENTITY_MISMATCH"),
+            ("wrong-artifact-url", "TOOLCHAIN_ANALYZER_IDENTITY_MISMATCH"),
+            ("wrong-artifact-hash", "TOOLCHAIN_ANALYZER_IDENTITY_MISMATCH"),
+        )
+        for mutation, expected_code in cases:
+            with self.subTest(mutation=mutation):
+                document = cast(
+                    dict[str, object],
+                    json.loads(json.dumps(catalog)),
+                )
+                pyrefly = next(
+                    item
+                    for item in self.catalog_tools(document)
+                    if item["id"] == "pyrefly"
+                )
+                if mutation == "missing-artifacts":
+                    pyrefly.pop("artifacts")
+                elif mutation == "floating-version":
+                    pyrefly["version"] = "latest"
+                elif mutation == "wrong-source":
+                    other_commit = "a" * 40
+                    pyrefly["source"] = (
+                        f"https://github.com/facebook/pyrefly/commit/{other_commit}"
+                    )
+                    pyrefly["source_digest"] = f"git:{other_commit}"
+                elif mutation == "wrong-version":
+                    pyrefly["version"] = "1.1.0"
+                else:
+                    artifacts = cast(
+                        dict[str, dict[str, str]],
+                        pyrefly["artifacts"],
+                    )
+                    if mutation == "wrong-artifact-url":
+                        artifacts["aarch64-darwin"]["url"] = artifacts[
+                            "aarch64-darwin"
+                        ]["url"].replace("pyrefly-1.1.1", "pyrefly-1.1.0")
+                    else:
+                        artifacts["aarch64-darwin"]["sha256"] = "0" * 64
+
+                _, findings = self.validate_catalog_fixture(document)
+
+                self.assertIn(
+                    (
+                        expected_code,
+                        "pyrefly",
+                    ),
+                    {(item["code"], item["tool_id"]) for item in findings},
+                )
+
+    def test_catalog_rejects_rust_analyzer_identity_drift(self) -> None:
+        catalog = json.loads(toolchain_catalog_path().read_text(encoding="utf-8"))
+        for tool_id in ("rust-analyzer", "rust-src"):
+            with self.subTest(tool=tool_id):
+                document = cast(
+                    dict[str, object],
+                    json.loads(json.dumps(catalog)),
+                )
+                tool = next(
+                    item
+                    for item in self.catalog_tools(document)
+                    if item["id"] == tool_id
+                )
+                tool["version"] = "1.96.0"
+
+                _, findings = self.validate_catalog_fixture(document)
+
+                self.assertIn(
+                    ("TOOLCHAIN_ANALYZER_IDENTITY_MISMATCH", tool_id),
+                    {(item["code"], item["tool_id"]) for item in findings},
+                )
 
     def test_repository_gate_requires_exact_python_runtime_and_pin(self) -> None:
         gate = load_gate()
@@ -429,6 +537,8 @@ class PortableBundleTests(unittest.TestCase):
         cases = (
             ("cargo", "version"),
             ("clippy", "source_identity"),
+            ("rust-analyzer", "version"),
+            ("rust-src", "version"),
             ("rustfmt", "source_identity"),
             ("cargo", "language"),
         )
@@ -485,8 +595,15 @@ class PortableBundleTests(unittest.TestCase):
         catalog = json.loads(toolchain_catalog_path().read_text(encoding="utf-8"))
         categories = {
             "github_actions": ("cachix/install-nix-action",),
-            "python_wheels": ("ruff", "ty", "uv"),
-            "rust_components": ("cargo", "clippy", "rust", "rustfmt"),
+            "python_wheels": ("pyrefly", "ruff", "ty", "uv"),
+            "rust_components": (
+                "cargo",
+                "clippy",
+                "rust",
+                "rust-analyzer",
+                "rust-src",
+                "rustfmt",
+            ),
         }
 
         for category, tool_ids in categories.items():

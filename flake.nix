@@ -3,7 +3,12 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/624af665418d3c65d544145b4d34ad696439570e";
-    rust-overlay.url = "github:oxalica/rust-overlay/8ec8a5a41f8d8244e672829c9cd705416139d3f0";
+    rust-overlay = {
+      # LLM contract: one root nixpkgs identity -> overlay follows it or lock resolution fails.
+      # Primary source: https://nix.dev/manual/nix/2.34/command-ref/new-cli/nix3-flake
+      url = "github:oxalica/rust-overlay/8ec8a5a41f8d8244e672829c9cd705416139d3f0";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
   outputs =
@@ -74,8 +79,11 @@
         "cachix/install-nix-action" = "https://github.com/cachix/install-nix-action";
         cargo = "https://github.com/rust-lang/cargo";
         clippy = "https://github.com/rust-lang/rust";
+        pyrefly = "https://github.com/facebook/pyrefly";
         ruff = "https://github.com/astral-sh/ruff";
         rust = "https://github.com/rust-lang/rust";
+        rust-analyzer = "https://github.com/rust-lang/rust";
+        rust-src = "https://github.com/rust-lang/rust";
         rustfmt = "https://github.com/rust-lang/rust";
         ty = "https://github.com/astral-sh/ty";
         uv = "https://github.com/astral-sh/uv";
@@ -103,18 +111,20 @@
       gitRepositoryBindingSelfTest =
         let
           commit = "0000000000000000000000000000000000000000";
-          rejectsRepository = !validPin {
-            id = "cachix/install-nix-action";
-            version = "v1.0.0";
-            source = "https://github.com/unrelated/repository/commit/${commit}";
-            source_digest = "git:${commit}";
-          };
-          rejectsDigestDowngrade = !validPin {
-            id = "cachix/install-nix-action";
-            version = "v1.0.0";
-            source = "https://github.com/cachix/install-nix-action/commit/${commit}";
-            source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
-          };
+          rejectsRepository =
+            !validPin {
+              id = "cachix/install-nix-action";
+              version = "v1.0.0";
+              source = "https://github.com/unrelated/repository/commit/${commit}";
+              source_digest = "git:${commit}";
+            };
+          rejectsDigestDowngrade =
+            !validPin {
+              id = "cachix/install-nix-action";
+              version = "v1.0.0";
+              source = "https://github.com/cachix/install-nix-action/commit/${commit}";
+              source_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+            };
         in
         if rejectsRepository && rejectsDigestDowngrade then
           true
@@ -152,13 +162,20 @@
         in
         if entry.language == language then entry else fail "TOOLCHAIN_LANGUAGE_MISMATCH" toolId;
       validateRustComponents =
-        rustPin: cargoPin: clippyPin: rustfmtPin:
+        rustPin: cargoPin: clippyPin: rustAnalyzerPin: rustSrcPin: rustfmtPin:
         # LLM contract: individually valid component pins -> one consistent Rust release or failure.
         # Source: https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/src/tools/build-manifest/src/main.rs
+        # Release manifest: https://static.rust-lang.org/dist/2026-07-16/channel-rust-1.97.1.toml
         if
           cargoPin.version == rustPin.version
+          && rustAnalyzerPin.version == rustPin.version
+          && rustSrcPin.version == rustPin.version
           && clippyPin.source == rustPin.source
           && clippyPin.source_digest == rustPin.source_digest
+          && rustAnalyzerPin.source == rustPin.source
+          && rustAnalyzerPin.source_digest == rustPin.source_digest
+          && rustSrcPin.source == rustPin.source
+          && rustSrcPin.source_digest == rustPin.source_digest
           && rustfmtPin.source == rustPin.source
           && rustfmtPin.source_digest == rustPin.source_digest
         then
@@ -343,24 +360,30 @@
           rustPin = pinFor "rust" "rust";
           cargoPin = pinFor "rust" "cargo";
           clippyPin = pinFor "rust" "clippy";
+          rustAnalyzerPin = pinFor "rust" "rust-analyzer";
+          rustSrcPin = pinFor "rust" "rust-src";
           rustfmtPin = pinFor "rust" "rustfmt";
           rustComponentSelfTest =
             let
               rejects =
-                cargoCandidate: clippyCandidate: rustfmtCandidate:
-                !(builtins.tryEval (validateRustComponents rustPin cargoCandidate clippyCandidate rustfmtCandidate))
-                .success;
+                cargoCandidate: clippyCandidate: rustAnalyzerCandidate: rustSrcCandidate: rustfmtCandidate:
+                !(builtins.tryEval (
+                  validateRustComponents rustPin cargoCandidate clippyCandidate rustAnalyzerCandidate rustSrcCandidate
+                    rustfmtCandidate
+                )).success;
             in
             if
-              rejects (cargoPin // { version = "0.0.0"; }) clippyPin rustfmtPin
-              && rejects cargoPin (clippyPin // { source = "https://example.invalid/clippy"; }) rustfmtPin
-              && rejects cargoPin clippyPin (rustfmtPin // { source = "https://example.invalid/rustfmt"; })
+              rejects (cargoPin // { version = "0.0.0"; }) clippyPin rustAnalyzerPin rustSrcPin rustfmtPin
+              && rejects cargoPin clippyPin (
+                rustAnalyzerPin // { source = "https://example.invalid/rust-analyzer"; }
+              ) rustSrcPin rustfmtPin
+              && rejects cargoPin clippyPin rustAnalyzerPin (rustSrcPin // { version = "0.0.0"; }) rustfmtPin
             then
               true
             else
               fail "TOOLCHAIN_RUST_COMPONENT_SELF_TEST_FAILED" "";
           rustComponentsValid = builtins.seq rustComponentSelfTest (
-            validateRustComponents rustPin cargoPin clippyPin rustfmtPin
+            validateRustComponents rustPin cargoPin clippyPin rustAnalyzerPin rustSrcPin rustfmtPin
           );
           rustRelease =
             if builtins.hasAttr rustPin.version pkgs.rust-bin.stable then
@@ -372,6 +395,8 @@
               rustRelease.default.override {
                 extensions = [
                   "clippy"
+                  "rust-analyzer"
+                  "rust-src"
                   "rustfmt"
                 ];
               }
@@ -411,7 +436,9 @@
           rustVersion = rustPin.version;
           cargoVersion = cargoPin.version;
           clippyVersion = clippyPin.version;
+          rustAnalyzerVersion = rustAnalyzerPin.version;
           rustfmtVersion = rustfmtPin.version;
+          pyreflyVersion = (pinFor "python" "pyrefly").version;
           rustCommit = gitCommit "rust" "rust";
           cargoCommit = gitCommit "rust" "cargo";
           python = pythonBase.withPackages (packages: [ packages.pyyaml ]);
@@ -423,6 +450,7 @@
           );
           gitleaks = bindNixPackage "nix" "gitleaks" "gitleaks" pkgs.gitleaks;
           pipAudit = bindNixPackage "python" "pip-audit" "pip-audit" pkgs.pip-audit;
+          pyrefly = mkWheelTool pkgs "pyrefly";
           ruff = mkWheelTool pkgs "ruff";
           ty = mkWheelTool pkgs "ty";
           uv = mkWheelTool pkgs "uv";
@@ -464,6 +492,7 @@
               toolchain.actionlint
               toolchain.git
               toolchain.gitleaks
+              toolchain.pyrefly
               toolchain.ruff
               toolchain.ty
               toolchain.uv
@@ -499,6 +528,16 @@
               assert_locked_identity rustfmt-commit \
                 "$(rustfmt --version | awk '{gsub(/[()]/, "", $3); print $3}')" \
                 "${builtins.substring 0 10 toolchain.rustCommit}"
+              assert_locked_identity rust-analyzer \
+                "$(rust-analyzer --version | awk '{print $2}')" \
+                "${toolchain.rustAnalyzerVersion}"
+              test -d "$(rustc --print sysroot)/lib/rustlib/src/rust/library" || {
+                echo "TOOLCHAIN_COMPONENT_MISSING:rust-src" >&2
+                exit 1
+              }
+              assert_locked_identity pyrefly \
+                "$(pyrefly --version | awk '{print $2}')" \
+                "${toolchain.pyreflyVersion}"
               cd rust
               cargo fmt --check
               cargo clippy --all-targets --all-features --offline -- -D warnings
@@ -509,6 +548,7 @@
                 assets/presets/owner-original.toml --json
               ruff format --check .
               ruff check .
+              pyrefly check
               ty check
               actionlint .github/workflows/governor.yml \
                 .github/workflows/governor-authority.yml \
@@ -562,6 +602,7 @@
               toolchain.gitleaks
               toolchain.formatter
               toolchain.pipAudit
+              toolchain.pyrefly
               toolchain.ruff
               toolchain.ty
               toolchain.uv

@@ -28,6 +28,7 @@ MANIFEST = Path("bin/manifest.json")
 SOURCE_INPUTS = (
     Path("flake.lock"),
     Path("flake.nix"),
+    Path("toolchain.lock.json"),
     Path("rust/Cargo.lock"),
     Path("rust/Cargo.toml"),
     Path("rust/clippy.toml"),
@@ -165,6 +166,10 @@ def _regular_file(root: Path, relative: Path) -> Path:
             ) from error
         if stat.S_ISLNK(metadata.st_mode):
             raise IntegrityError(f"bundle symlink rejected: {candidate}")
+    # Every non-empty relative path executes the loop; Pyrefly 1.1.1 cannot
+    # derive that fact from the guard above.
+    # Primary source: https://github.com/facebook/pyrefly/blob/b87de05834c401898c79fd9686b806c051dd3667/website/docs/error-suppressions.mdx
+    # pyrefly: ignore[unbound-name]
     if not stat.S_ISREG(metadata.st_mode):
         raise IntegrityError(f"bundle path is not a regular file: {candidate}")
     return candidate

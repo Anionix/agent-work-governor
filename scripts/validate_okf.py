@@ -261,6 +261,10 @@ def _profile_computation(
                 "provide exactly one computation path or inline computation fence",
             )
         )
+    # has_file already proves the string predicate at runtime; Pyrefly 1.1.1
+    # does not propagate narrowing through the named boolean.
+    # Primary source: https://github.com/facebook/pyrefly/blob/b87de05834c401898c79fd9686b806c051dd3667/website/docs/error-suppressions.mdx
+    # pyrefly: ignore[bad-argument-type]
     elif has_file and not _resource_exists(computation_path, path, bundle):
         errors.append(
             issue(
