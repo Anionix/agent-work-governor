@@ -2,6 +2,8 @@
 
 Issue/spec:
 
+Head commit trailer: `Issue-Spec: #<same issue number>`
+
 ## LLM contract
 
 State transition and fail-closed outcome:

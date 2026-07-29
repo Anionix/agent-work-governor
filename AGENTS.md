@@ -16,6 +16,7 @@ These rules apply to this owner-original repository.
 ## Pull requests
 
 - Branch from current `origin/main`; do not stack.
+- Bind the canonical Issue as `Issue-Spec: #N` in the final commit trailer.
 - Keep one task per PR and target about 200 product-diff lines. Contract comments
   and the one-time source-only baseline import are excluded from this target.
 - Before opening a PR, run checks and the code-review skill on the final commit;
