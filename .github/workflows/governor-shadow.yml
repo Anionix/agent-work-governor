@@ -151,7 +151,11 @@ jobs:
           sys.stdout.write(":".join(canonical))
           PYTHONPATH_CHECK
           )"
+          # LLM contract: Cargo output mode -> ANSI-free diagnostic input;
+          # bind the setting before execution or refuse correlation.
+          # Primary source: https://github.com/rust-lang/cargo/blob/1d775c7efc926b45633c2e72b0c4195f8e4afb0a/src/doc/src/reference/config.md#L1477-L1482
           root_environment=(
+            "CARGO_TERM_COLOR=never"
             "PATH=$PATH"
             "PYTHONHASHSEED=0"
             "PYTHONNOUSERSITE=1"
@@ -187,7 +191,8 @@ jobs:
             done
           done
           root_environment+=("${wrapper_environment[@]}")
-          printf '%s\n' "${wrapper_environment[@]}" >> "$output/environment"
+          printf '%s\n' "CARGO_TERM_COLOR=never" \
+            "${wrapper_environment[@]}" >> "$output/environment"
           environment_sha="$(hash_file "$output/environment")"
           for name in AR AR_FOR_BUILD AS AS_FOR_BUILD CC CC_FOR_BUILD \
             CONFIG_SHELL CPATH CXX CXX_FOR_BUILD LD LD_DYLD_PATH LD_FOR_BUILD \
@@ -274,6 +279,7 @@ jobs:
             "$verify_exit" <<'PYTHON' > "$output/shadow.json"
           import hashlib
           import json
+          import re
           import sys
           from pathlib import Path
 
@@ -357,8 +363,10 @@ jobs:
               return sorted(found, key=lambda item: item["identifier"])
 
           # LLM contract: isolated rust.tests evidence -> finite public
-          # diagnostic vocabulary; arbitrary candidate output is never emitted.
-          # Primary source: https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages
+          # vocabulary plus a bounded length-framed set digest; raw candidate
+          # output is never emitted, ambiguous workspace suites fail closed,
+          # and diagnostics never affect semantic state.
+          # Primary source: https://github.com/rust-lang/cargo/blob/1d775c7efc926b45633c2e72b0c4195f8e4afb0a/src/doc/src/reference/external-tools.md
           def rust_failure_diagnostics(value):
               checks = value.get("checks", []) if isinstance(value, dict) else []
               failed = next(
@@ -417,7 +425,52 @@ jobs:
               )
               if not signals:
                   signals.add("UNKNOWN_NONZERO")
+              def suite_identity(line):
+                  running = re.fullmatch(rb"\s+Running (.+) \(.+\)", line)
+                  if running is not None:
+                      return b"cargo:" + running.group(1)
+                  doctests = re.fullmatch(rb"\s+Doc-tests (.+)", line)
+                  return b"doctest:" + doctests.group(1) if doctests is not None else None
+
+              lines = data.splitlines()
+              suite_counts = {}
+              for line in lines:
+                  identity = suite_identity(line)
+                  if identity is not None:
+                      suite_counts[identity] = suite_counts.get(identity, 0) + 1
+              failed_tests = set()
+              failed_test_unparsed_count = 0
+              suite = None
+              for line in lines:
+                  identity = suite_identity(line)
+                  failed = re.fullmatch(rb"test (.+) \.\.\. FAILED", line)
+                  if identity is not None:
+                      suite = identity
+                  elif failed is not None:
+                      if suite is None or suite_counts[suite] != 1:
+                          failed_test_unparsed_count += 1
+                      else:
+                          failed_tests.add((suite, failed.group(1)))
+              failed_tests = sorted(failed_tests)
+              failed_test_set_sha = None
+              if len(failed_tests) > 1_024:
+                  signals.add("FAILED_TEST_SET_TOO_WIDE")
+              elif failed_tests:
+                  digest = hashlib.sha256()
+                  for suite, name in failed_tests:
+                      digest.update(len(suite).to_bytes(8, "big"))
+                      digest.update(suite)
+                      digest.update(len(name).to_bytes(8, "big"))
+                      digest.update(name)
+                  failed_test_set_sha = digest.hexdigest()
+              if failed_test_unparsed_count or (
+                  "RUST_TEST_FAILED" in signals and not failed_tests
+              ):
+                  signals.add("FAILED_TEST_IDENTITY_UNPARSED")
               return {
+                  "failed_test_count": len(failed_tests),
+                  "failed_test_set_sha256": failed_test_set_sha,
+                  "failed_test_unparsed_count": failed_test_unparsed_count,
                   "permission_scopes": permission_scopes,
                   "signals": sorted(signals),
               }
