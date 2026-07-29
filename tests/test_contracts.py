@@ -1947,6 +1947,26 @@ class SourceHygieneTests(unittest.TestCase):
         ):
             self.assertIn(evidence, workflow)
 
+    def test_privileged_harness_regression_is_post_merge_only(self) -> None:
+        workflow = (PLUGIN_ROOT / ".github/workflows/harness-isolation.yml").read_text(
+            encoding="utf-8"
+        )
+        for evidence in (
+            "push:\n    branches: [main]",
+            "permissions:\n  contents: read",
+            "persist-credentials: false",
+            "ref: ${{ github.sha }}",
+            "runner: [ubuntu-24.04, macos-15]",
+            'sudo "$python" -B -m unittest tests.test_bounded_harness',
+            'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
+        ):
+            self.assertIn(evidence, workflow)
+        self.assertNotIn("pull_request", workflow)
+        self.assertIn(
+            ".github/workflows/harness-isolation.yml",
+            (PLUGIN_ROOT / "flake.nix").read_text(encoding="utf-8"),
+        )
+
     def test_split_rust_toolchain_lock_has_no_stale_references(self) -> None:
         stale_lock = "rust/toolchain" + ".lock.json"
         stale_contract = "rust/toolchain" + ".lock.LLM-CONTRACT.md"

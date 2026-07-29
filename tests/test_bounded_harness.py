@@ -4,12 +4,18 @@ import asyncio
 import hashlib
 import io
 import json
+import os
+import pwd
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
@@ -19,9 +25,9 @@ import bounded_harness as harness
 
 # LLM-CONTRACT
 # id: agent-work-governor.bounded-harness-tests
-# state: PLAN_FIXTURE -> BOUNDED_EXECUTION -> RECEIPT_OR_TYPED_FAULT | TEST_FAILURE
-# preconditions: every subprocess and output remains inside one temporary repository
-# invariant: tests cover exact argv, bounds, timeout, path containment, and atomic replacement
+# state: PLAN_FIXTURE + TEST_IDENTITY -> BOUNDED_EXECUTION -> RECEIPT_OR_TYPED_FAULT | TEST_FAILURE
+# preconditions: fixtures use temporary roots; the root-only test drops to the system nobody user
+# invariant: tests cover argv, bounds, timeout, path and UID isolation, and atomic replacement
 # failure: unittest exposes the violated fail-closed transition
 # source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/unittest.rst
 # knowledge: bundle:knowledge/policies/work-governor.md
@@ -29,6 +35,7 @@ import bounded_harness as harness
 # test: bundle:tests/test_bounded_harness.py
 
 SHA = "a" * 64
+NOBODY = pwd.getpwnam("nobody")
 
 
 def encoded(value: object) -> bytes:
@@ -41,6 +48,7 @@ class BoundedHarnessTests(unittest.TestCase):
         self.root = Path(self.temporary.name).resolve()
         self.plan_path = self.root / "plan.json"
         self.receipt = self.root / ".governance/receipts/run.json"
+        self.runtime_root = self.root / "runtime"
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -91,7 +99,10 @@ class BoundedHarnessTests(unittest.TestCase):
         return digest
 
     def invoke(self, digest: str, workers: int = 2) -> int:
-        with redirect_stdout(io.StringIO()):
+        with (
+            redirect_stdout(io.StringIO()),
+            mock.patch.object(harness, "_isolation_identity", return_value=None),
+        ):
             return harness.main(
                 [
                     "--plan-report",
@@ -104,6 +115,8 @@ class BoundedHarnessTests(unittest.TestCase):
                     "b" * 64,
                     "--receipt",
                     str(self.receipt),
+                    "--runtime-root",
+                    str(self.runtime_root),
                     "--workers",
                     str(workers),
                 ]
@@ -203,6 +216,109 @@ class BoundedHarnessTests(unittest.TestCase):
             self.assertEqual(0, self.invoke(digest, workers=2))
         self.assertEqual(2, TrackingSemaphore.maximum)
 
+    def test_nominal_exit_kills_same_session_descendants(self) -> None:
+        leak = self.root / "nominal-descendant-leaked"
+        descendant = (
+            "import os,time;from pathlib import Path;"
+            "os.close(1);os.close(2);time.sleep(.4);"
+            f"Path({str(leak)!r}).write_text('bad')"
+        )
+        digest = self.plan(
+            [
+                self.check(
+                    "python.nominal-descendant",
+                    "import subprocess,sys;"
+                    f"subprocess.Popen([sys.executable,'-c',{descendant!r}])",
+                )
+            ]
+        )
+        self.assertEqual(0, self.invoke(digest, workers=1))
+        time.sleep(0.5)
+        self.assertFalse(leak.exists())
+
+    def test_fixed_identity_and_kill_failures_are_fail_closed(self) -> None:
+        with (
+            mock.patch.object(harness.os, "geteuid", return_value=0),
+            mock.patch.dict(harness.os.environ, {"SUDO_UID": "501"}),
+        ):
+            self.assertEqual(
+                harness.RunIdentity(
+                    NOBODY.pw_uid % (1 << 32),
+                    NOBODY.pw_gid % (1 << 32),
+                ),
+                harness._isolation_identity(),
+            )
+        with (
+            mock.patch.object(harness.os, "geteuid", return_value=0),
+            mock.patch.object(
+                harness.pwd,
+                "getpwnam",
+                return_value=SimpleNamespace(pw_uid=-2, pw_gid=-2),
+            ),
+            mock.patch.dict(harness.os.environ, {}, clear=True),
+        ):
+            self.assertEqual(
+                harness.RunIdentity((1 << 32) - 2, (1 << 32) - 2),
+                harness._isolation_identity(),
+            )
+        with mock.patch.dict(
+            harness.os.environ,
+            {
+                "AWS_ACCESS_KEY_ID": "secret",
+                "BASH_ENV": "/tmp/inject",
+                "GITHUB_ENV": "/tmp/github-env",
+                "LD_PRELOAD": "/tmp/inject.so",
+                "NIX_CFLAGS_COMPILE": "-isystem /nix/store/include",
+                "NIX_REMOTE": "ssh://root@host",
+                "NIX_SECRET_TOKEN": "secret",
+                "NIX_USER_CONF_FILES": "/tmp/nix.conf",
+                "PATH": "/trusted/bin",
+                "PKG_CONFIG_ATTACK": "secret",
+                "PYTHONPATH": "/trusted/python",
+                "RUST_TOKEN": "secret",
+            },
+            clear=True,
+        ):
+            environment = harness._candidate_environment(self.root)
+        self.assertEqual("/trusted/bin", environment["PATH"])
+        self.assertEqual("/trusted/python", environment["PYTHONPATH"])
+        self.assertEqual(
+            "-isystem /nix/store/include",
+            environment["NIX_CFLAGS_COMPILE"],
+        )
+        for denied in (
+            "AWS_ACCESS_KEY_ID",
+            "BASH_ENV",
+            "GITHUB_ENV",
+            "LD_PRELOAD",
+            "NIX_REMOTE",
+            "NIX_SECRET_TOKEN",
+            "NIX_USER_CONF_FILES",
+            "PKG_CONFIG_ATTACK",
+            "RUST_TOKEN",
+        ):
+            self.assertNotIn(denied, environment)
+        with (
+            mock.patch.object(
+                harness,
+                "_candidate_can_write",
+                return_value=True,
+            ),
+            self.assertRaises(harness.HarnessError) as raised,
+        ):
+            harness._validate_subject(
+                self.root,
+                harness.RunIdentity((1 << 32) - 2, (1 << 32) - 2),
+            )
+        self.assertEqual("HARNESS_SUBJECT_WRITABLE", raised.exception.code)
+        digest = self.plan([self.check("python.kill-fault", "print('done')")])
+        with mock.patch.object(
+            harness.os, "killpg", side_effect=PermissionError("injected")
+        ):
+            self.assertEqual(1, self.invoke(digest, workers=1))
+        fault = json.loads(self.receipt.with_name("run.json.fault.json").read_text())
+        self.assertEqual("HARNESS_CONTAINMENT_FAILED", fault["code"])
+
     def test_invalid_digest_and_escaped_cwd_spawn_nothing(self) -> None:
         digest = self.plan([self.check("python.safe", "print('x')")])
         self.receipt.parent.mkdir(parents=True)
@@ -249,6 +365,9 @@ class BoundedHarnessTests(unittest.TestCase):
             ]
         )
         bindings, checks, plan_sha, coverage = harness.load_plan(self.plan_path, digest)
+        repository, runtime = harness._prepare_runtime(
+            self.root, self.receipt, self.runtime_root, None
+        )
 
         async def interrupt() -> harness.HarnessError:
             task = asyncio.create_task(
@@ -257,10 +376,12 @@ class BoundedHarnessTests(unittest.TestCase):
                     checks,
                     plan_sha,
                     coverage,
-                    self.root,
-                    self.receipt,
+                    repository,
+                    runtime.receipt,
                     SHA,
                     1,
+                    runtime,
+                    None,
                 )
             )
             async with asyncio.timeout(5):
@@ -272,7 +393,7 @@ class BoundedHarnessTests(unittest.TestCase):
             return raised.exception
 
         error = asyncio.run(interrupt())
-        harness._fault(self.root, self.receipt, error)
+        harness._fault(self.receipt, error)
         self.assertFalse(self.receipt.exists())
         fault = json.loads(self.receipt.with_name("run.json.fault.json").read_text())
         self.assertEqual("HARNESS_INTERRUPTED", fault["code"])
@@ -287,6 +408,82 @@ class BoundedHarnessTests(unittest.TestCase):
         ):
             harness._atomic(target, b"new")
         self.assertEqual(b"old", target.read_bytes())
+
+    @unittest.skipUnless(
+        os.geteuid() == 0,
+        "requires a disposable root harness",
+    )
+    def test_distinct_uid_blocks_new_session_receipt_rewrite(self) -> None:
+        self.root.chmod(0o755)
+        runtime_root = (
+            Path(tempfile.gettempdir()).resolve()
+            / f"agent-work-governor-isolation-{uuid.uuid4().hex}"
+        )
+        self.addCleanup(shutil.rmtree, runtime_root, True)
+        receipt = runtime_root / "run.json"
+        blocked = runtime_root / "artifacts/overwrite-blocked"
+        source = self.root / "source.py"
+        source.write_text("original")
+        source.chmod(0o444)
+        escaped = (
+            "import os,time;from pathlib import Path;"
+            "os.setsid();os.close(1);os.close(2);time.sleep(.2);"
+            f"\ntry: Path({str(receipt)!r}).write_text('forged')"
+            f"\nexcept PermissionError: pass"
+            f"\ntry: Path({str(source)!r}).write_text('forged')"
+            f"\nexcept PermissionError: Path({str(blocked)!r}).write_text('yes')"
+        )
+        digest = self.plan(
+            [
+                self.check(
+                    "python.new-session",
+                    "import subprocess,sys;"
+                    f"subprocess.Popen([sys.executable,'-c',{escaped!r}])",
+                )
+            ]
+        )
+        with redirect_stdout(io.StringIO()):
+            result = harness.main(
+                [
+                    "--plan-report",
+                    str(self.plan_path),
+                    "--expected-plan-sha256",
+                    digest,
+                    "--repository",
+                    str(self.root),
+                    "--invocation-sha256",
+                    "b" * 64,
+                    "--receipt",
+                    str(receipt),
+                    "--runtime-root",
+                    str(runtime_root),
+                    "--workers",
+                    "1",
+                ]
+            )
+        self.assertEqual(0, result)
+        time.sleep(0.4)
+        self.assertEqual("yes", blocked.read_text())
+        self.assertNotEqual(b"forged", receipt.read_bytes())
+        self.assertEqual("original", source.read_text())
+        acl_command: list[str] | None = None
+        if sys.platform == "darwin":
+            acl_command = ["/bin/chmod", "+a", "nobody allow write", str(source)]
+        elif setfacl := shutil.which("setfacl"):
+            acl_command = [
+                setfacl,
+                "-m",
+                f"u:{NOBODY.pw_uid}:rw",
+                str(source),
+            ]
+        if acl_command is not None:
+            subprocess.run(acl_command, check=True)
+            with self.assertRaises(harness.HarnessError) as raised:
+                harness._validate_subject(
+                    self.root,
+                    harness._isolation_identity(),
+                )
+            self.assertEqual("HARNESS_SUBJECT_WRITABLE", raised.exception.code)
 
 
 if __name__ == "__main__":

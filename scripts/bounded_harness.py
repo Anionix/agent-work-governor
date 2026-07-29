@@ -8,8 +8,11 @@ import asyncio
 import hashlib
 import json
 import os
+import pwd
 import re
 import signal
+import stat
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -17,9 +20,9 @@ from typing import Any, cast
 
 # LLM-CONTRACT
 # id: agent-work-governor.bounded-harness
-# state: VALID_EXECUTION_PLAN -> BOUNDED_RUN -> AGGREGATE_RUN_RECEIPT | HARNESS_FAULT
-# preconditions: the caller binds one PLANNED report, repository, invocation, and plan digest
-# invariant: only plan argv executes without a shell; this module never infers or writes PASS
+# state: VALID_EXECUTION_PLAN + DISTINCT_UID -> WRITE_ISOLATED_RUN -> AGGREGATE_RUN_RECEIPT | HARNESS_FAULT
+# preconditions: a root harness binds one plan, repository, invocation, and dedicated identity
+# invariant: only plan argv executes; candidate checks cannot write receipt/evidence or PASS
 # failure: malformed, partial, unbounded, interrupted, or unsafe runs emit a typed sibling fault
 # source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/asyncio-subprocess.rst
 # knowledge: bundle:knowledge/policies/work-governor.md
@@ -66,6 +69,91 @@ class CheckPhase(StrEnum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class RunIdentity:
+    """Unprivileged operating-system identity for candidate checks."""
+
+    uid: int
+    gid: int
+
+
+@dataclass(frozen=True)
+class RuntimePaths:
+    """Harness-owned paths that candidate checks cannot replace."""
+
+    receipt: Path
+    evidence: Path
+    artifacts: Path
+
+
+SAFE_ENVIRONMENT = frozenset(
+    {
+        "AR",
+        "AR_FOR_BUILD",
+        "AS",
+        "AS_FOR_BUILD",
+        "CC",
+        "CC_FOR_BUILD",
+        "CONFIG_SHELL",
+        "CPATH",
+        "CXX",
+        "CXX_FOR_BUILD",
+        "DETERMINISTIC_BUILD",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LD",
+        "LD_DYLD_PATH",
+        "LD_FOR_BUILD",
+        "LIBRARY_PATH",
+        "MACOSX_DEPLOYMENT_TARGET",
+        "NIX_BINTOOLS",
+        "NIX_BINTOOLS_FOR_BUILD",
+        "NIX_BUILD_CORES",
+        "NIX_CC",
+        "NIX_CC_FOR_BUILD",
+        "NIX_CFLAGS_COMPILE",
+        "NIX_CFLAGS_COMPILE_FOR_BUILD",
+        "NIX_DONT_SET_RPATH",
+        "NIX_DONT_SET_RPATH_FOR_BUILD",
+        "NIX_ENFORCE_NO_NATIVE",
+        "NIX_HARDENING_ENABLE",
+        "NIX_IGNORE_LD_THROUGH_GCC",
+        "NIX_LDFLAGS",
+        "NIX_LDFLAGS_FOR_BUILD",
+        "NIX_NO_SELF_RPATH",
+        "NIX_SSL_CERT_FILE",
+        "NM",
+        "NM_FOR_BUILD",
+        "NO_COLOR",
+        "OBJCOPY",
+        "OBJCOPY_FOR_BUILD",
+        "OBJDUMP",
+        "OBJDUMP_FOR_BUILD",
+        "PATH",
+        "PYTHONHASHSEED",
+        "PYTHONNOUSERSITE",
+        "PYTHONPATH",
+        "RANLIB",
+        "RANLIB_FOR_BUILD",
+        "SDKROOT",
+        "SIZE",
+        "SIZE_FOR_BUILD",
+        "SOURCE_DATE_EPOCH",
+        "SSL_CERT_FILE",
+        "STRINGS",
+        "STRINGS_FOR_BUILD",
+        "STRIP",
+        "STRIP_FOR_BUILD",
+        "TERM",
+        "TERMINFO_DIRS",
+        "XDG_CONFIG_DIRS",
+        "XDG_DATA_DIRS",
+        "ZERO_AR_DATE",
+    }
+)
 
 
 def _json(value: object) -> bytes:
@@ -208,7 +296,80 @@ def _kill(process: asyncio.subprocess.Process) -> None:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         if process.returncode is None:
-            process.kill()
+            try:
+                process.kill()
+            except OSError as error:
+                raise HarnessError("HARNESS_CONTAINMENT_FAILED") from error
+    except OSError as error:
+        raise HarnessError("HARNESS_CONTAINMENT_FAILED") from error
+
+
+def _isolation_identity() -> RunIdentity:
+    # LLM contract: root harness + distinct non-root identity -> isolated check
+    # or typed refusal; candidate code never shares receipt-writer authority.
+    # Primary source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/subprocess.rst
+    try:
+        account = pwd.getpwnam("nobody")
+    except KeyError as error:
+        raise HarnessError("HARNESS_IDENTITY_UNSAFE") from error
+    uid = account.pw_uid % (1 << 32)
+    gid = account.pw_gid % (1 << 32)
+    invoking = os.environ.get("SUDO_UID", "")
+    _require(not invoking or invoking.isdecimal(), "HARNESS_IDENTITY_UNSAFE")
+    invoking_uid = int(invoking) if invoking else -1
+    _require(
+        os.geteuid() == 0
+        and uid not in (0, (1 << 32) - 1)
+        and gid not in (0, (1 << 32) - 1)
+        and uid != invoking_uid,
+        "HARNESS_PRIVILEGE_ISOLATION_REQUIRED",
+    )
+    return RunIdentity(uid, gid)
+
+
+def _candidate_environment(artifacts: Path) -> dict[str, str]:
+    environment = {
+        key: value for key, value in os.environ.items() if key in SAFE_ENVIRONMENT
+    }
+    environment.update(
+        {
+            "CARGO_HOME": str(artifacts),
+            "CARGO_TARGET_DIR": str(artifacts / "cargo-target"),
+            "HOME": str(artifacts),
+            "PIP_CACHE_DIR": str(artifacts / "pip-cache"),
+            "RUFF_CACHE_DIR": str(artifacts / "ruff-cache"),
+            "TMPDIR": str(artifacts),
+            "UV_CACHE_DIR": str(artifacts / "uv-cache"),
+            "XDG_CACHE_HOME": str(artifacts),
+        }
+    )
+    return environment
+
+
+async def _spawn(
+    argv: list[str], cwd: Path, artifacts: Path, identity: RunIdentity | None
+) -> asyncio.subprocess.Process:
+    if identity is None:
+        return await asyncio.create_subprocess_exec(
+            *argv,
+            cwd=cwd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+    return await asyncio.create_subprocess_exec(
+        *argv,
+        cwd=cwd,
+        env=_candidate_environment(artifacts),
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
+        extra_groups=(),
+        group=identity.gid,
+        user=identity.uid,
+    )
 
 
 async def _execute_check(
@@ -219,6 +380,7 @@ async def _execute_check(
     events: dict[str, asyncio.Event],
     semaphore: asyncio.Semaphore,
     state: dict[str, CheckPhase],
+    identity: RunIdentity | None,
 ) -> dict[str, object]:
     identifier = check["identifier"]
     await asyncio.gather(*(events[item].wait() for item in check["dependencies"]))
@@ -233,13 +395,8 @@ async def _execute_check(
                 )
                 for atom in check["argv"]
             ]
-            process = await asyncio.create_subprocess_exec(
-                *argv,
-                cwd=_inside(repository, check["path"]),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
+            process = await _spawn(
+                argv, _inside(repository, check["path"]), artifacts, identity
             )
         except HarnessError as error:
             state[identifier] = CheckPhase.FAILED
@@ -267,6 +424,8 @@ async def _execute_check(
                 await process.wait()
 
             await asyncio.wait_for(complete(), check["timeout_seconds"])
+            _kill(process)
+            await process.wait()
         except TimeoutError:
             timed_out = True
             _kill(process)
@@ -315,19 +474,113 @@ def _runtime_dir(root: Path, name: str) -> Path:
     return path
 
 
-def _invalidate(repository: Path, receipt: Path) -> tuple[Path, Path]:
+def _candidate_can_write(paths: list[Path], identity: RunIdentity) -> bool:
+    # LLM contract: stat-safe subject + candidate identity -> no effective write
+    # access, including ACL grants, or typed refusal before candidate execution.
+    # Primary source: https://pubs.opengroup.org/onlinepubs/9799919799/functions/access.html
+    process = os.fork()
+    if process == 0:
+        result = 2
+        try:
+            os.setgroups([])
+            os.setgid(identity.gid)
+            os.setuid(identity.uid)
+            result = int(
+                any(not path.exists() or os.access(path, os.W_OK) for path in paths)
+            )
+        finally:
+            os._exit(result)
+    _, status = os.waitpid(process, 0)
+    _require(
+        os.WIFEXITED(status) and os.WEXITSTATUS(status) in (0, 1),
+        "HARNESS_SUBJECT_ACCESS_UNVERIFIED",
+    )
+    return os.WEXITSTATUS(status) == 1
+
+
+def _validate_subject(repository: Path, identity: RunIdentity) -> None:
+    paths: list[Path] = []
+    for current, directories, files in os.walk(repository, followlinks=False):
+        for name in [".", *directories, *files]:
+            path = Path(current) if name == "." else Path(current) / name
+            metadata = path.lstat()
+            writable = (
+                (
+                    metadata.st_uid == identity.uid
+                    and metadata.st_mode & stat.S_IWUSR != 0
+                )
+                or (
+                    metadata.st_gid == identity.gid
+                    and metadata.st_mode & stat.S_IWGRP != 0
+                )
+                or metadata.st_mode & stat.S_IWOTH != 0
+            )
+            _require(
+                not writable
+                and not stat.S_ISLNK(metadata.st_mode)
+                and (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)),
+                "HARNESS_SUBJECT_WRITABLE",
+            )
+            paths.append(path)
+            _require(len(paths) <= 100_000, "HARNESS_SUBJECT_TOO_WIDE")
+    _require(
+        not _candidate_can_write(paths, identity),
+        "HARNESS_SUBJECT_WRITABLE",
+    )
+
+
+def _prepare_runtime(
+    repository: Path,
+    receipt: Path,
+    runtime_root: Path,
+    identity: RunIdentity | None,
+) -> tuple[Path, RuntimePaths]:
     try:
         repository = repository.resolve(strict=True)
-        receipts = repository / ".governance" / "receipts"
-        receipts.mkdir(parents=True, exist_ok=True)
-        receipts = receipts.resolve(strict=True)
-        receipt.resolve().relative_to(receipts)
-        _require(receipts.is_relative_to(repository), "HARNESS_RECEIPT_PATH_UNSAFE")
+        if identity is None:
+            receipts = repository / ".governance" / "receipts"
+            receipts.mkdir(parents=True, exist_ok=True)
+            receipts = receipts.resolve(strict=True)
+            receipt.resolve().relative_to(receipts)
+            _require(receipts.is_relative_to(repository), "HARNESS_RECEIPT_PATH_UNSAFE")
+            evidence = _runtime_dir(receipts, "evidence")
+            artifacts = _runtime_dir(receipts, "artifacts")
+        else:
+            _validate_subject(repository, identity)
+            _require(
+                runtime_root.is_absolute()
+                and receipt.is_absolute()
+                and receipt.parent == runtime_root,
+                "HARNESS_RUNTIME_ROOT_UNSAFE",
+            )
+            parent = runtime_root.parent.resolve(strict=True)
+            metadata = parent.stat()
+            _require(
+                metadata.st_uid == 0
+                and stat.S_ISDIR(metadata.st_mode)
+                and metadata.st_mode & stat.S_ISVTX != 0,
+                "HARNESS_RUNTIME_ROOT_UNSAFE",
+            )
+            runtime_root = parent / runtime_root.name
+            runtime_root.mkdir(mode=0o711)
+            metadata = runtime_root.lstat()
+            _require(
+                metadata.st_uid == 0
+                and stat.S_ISDIR(metadata.st_mode)
+                and stat.S_IMODE(metadata.st_mode) == 0o711,
+                "HARNESS_RUNTIME_ROOT_UNSAFE",
+            )
+            receipt = runtime_root / receipt.name
+            evidence = _runtime_dir(runtime_root, "evidence")
+            evidence.chmod(0o700)
+            artifacts = _runtime_dir(runtime_root, "artifacts")
+            os.chown(artifacts, identity.uid, identity.gid)
+            artifacts.chmod(0o700)
         receipt.unlink(missing_ok=True)
         receipt.with_name(f"{receipt.name}.fault.json").unlink(missing_ok=True)
     except (OSError, ValueError) as error:
-        raise HarnessError("HARNESS_RECEIPT_INVALIDATION_FAILED") from error
-    return repository, receipts
+        raise HarnessError("HARNESS_RUNTIME_PREPARATION_FAILED") from error
+    return repository, RuntimePaths(receipt, evidence, artifacts)
 
 
 async def execute(
@@ -339,14 +592,16 @@ async def execute(
     receipt: Path,
     invocation_sha256: str,
     workers: int,
+    runtime: RuntimePaths,
+    identity: RunIdentity | None,
 ) -> None:
     _require(
         DIGEST.fullmatch(invocation_sha256) is not None and 0 < workers <= 8,
         "HARNESS_INVOCATION_INVALID",
     )
-    repository, receipts = _invalidate(repository, receipt)
-    evidence_root = _runtime_dir(receipts, "evidence")
-    artifacts = _runtime_dir(receipts, "artifacts")
+    receipt = runtime.receipt
+    evidence_root = runtime.evidence
+    artifacts = runtime.artifacts
     order = [check["identifier"] for check in checks]
     state = dict.fromkeys(order, CheckPhase.NOT_STARTED)
     events = {identifier: asyncio.Event() for identifier in order}
@@ -354,7 +609,14 @@ async def execute(
     tasks = [
         asyncio.create_task(
             _execute_check(
-                check, repository, evidence_root, artifacts, events, semaphore, state
+                check,
+                repository,
+                evidence_root,
+                artifacts,
+                events,
+                semaphore,
+                state,
+                identity,
             )
         )
         for check in checks
@@ -396,10 +658,8 @@ async def execute(
         raise fault from error
 
 
-def _fault(repository: Path, receipt: Path, error: HarnessError) -> None:
+def _fault(receipt: Path, error: HarnessError) -> None:
     try:
-        root = repository.resolve(strict=True) / ".governance" / "receipts"
-        receipt.resolve().relative_to(root)
         _atomic(
             receipt.with_name(f"{receipt.name}.fault.json"),
             _json(
@@ -414,7 +674,7 @@ def _fault(repository: Path, receipt: Path, error: HarnessError) -> None:
                 }
             ),
         )
-    except (OSError, ValueError):
+    except OSError:
         return
 
 
@@ -425,13 +685,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repository", type=Path, required=True)
     parser.add_argument("--invocation-sha256", required=True)
     parser.add_argument("--receipt", type=Path, required=True)
+    parser.add_argument("--runtime-root", type=Path, required=True)
     parser.add_argument("--workers", type=int, default=2)
     args = parser.parse_args(argv)
-    receipt = (
-        args.receipt if args.receipt.is_absolute() else args.repository / args.receipt
-    )
+    runtime: RuntimePaths | None = None
     try:
-        _invalidate(args.repository, receipt)
+        identity = _isolation_identity()
+        repository, runtime = _prepare_runtime(
+            args.repository, args.receipt, args.runtime_root, identity
+        )
         bindings, checks, plan_sha256, coverage_sha256 = load_plan(
             args.plan_report, args.expected_plan_sha256
         )
@@ -441,22 +703,30 @@ def main(argv: list[str] | None = None) -> int:
                 checks,
                 plan_sha256,
                 coverage_sha256,
-                args.repository,
-                receipt,
+                repository,
+                runtime.receipt,
                 args.invocation_sha256,
                 args.workers,
+                runtime,
+                identity,
             )
         )
     except KeyboardInterrupt:
         error = HarnessError("HARNESS_INTERRUPTED")
-        _fault(args.repository, receipt, error)
+        if runtime is not None:
+            _fault(runtime.receipt, error)
         return 130
     except HarnessError as error:
-        _fault(args.repository, receipt, error)
+        if runtime is not None:
+            _fault(runtime.receipt, error)
         if error.code == "HARNESS_INTERRUPTED":
             return 130
         return 2 if "PLAN" in error.code else 1
-    print(_json({"receipt": str(receipt), "state": "AGGREGATE_RUN_RECEIPT"}).decode())
+    print(
+        _json(
+            {"receipt": str(runtime.receipt), "state": "AGGREGATE_RUN_RECEIPT"}
+        ).decode()
+    )
     return 0
 
 
