@@ -477,11 +477,80 @@ def _commit_issue_number(
 
 
 def _body_issue_number(body: str) -> int:
+    # LLM-CONTRACT
+    # id: agent-work-governor.visible-body-issue
+    # state: LIVE_BODY -> VISIBLE | HTML_COMMENT | FENCE -> ONE_VISIBLE_FIELD
+    # preconditions: body is the bounded live PR body from both stable snapshots
+    # invariant: hidden, mixed, or structurally incomplete Issue/spec evidence never authorizes
+    # failure: reject hidden markers, unclosed contexts, or non-canonical visible fields
+    # source: https://github.com/github/cmark-gfm/blob/499789b49373bfa045d0e7547e5ee63444c77bca/test/spec.txt
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: validate_pr_authority
+    # test: bundle:tests/test_pr_authority.py
     lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    authority_lines = [
-        line for line in lines if line.lstrip().casefold().startswith("issue/spec:")
-    ]
-    if len(authority_lines) != 1:
+    authority_lines: list[str] = []
+    fence_character: str | None = None
+    fence_length = 0
+    in_comment = False
+    hidden_marker = False
+
+    for line in lines:
+        folded = line.casefold()
+        content = line.lstrip(" ")
+        indentation = len(line) - len(content)
+
+        if fence_character is not None:
+            hidden_marker |= "issue/spec:" in folded
+            run_length = len(content) - len(content.lstrip(fence_character))
+            if (
+                indentation <= 3
+                and run_length >= fence_length
+                and not content[run_length:].strip(" ")
+            ):
+                fence_character = None
+                fence_length = 0
+            continue
+
+        if not in_comment and indentation <= 3 and content[:1] in {"`", "~"}:
+            candidate = content[0]
+            run_length = len(content) - len(content.lstrip(candidate))
+            info = content[run_length:]
+            if run_length >= 3 and (candidate == "~" or "`" not in info):
+                hidden_marker |= "issue/spec:" in folded
+                fence_character = candidate
+                fence_length = run_length
+                continue
+
+        starts_visible = not in_comment
+        position = 0
+        while position < len(line):
+            if in_comment:
+                end = line.find("-->", position)
+                nested = line.find("<!--", position)
+                boundary = len(line) if end < 0 else end
+                hidden_marker |= "issue/spec:" in line[position:boundary].casefold()
+                if nested >= 0 and (end < 0 or nested < end):
+                    raise _Reject("AUTHORITY_BODY_ISSUE_INVALID")
+                if end < 0:
+                    break
+                in_comment = False
+                position = end + 3
+                continue
+            start = line.find("<!--", position)
+            if start < 0:
+                break
+            in_comment = True
+            position = start + 4
+
+        if starts_visible and line.lstrip().casefold().startswith("issue/spec:"):
+            authority_lines.append(line)
+
+    if (
+        in_comment
+        or fence_character is not None
+        or hidden_marker
+        or len(authority_lines) != 1
+    ):
         raise _Reject("AUTHORITY_BODY_ISSUE_INVALID")
     match = BODY_ISSUE_RE.fullmatch(authority_lines[0])
     if match is None:
