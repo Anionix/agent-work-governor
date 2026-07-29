@@ -89,10 +89,10 @@ def _safe_relative_path(raw_path: str) -> PurePosixPath | None:
     decoded = unquote(raw_path)
     if not decoded or "\x00" in decoded or "\\" in decoded or decoded.startswith("/"):
         return None
-    relative = PurePosixPath(decoded)
-    if any(part in {"", ".", ".."} for part in relative.parts):
+    parts = decoded.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
         return None
-    return relative
+    return PurePosixPath(*parts)
 
 
 def _immutable_external_source(reference: str) -> bool:

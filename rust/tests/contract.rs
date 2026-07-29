@@ -208,6 +208,35 @@ fn percent_encoded_traversal_is_rejected_after_one_decode() -> Result<(), Box<dy
     Ok(())
 }
 
+#[test]
+fn reference_component_diagnostics_match_python() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = fixture()?;
+    fs::create_dir(fixture.bundle.join("dir"))?;
+    fs::write(fixture.bundle.join("dir/evidence.md"), "nested evidence\n")?;
+
+    for row in include_str!(
+        "../../assets/repository/.agent-work-governor/tests/fixtures/reference-component-parity.tsv"
+    )
+    .lines()
+    {
+        let (reference, expected) = row.split_once('\t').ok_or("invalid parity fixture row")?;
+        fs::write(
+            &fixture.source,
+            contract_source(reference, "enforce_contract", "fn enforce_contract() {}"),
+        )?;
+        let CheckReport::Contract(report) = check(&fixture)? else {
+            return Err("unexpected report variant".into());
+        };
+        assert_eq!(Status::Fail, report.status, "{reference}");
+        assert_eq!(
+            Some(expected),
+            finding_message(&report.findings, "LLM_CONTRACT_SOURCE_INVALID"),
+            "{reference}"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_escape_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
