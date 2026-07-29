@@ -364,6 +364,40 @@ class AuthorityTests(unittest.TestCase):
             (result.status, result.code),
         )
 
+    def test_body_issue_evidence_must_be_reader_visible_markdown(self) -> None:
+        invalid_bodies = (
+            "<!-- Issue/spec: #33 -->",
+            "<!--\nIssue/spec: #33\n-->",
+            "<!--\nIssue/spec: #33",
+            "<!--\n```\nIssue/spec: #33\n```\n-->",
+            "```\nIssue/spec: #33\n```",
+            "~~~\nIssue/spec: #33\n~~~",
+            " ````python\nIssue/spec: #33\n```",
+            "   ~~~~\nIssue/spec: #33\n```\n~~~~",
+            "```\n<!--\nIssue/spec: #33\n-->\n```",
+            "<!-- Issue/spec: #33 -->\nIssue/spec: #33",
+            "```\nIssue/spec: #33\n```\nIssue/spec: #33",
+            "Issue/spec: #33\n<!--",
+            "Issue/spec: #33\n~~~",
+        )
+        for body in invalid_bodies:
+            with self.subTest(body=body):
+                result = self.validate(live=self.pull(body=body))
+                self.assertEqual(
+                    ("FAIL", "AUTHORITY_BODY_ISSUE_INVALID"),
+                    (result.status, result.code),
+                )
+
+        valid_bodies = (
+            "<!-- note -->\n```\nexample\n```\nIssue/spec: #33",
+            "    ```\nIssue/spec: #33",
+            "Introduction\r\nIssue/spec: #33\r\n",
+        )
+        for body in valid_bodies:
+            with self.subTest(body=body):
+                result = self.validate(live=self.pull(body=body))
+                self.assertEqual("PASS", result.status)
+
     def test_issue_must_exist_in_the_repository_and_not_be_a_pull_request(
         self,
     ) -> None:
