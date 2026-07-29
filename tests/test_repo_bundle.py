@@ -588,6 +588,54 @@ class PortableBundleTests(unittest.TestCase):
         self.assertEqual([], paths)
         self.assertEqual("Git path escapes the repository root", error)
 
+    def test_changed_code_files_reject_required_sidecar_deletion(self) -> None:
+        gate = load_gate()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*arguments: str) -> None:
+                subprocess.run(
+                    [
+                        "git",
+                        "-c",
+                        "commit.gpgsign=false",
+                        "-C",
+                        str(root),
+                        *arguments,
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+
+            git("init", "-b", "main")
+            git("config", "user.name", "Contract Test")
+            git("config", "user.email", "contract@example.invalid")
+            manifest = root / "manifest.json"
+            sidecar = root / "manifest.LLM-CONTRACT.md"
+            manifest.write_text('{"schema_version":"0.1"}\n', encoding="utf-8")
+            sidecar.write_text("# LLM contract\n", encoding="utf-8")
+            git("add", manifest.name, sidecar.name)
+            git("commit", "-m", "baseline")
+            git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+            git("switch", "-c", "work/delete-sidecar")
+            git("rm", sidecar.name)
+            git("commit", "-m", "delete required sidecar")
+            paths, error = gate.changed_code_files(root, "origin/main", "HEAD")
+            self.assertEqual([], paths)
+            self.assertEqual(
+                "manifest.LLM-CONTRACT.md: required JSON contract sidecar was deleted",
+                error,
+            )
+
+            git("switch", "-C", "work/delete-both", "origin/main")
+            git("rm", manifest.name, sidecar.name)
+            git("commit", "-m", "delete governed JSON and sidecar")
+            paths, error = gate.changed_code_files(root, "origin/main", "HEAD")
+
+        self.assertEqual([], paths)
+        self.assertIsNone(error)
+
     def test_bundle_reference_is_explicit_and_bounded(self) -> None:
         resolved, error = contract_blocks.resolve_contract_reference(
             "bundle:knowledge/policies/work-governor.md",

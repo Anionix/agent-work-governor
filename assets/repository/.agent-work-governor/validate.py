@@ -259,6 +259,41 @@ def changed_code_files(
         return [], error
 
     root = root.resolve()
+    deleted_paths, error = run_git_paths_z(
+        root,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--diff-filter=D",
+        "-z",
+        f"{branch_base}...{head_ref}",
+    )
+    if error is not None:
+        return [], error
+    deleted_sidecars = {path for path in deleted_paths if is_contract_sidecar(path)}
+    if deleted_sidecars:
+        tracked_paths, error = run_git_paths_z(root, "ls-files", "-z")
+        if error is not None:
+            return [], error
+        required_sidecars: set[Path] = set()
+        for source in tracked_paths:
+            if (
+                source.suffix.lower() in SIDECAR_EXTENSIONS
+                and contract_source_path(source) == source
+            ):
+                required_sidecars.update(
+                    (
+                        source.with_suffix(".LLM-CONTRACT.md"),
+                        source.parent / "LLM-CONTRACT.md",
+                    )
+                )
+        if missing_sidecars := sorted(deleted_sidecars & required_sidecars):
+            relative = missing_sidecars[0].relative_to(root).as_posix()
+            return (
+                [],
+                f"{relative}: required JSON contract sidecar was deleted",
+            )
+
     paths: set[Path] = set()
     for path in changed_paths:
         if not is_governed_source(path):
