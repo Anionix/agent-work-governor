@@ -251,7 +251,7 @@ def changed_code_files(
         root,
         "diff",
         "--name-only",
-        "--diff-filter=ACMR",
+        "--diff-filter=ACMRT",
         "-z",
         f"{branch_base}...{head_ref}",
     )
