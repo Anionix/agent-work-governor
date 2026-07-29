@@ -1,0 +1,327 @@
+# LLM-CONTRACT
+# id: agent-work-governor.shadow-plan-verify
+# state: LEGACY_SUCCESS + TRUSTED_CONTROL + CANDIDATE_HEAD -> TRUSTED_PLAN -> ISOLATED_RUN -> PARITY_EVIDENCE | SHADOW_REGRESSION | SHADOW_INCONCLUSIVE
+# preconditions: one successful pull-request governor run supplies an exact candidate SHA
+# invariant: only default-branch Governor bytes run as trusted; shadow never grants merge authority
+# failure: setup faults fail this non-required job and governed faults remain typed observations
+# source: https://github.com/github/docs/blob/ee27de73e024106c5cf1f3938cf00bb477252862/content/actions/reference/workflows-and-actions/events-that-trigger-workflows.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: observe
+# test: bundle:tests/test_contracts.py
+
+name: governor-shadow
+
+on:
+  workflow_run:
+    workflows: [governor]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  observe:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    name: shadow / ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Source: https://github.com/github/docs/blob/ee27de73e024106c5cf1f3938cf00bb477252862/content/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job.md
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
+    concurrency:
+      group: governor-shadow-${{ github.event.workflow_run.id }}-${{ matrix.runner }}
+      cancel-in-progress: true
+    env:
+      CANDIDATE_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      CANDIDATE_REPOSITORY: ${{ github.event.workflow_run.head_repository.full_name }}
+      CONTROL_SHA: ${{ github.sha }}
+      LEGACY_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      RUNNER_LABEL: ${{ matrix.runner }}
+      WORKFLOW_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      WORKFLOW_RUN_ID: ${{ github.event.workflow_run.id }}
+    steps:
+      - name: Check out the trusted default-branch control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: control
+          persist-credentials: false
+          ref: ${{ env.CONTROL_SHA }}
+
+      - name: Check out the observed candidate without retained credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          lfs: false
+          path: subject
+          persist-credentials: false
+          repository: ${{ env.CANDIDATE_REPOSITORY }}
+          ref: ${{ env.CANDIDATE_HEAD_SHA }}
+          submodules: false
+
+      - name: Install locked Nix
+        uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
+        with:
+          enable_kvm: false
+
+      - name: Observe trusted Plan, isolated execution, and trusted Verify
+        shell: bash
+        run: |
+          # LLM contract: default control + immutable candidate snapshot ->
+          # typed shadow evidence; no candidate tool establishes trust or PASS.
+          # Primary source: https://slsa.dev/spec/v1.2/verifying-artifacts
+          set -euo pipefail
+          [[ "$CONTROL_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$CANDIDATE_REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+          [[ "$LEGACY_CONCLUSION" == success ]]
+          control="$GITHUB_WORKSPACE/control"
+          subject="$GITHUB_WORKSPACE/subject"
+          test "$(git -C "$control" rev-parse HEAD)" = "$CONTROL_SHA"
+          test "$(git -C "$subject" rev-parse HEAD)" = "$CANDIDATE_HEAD_SHA"
+          test -z "$(git -C "$subject" status --porcelain)"
+          output="$RUNNER_TEMP/governor-shadow"
+          mkdir -p "$output"
+          package="$(
+            nix build --no-update-lock-file --no-write-lock-file \
+              "path:$control#default" --no-link --print-out-paths
+          )"
+          nix develop --no-update-lock-file --no-write-lock-file \
+            "path:$control" --command bash -s -- \
+            "$control" "$subject" "$output" "$package" <<'SHADOW'
+          set -euo pipefail
+          control=$1
+          subject=$2
+          output=$3
+          package=$4
+          plugin="$package/share/agent-work-governor"
+          python="$(command -v python)"
+          hash_file() { nix hash file --type sha256 --base16 "$1"; }
+          git -C "$subject" archive "$CANDIDATE_HEAD_SHA" > "$output/repository.tar"
+          subject_store="$(nix store add-path "$subject")"
+          candidate_archive_sha="$(hash_file "$output/repository.tar")"
+          candidate_store_sha="$(
+            nix hash path --type sha256 --base16 "$subject_store"
+          )"
+          control_manifest_sha="$(hash_file "$plugin/bin/manifest.json")"
+          printf '%s' "$CANDIDATE_HEAD_SHA" > "$output/revision"
+          printf '%s\n%s\n%s\n' "$CONTROL_SHA" "$control_manifest_sha" \
+            "$RUNNER_LABEL" > "$output/environment"
+          printf '%s\n%s\n%s\n%s\n%s\n%s\n%s\n' \
+            "$CONTROL_SHA" "$CANDIDATE_REPOSITORY" "$CANDIDATE_HEAD_SHA" \
+            "$candidate_archive_sha" "$candidate_store_sha" "$WORKFLOW_RUN_ID" \
+            "$WORKFLOW_RUN_ATTEMPT:$RUNNER_LABEL" > "$output/invocation"
+          revision_sha="$(hash_file "$output/revision")"
+          policy_sha="$(hash_file "$plugin/assets/presets/owner-original.toml")"
+          toolchain_sha="$(hash_file "$plugin/toolchain.lock.json")"
+          environment_sha="$(hash_file "$output/environment")"
+          invocation_sha="$(hash_file "$output/invocation")"
+          harness_sha="$(hash_file "$plugin/scripts/bounded_harness.py")"
+          root_environment=(
+            "PATH=$PATH"
+            "PYTHONHASHSEED=0"
+            "PYTHONNOUSERSITE=1"
+          )
+          for name in AR CC CXX LD RANLIB SDKROOT MACOSX_DEPLOYMENT_TARGET \
+            NIX_CC NIX_CFLAGS_COMPILE NIX_LDFLAGS NIX_SSL_CERT_FILE SSL_CERT_FILE
+          do
+            value=${!name-}
+            if [[ -n "$value" ]]; then
+              root_environment+=("$name=$value")
+            fi
+          done
+          bindings=(
+            --repository-sha256 "$candidate_store_sha"
+            --revision-sha256 "$revision_sha"
+            --policy-sha256 "$policy_sha"
+            --toolchain-sha256 "$toolchain_sha"
+            --environment-sha256 "$environment_sha"
+          )
+          project=(
+            mixed-uv-cargo
+            --python-working-directory .
+            --rust-working-directory rust
+          )
+          plan="$output/plan.json"
+          runtime="/tmp/agent-work-governor-shadow-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$RUNNER_LABEL"
+          receipt="$runtime/run.json"
+          plan_exit=0
+          harness_exit=-1
+          verify_exit=-1
+          (
+            cd "$subject_store"
+            "$python" "$plugin/scripts/rust_dispatch.py" \
+              plan "${bindings[@]}" "${project[@]}"
+          ) > "$plan" 2> "$output/plan.stderr" || plan_exit=$?
+          plan_sha=
+          if (( plan_exit == 0 )); then
+            plan_sha="$(
+              "$python" -c \
+                'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["execution_plan_sha256"])' \
+                "$plan"
+            )"
+            harness_exit=0
+            sudo /usr/bin/env -i "${root_environment[@]}" "$python" -B \
+              "$plugin/scripts/bounded_harness.py" \
+              --plan-report "$plan" \
+              --expected-plan-sha256 "$plan_sha" \
+              --repository "$subject_store" \
+              --invocation-sha256 "$invocation_sha" \
+              --receipt "$receipt" \
+              --runtime-root "$runtime" \
+              > "$output/harness.json" 2> "$output/harness.stderr" \
+              || harness_exit=$?
+          fi
+          if (( plan_exit == 0 && harness_exit == 0 )); then
+            evidence=()
+            while IFS= read -r name; do
+              evidence+=(--evidence "$name.log")
+            done < <(
+              "$python" -c \
+                'import json,sys; print(*[item["identifier"] for item in json.load(open(sys.argv[1], encoding="utf-8"))["execution_plan"]["checks"]], sep="\n")' \
+                "$plan"
+            )
+            verify_exit=0
+            (
+              cd "$subject_store"
+              sudo /usr/bin/env -i "${root_environment[@]}" "$python" -B \
+                "$plugin/scripts/rust_dispatch.py" verify "${bindings[@]}" \
+                --expected-harness-sha256 "$harness_sha" \
+                --expected-invocation-sha256 "$invocation_sha" \
+                --receipt "$receipt" \
+                --evidence-root "$runtime/evidence" \
+                "${evidence[@]}" "${project[@]}"
+            ) > "$output/verify.json" 2> "$output/verify.stderr" \
+              || verify_exit=$?
+          fi
+          sudo /usr/bin/env -i "$python" -B - "$output" "$runtime" \
+            "$CONTROL_SHA" "$CANDIDATE_REPOSITORY" "$CANDIDATE_HEAD_SHA" \
+            "$candidate_archive_sha" "$candidate_store_sha" \
+            "$control_manifest_sha" "$RUNNER_LABEL" "$WORKFLOW_RUN_ID" \
+            "$WORKFLOW_RUN_ATTEMPT" "$plan_exit" "$harness_exit" \
+            "$verify_exit" <<'PYTHON' > "$output/shadow.json"
+          import hashlib
+          import json
+          import sys
+          from pathlib import Path
+
+          (
+              output,
+              runtime,
+              control_sha,
+              candidate_repository,
+              candidate_head_sha,
+              candidate_archive_sha,
+              candidate_store_sha,
+              control_manifest_sha,
+              runner,
+              workflow_run_id,
+              workflow_run_attempt,
+              plan_exit,
+              harness_exit,
+              verify_exit,
+          ) = sys.argv[1:]
+          output, runtime = Path(output), Path(runtime)
+          exits = {
+              "plan": int(plan_exit),
+              "harness": int(harness_exit),
+              "verify": int(verify_exit),
+          }
+
+          def content(path):
+              try:
+                  data = path.read_bytes()
+              except OSError:
+                  return None, None
+              return data, hashlib.sha256(data).hexdigest()
+
+          def document(path):
+              data, digest = content(path)
+              try:
+                  value = json.loads(data) if data is not None else None
+              except (UnicodeError, json.JSONDecodeError):
+                  value = None
+              return value if isinstance(value, dict) else None, digest
+
+          def reasons(value):
+              found = set()
+              if isinstance(value, dict):
+                  for key in ("code", "reason"):
+                      if isinstance(value.get(key), str):
+                          found.add(value[key])
+                  for item in value.get("findings", []):
+                      if isinstance(item, dict):
+                          for key in ("code", "reason"):
+                              if isinstance(item.get(key), str):
+                                  found.add(item[key])
+              return found
+
+          plan, plan_digest = document(output / "plan.json")
+          receipt, receipt_digest = document(runtime / "run.json")
+          fault, _ = document(runtime / "run.json.fault.json")
+          verify, verify_digest = document(output / "verify.json")
+          reason_codes = reasons(plan) | reasons(fault) | reasons(verify)
+          for stage, code in exits.items():
+              if code == -1:
+                  reason_codes.add(f"{stage.upper()}_NOT_RUN")
+              elif code != 0:
+                  reason_codes.add(f"{stage.upper()}_EXIT_{code}")
+          evidence_digest = None
+          evidence_root = runtime / "evidence"
+          if evidence_root.is_dir():
+              digest = hashlib.sha256()
+              for path in sorted(evidence_root.glob("*.log")):
+                  data = path.read_bytes()
+                  name = path.name.encode()
+                  digest.update(len(name).to_bytes(8, "big"))
+                  digest.update(name)
+                  digest.update(len(data).to_bytes(8, "big"))
+                  digest.update(data)
+              evidence_digest = digest.hexdigest()
+          if all(code == 0 for code in exits.values()):
+              state = "PARITY_EVIDENCE"
+          elif 70 in exits.values():
+              state = "SHADOW_INCONCLUSIVE"
+          elif any(code not in (-1, 0) for code in exits.values()):
+              state = "SHADOW_REGRESSION"
+          else:
+              state = "SHADOW_INCONCLUSIVE"
+          if state != "PARITY_EVIDENCE" and not reason_codes:
+              reason_codes.add("SHADOW_OUTPUT_INCOMPLETE")
+          result = {
+              "candidate_archive_sha256": candidate_archive_sha,
+              "candidate_head_sha": candidate_head_sha,
+              "candidate_repository": candidate_repository,
+              "candidate_store_sha256": candidate_store_sha,
+              "control_manifest_sha256": control_manifest_sha,
+              "control_sha": control_sha,
+              "evidence_set_sha256": evidence_digest,
+              "execution_plan_sha256": (
+                  plan.get("execution_plan_sha256")
+                  if isinstance(plan, dict)
+                  else None
+              ),
+              "legacy_conclusion": "success",
+              "plan_report_sha256": plan_digest,
+              "reason_codes": sorted(reason_codes),
+              "receipt_sha256": receipt_digest,
+              "runner": runner,
+              "schema_version": "0.1",
+              "stage_exit": exits,
+              "state": state,
+              "verify_report_sha256": verify_digest,
+              "workflow_run_attempt": int(workflow_run_attempt),
+              "workflow_run_id": int(workflow_run_id),
+          }
+          print(json.dumps(result, separators=(",", ":"), sort_keys=True))
+          PYTHON
+          cat "$output/shadow.json"
+          {
+            echo '### Agent Work Governor shadow evidence'
+            echo '```json'
+            cat "$output/shadow.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          SHADOW
