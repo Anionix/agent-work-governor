@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from collections.abc import Iterable
@@ -35,11 +36,19 @@ CANONICAL_GIT_REPOSITORIES: Final[dict[str, str]] = {
     "cachix/install-nix-action": "https://github.com/cachix/install-nix-action",
     "cargo": "https://github.com/rust-lang/cargo",
     "clippy": "https://github.com/rust-lang/rust",
+    "pyrefly": "https://github.com/facebook/pyrefly",
     "ruff": "https://github.com/astral-sh/ruff",
     "rust": "https://github.com/rust-lang/rust",
+    "rust-analyzer": "https://github.com/rust-lang/rust",
+    "rust-src": "https://github.com/rust-lang/rust",
     "rustfmt": "https://github.com/rust-lang/rust",
     "ty": "https://github.com/astral-sh/ty",
     "uv": "https://github.com/astral-sh/uv",
+}
+ANALYZER_IDENTITY_SHA256: Final[dict[str, str]] = {
+    "pyrefly": "d26fe635c6236e6720280ff3e16e5edb0e34a70fc17f52f09f36f3b9a2cdfb5a",
+    "rust-analyzer": "77b9564fdb25238b477b09933ae45352b30881ef228b9c2a6ec84fe2bd9948cf",
+    "rust-src": "1a9193af133d51ebdcbcf3b58616329d49e0987d851ab2c7aec47b2891f3f21b",
 }
 
 
@@ -115,6 +124,7 @@ def _rust_component_findings(pins: dict[str, dict[str, Any]]) -> list[Finding]:
     # knowledge: bundle:knowledge/policies/work-governor.md
     # enforced_by: validate_catalog
     # test: bundle:tests/test_repo_bundle.py
+    # Primary release manifest: https://static.rust-lang.org/dist/2026-07-16/channel-rust-1.97.1.toml
     rust = pins.get("rust")
     if rust is None:
         return []
@@ -122,7 +132,14 @@ def _rust_component_findings(pins: dict[str, dict[str, Any]]) -> list[Finding]:
     findings: list[Finding] = []
     components = {
         tool_id: pins[tool_id]
-        for tool_id in ("cargo", "clippy", "rust", "rustfmt")
+        for tool_id in (
+            "cargo",
+            "clippy",
+            "rust",
+            "rust-analyzer",
+            "rust-src",
+            "rustfmt",
+        )
         if tool_id in pins
     }
     for tool_id, pin in components.items():
@@ -131,12 +148,13 @@ def _rust_component_findings(pins: dict[str, dict[str, Any]]) -> list[Finding]:
                 _finding("TOOLCHAIN_RUST_COMPONENT_MISMATCH", tool_id, "language")
             )
 
-    cargo = components.get("cargo")
-    if cargo is not None and cargo.get("version") != rust.get("version"):
-        findings.append(
-            _finding("TOOLCHAIN_RUST_COMPONENT_MISMATCH", "cargo", "version")
-        )
-    for tool_id in ("clippy", "rustfmt"):
+    for tool_id in ("cargo", "rust-analyzer", "rust-src"):
+        pin = components.get(tool_id)
+        if pin is not None and pin.get("version") != rust.get("version"):
+            findings.append(
+                _finding("TOOLCHAIN_RUST_COMPONENT_MISMATCH", tool_id, "version")
+            )
+    for tool_id in ("clippy", "rust-analyzer", "rust-src", "rustfmt"):
         pin = components.get(tool_id)
         if pin is None:
             continue
@@ -167,6 +185,32 @@ def _valid_artifacts(value: object) -> bool:
         ):
             return False
     return True
+
+
+def _analyzer_identity_finding(
+    entry: dict[str, Any],
+) -> Finding | None:
+    """Bind each analyzer to one independently fixed canonical tuple."""
+    tool_id = entry.get("id")
+    if not isinstance(tool_id, str) or tool_id not in ANALYZER_IDENTITY_SHA256:
+        return None
+
+    # LLM-CONTRACT
+    # id: agent-work-governor.analyzer-identity
+    # state: ANALYZER_TUPLE -> CANONICAL_ANALYZER_IDENTITY | IDENTITY_REJECTED
+    # preconditions: generic entry shape and exact-pin syntax are valid
+    # invariant: version, source, digest, URLs, hashes, and platforms change together
+    # failure: emit one stable identity finding before any analyzer executes
+    # source: https://github.com/facebook/pyrefly/blob/b87de05834c401898c79fd9686b806c051dd3667/.github/workflows/build_binaries.yml
+    # Primary Rust source: https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/src/tools/build-manifest/src/main.rs
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: validate_catalog
+    # test: bundle:tests/test_repo_bundle.py
+    canonical = json.dumps(entry, sort_keys=True, separators=(",", ":")).encode()
+    observed = hashlib.sha256(canonical).hexdigest()
+    if observed != ANALYZER_IDENTITY_SHA256[tool_id]:
+        return _finding("TOOLCHAIN_ANALYZER_IDENTITY_MISMATCH", tool_id, "identity")
+    return None
 
 
 def validate_catalog(
@@ -257,6 +301,8 @@ def validate_catalog(
             digest,
         ):
             findings.append(git_source_finding)
+        elif analyzer_finding := _analyzer_identity_finding(entry):
+            findings.append(analyzer_finding)
         if tool_id in pins:
             findings.append(_finding("TOOLCHAIN_DUPLICATE_ID", tool_id))
         else:

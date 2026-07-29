@@ -306,7 +306,7 @@ mod tests {
             encoded["catalog_sha256"]
         );
         assert_eq!(
-            "c59d3d37873cc03f65150498af03a107f0411c5e6d59d360d19eca1408161b58",
+            "c293da2e18d7659add467f51413d627d17dd5f2b70495536451cb33a786a9194",
             encoded["toolchain_sha256"]
         );
         assert_eq!("python.pip-audit", checks[0]["identifier"]);

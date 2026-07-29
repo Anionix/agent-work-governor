@@ -153,6 +153,8 @@ jobs:
         shell: bash
         run: |
           # LLM contract: unified catalog + Cargo.lock -> EXACT_RUST_CHECKS -> PASS or failure.
+          # Primary source: https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/src/tools/build-manifest/src/main.rs
+          # Release manifest: https://static.rust-lang.org/dist/2026-07-16/channel-rust-1.97.1.toml
           set -euo pipefail
           locked_version() {
             nix develop --no-update-lock-file --no-write-lock-file --command \
@@ -172,15 +174,25 @@ jobs:
           rust_version="$(nix develop --no-update-lock-file --no-write-lock-file --command rustc --version | awk '{print $2}')"
           cargo_version="$(nix develop --no-update-lock-file --no-write-lock-file --command cargo --version | awk '{print $2}')"
           clippy_version="$(nix develop --no-update-lock-file --no-write-lock-file --command cargo-clippy --version | awk '{print $2}')"
+          rust_analyzer_version="$(nix develop --no-update-lock-file --no-write-lock-file --command rust-analyzer --version | awk '{print $2}')"
           rustfmt_version="$(nix develop --no-update-lock-file --no-write-lock-file --command rustfmt --version | awk '{split($2, parts, "-"); print parts[1]}')"
           audit_version="$(nix develop --no-update-lock-file --no-write-lock-file --command cargo audit --version | awk '{print $NF}')"
           deny_version="$(nix develop --no-update-lock-file --no-write-lock-file --command cargo deny --version | awk '{print $NF}')"
           assert_version rust "$rust_version"
           assert_version cargo "$cargo_version"
           assert_version clippy "$clippy_version"
+          assert_version rust-analyzer "$rust_analyzer_version"
           assert_version rustfmt "$rustfmt_version"
           assert_version cargo-audit "$audit_version"
           assert_version cargo-deny "$deny_version"
+          rust_src="$(
+            nix develop --no-update-lock-file --no-write-lock-file --command \
+              rustc --print sysroot
+          )/lib/rustlib/src/rust/library"
+          test -d "$rust_src" || {
+            echo "::error title=TOOLCHAIN_COMPONENT_MISSING::rust-src path=$rust_src"
+            exit 1
+          }
           nix develop --no-update-lock-file --no-write-lock-file --command \
             cargo audit --file rust/Cargo.lock
           nix develop --no-update-lock-file --no-write-lock-file --command \
@@ -196,6 +208,7 @@ jobs:
           UV_TOOL_DIR: ${{ runner.temp }}/uv-tools
         run: |
           # LLM contract: toolchain.lock + uv.lock -> EXACT_CHECKS -> PASS or non-zero exit.
+          # Primary source: https://github.com/facebook/pyrefly/blob/b87de05834c401898c79fd9686b806c051dd3667/website/docs/installation.mdx
           set -euo pipefail
           run_locked() {
             nix develop --no-update-lock-file --no-write-lock-file --command "$@"
@@ -218,12 +231,15 @@ jobs:
           assert_version uv "$(run_locked uv --version | awk '{print $2}')"
           assert_version python "$(run_locked python --version | awk '{print $2}')"
           assert_version ruff "$(run_locked ruff --version | awk '{print $2}')"
+          assert_version pyrefly \
+            "$(run_locked pyrefly --version | awk '{print $2}')"
           assert_version ty "$(run_locked ty --version | awk '{print $2}')"
           assert_version pip-audit \
             "$(run_locked pip-audit --version | awk '{print $2}')"
           run_locked uv lock --check
           run_locked ruff format --check .
           run_locked ruff check .
+          run_locked pyrefly check
           run_locked ty check
           run_locked python -B -m unittest discover -s tests
           run_locked python scripts/validate_canonical.py --fetch-missing .
