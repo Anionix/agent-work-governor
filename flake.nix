@@ -9,6 +9,13 @@
       url = "github:oxalica/rust-overlay/8ec8a5a41f8d8244e672829c9cd705416139d3f0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+    rustsec-advisory-db = {
+      # LLM contract: one immutable RustSec revision -> one locked advisory
+      # source, or provenance evaluation closes before any security check.
+      # Primary source: https://github.com/RustSec/advisory-db/commit/7c7ccac53056b87f69ac677f15ea2d9a98a6f8e2
+      url = "github:RustSec/advisory-db/7c7ccac53056b87f69ac677f15ea2d9a98a6f8e2";
+      flake = false;
+    };
   };
 
   outputs =
@@ -16,6 +23,7 @@
       self,
       nixpkgs,
       rust-overlay,
+      rustsec-advisory-db,
     }:
     let
       fail = code: detail: throw "${code}${if detail == "" then "" else ":${detail}"}";
@@ -264,6 +272,7 @@
         bindInput "nixpkgs" "NixOS" "nixpkgs" nixpkgs
       );
       lockedRustOverlay = bindInput "rust-overlay" "oxalica" "rust-overlay" rust-overlay;
+      lockedRustSec = bindInput "rustsec-advisory-db" "RustSec" "advisory-db" rustsec-advisory-db;
       bindPackage =
         language: toolId: expectedPname: package:
         let
@@ -524,8 +533,50 @@
             cargo = toolchain.rust;
             rustc = toolchain.rust;
           };
+          cargoVendor = rustPlatform.importCargoLock {
+            lockFile = ./rust/Cargo.lock;
+          };
+          shadowInputs =
+            pkgs.runCommand "agent-work-governor-shadow-rust-inputs"
+              {
+                nativeBuildInputs = [ toolchain.git ];
+              }
+              ''
+                # LLM contract: pinned Cargo/RustSec inputs -> immutable offline
+                # runtime, or the Nix build fails without emitting an output.
+                # Primary source: https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/doc/src/reference/source-replacement.md
+                mkdir -p "$out/vendor" "$out/advisory-db"
+                cp -LR ${cargoVendor}/. "$out/vendor/"
+                cp -R ${lockedRustSec}/. "$out/advisory-db/"
+                chmod -R u+w "$out"
+                find "$out/advisory-db" -type d -exec chmod 755 {} +
+                find "$out/advisory-db" -type f -exec chmod 644 {} +
+                git -C "$out/advisory-db" init -q -b main
+                git -C "$out/advisory-db" add -A
+                GIT_AUTHOR_NAME=RustSec GIT_AUTHOR_EMAIL=security@rustsec.org \
+                  GIT_COMMITTER_NAME=RustSec GIT_COMMITTER_EMAIL=security@rustsec.org \
+                  GIT_AUTHOR_DATE="@${toString lockedRustSec.lastModified} +0000" \
+                  GIT_COMMITTER_DATE="@${toString lockedRustSec.lastModified} +0000" \
+                  git -C "$out/advisory-db" commit -q -m \
+                    "Pinned RustSec ${lockedRustSec.rev}"
+                cat > "$out/config.toml" <<EOF
+                [source.crates-io]
+                replace-with = "vendored-sources"
+
+                [source.vendored-sources]
+                directory = "$out/vendor"
+
+                [net]
+                offline = true
+                EOF
+                printf '%s\n' \
+                  '{"cargo_lock_sha256":"${builtins.hashFile "sha256" ./rust/Cargo.lock}","rustsec_revision":"${lockedRustSec.rev}","schema_version":"0.1"}' \
+                  > "$out/manifest.json"
+                chmod -R a-w "$out"
+              '';
         in
         {
+          shadow-inputs = shadowInputs;
           default = rustPlatform.buildRustPackage {
             pname = "agent-work-governor";
             version = "0.1.0";
@@ -632,7 +683,10 @@
       );
 
       checks = forAllSystems (pkgs: {
-        default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+        inherit (self.packages.${pkgs.stdenv.hostPlatform.system})
+          default
+          shadow-inputs
+          ;
       });
 
       devShells = forAllSystems (

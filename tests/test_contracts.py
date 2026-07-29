@@ -1841,7 +1841,7 @@ class SourceHygieneTests(unittest.TestCase):
             [root_inputs["nixpkgs"]],
             rust_overlay["inputs"]["nixpkgs"],
         )
-        for tool in ("nixpkgs", "rust-overlay"):
+        for tool in ("nixpkgs", "rust-overlay", "rustsec-advisory-db"):
             input_node = flake_lock["nodes"][root_inputs[tool]]
             locked = input_node["locked"]
             original = input_node["original"]
@@ -1981,10 +1981,12 @@ class SourceHygieneTests(unittest.TestCase):
             "github.event.workflow_run.head_sha",
             "repository: ${{ env.CANDIDATE_REPOSITORY }}",
             '"path:$control#default"',
+            '"path:$control#shadow-inputs"',
             'nix store add-path "$subject"',
             "--no-update-lock-file --no-write-lock-file",
             "sudo /usr/bin/env -i",
             "--runtime-root",
+            "--trusted-rust-inputs",
             "--evidence-root",
             "runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]",
             "scripts/rust_dispatch.py",
@@ -1997,6 +1999,7 @@ class SourceHygieneTests(unittest.TestCase):
             '"candidate_store_sha256"',
             '"plan_report_sha256"',
             '"receipt_sha256"',
+            '"rust_inputs_sha256"',
             '"evidence_set_sha256"',
             '"verify_report_sha256"',
             "GITHUB_STEP_SUMMARY",
