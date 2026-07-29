@@ -274,6 +274,7 @@ jobs:
             "$verify_exit" <<'PYTHON' > "$output/shadow.json"
           import hashlib
           import json
+          import re
           import sys
           from pathlib import Path
 
@@ -357,7 +358,8 @@ jobs:
               return sorted(found, key=lambda item: item["identifier"])
 
           # LLM contract: isolated rust.tests evidence -> finite public
-          # diagnostic vocabulary; arbitrary candidate output is never emitted.
+          # vocabulary plus a bounded length-framed set digest; raw candidate
+          # output is never emitted and diagnostics never affect semantic state.
           # Primary source: https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages
           def rust_failure_diagnostics(value):
               checks = value.get("checks", []) if isinstance(value, dict) else []
@@ -417,7 +419,42 @@ jobs:
               )
               if not signals:
                   signals.add("UNKNOWN_NONZERO")
+              failed_tests = set()
+              failed_test_unparsed_count = 0
+              suite = None
+              for line in data.splitlines():
+                  running = re.fullmatch(rb"\s+Running (.+) \(.+\)", line)
+                  doctests = re.fullmatch(rb"\s+Doc-tests (.+)", line)
+                  failed = re.fullmatch(rb"test (.+) \.\.\. FAILED", line)
+                  if running is not None:
+                      suite = b"cargo:" + running.group(1)
+                  elif doctests is not None:
+                      suite = b"doctest:" + doctests.group(1)
+                  elif failed is not None:
+                      if suite is None:
+                          failed_test_unparsed_count += 1
+                      else:
+                          failed_tests.add((suite, failed.group(1)))
+              failed_tests = sorted(failed_tests)
+              failed_test_set_sha = None
+              if len(failed_tests) > 1_024:
+                  signals.add("FAILED_TEST_SET_TOO_WIDE")
+              elif failed_tests:
+                  digest = hashlib.sha256()
+                  for suite, name in failed_tests:
+                      digest.update(len(suite).to_bytes(8, "big"))
+                      digest.update(suite)
+                      digest.update(len(name).to_bytes(8, "big"))
+                      digest.update(name)
+                  failed_test_set_sha = digest.hexdigest()
+              if failed_test_unparsed_count or (
+                  "RUST_TEST_FAILED" in signals and not failed_tests
+              ):
+                  signals.add("FAILED_TEST_IDENTITY_UNPARSED")
               return {
+                  "failed_test_count": len(failed_tests),
+                  "failed_test_set_sha256": failed_test_set_sha,
+                  "failed_test_unparsed_count": failed_test_unparsed_count,
                   "permission_scopes": permission_scopes,
                   "signals": sorted(signals),
               }
