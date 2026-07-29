@@ -1245,6 +1245,8 @@ class SourceHygieneTests(unittest.TestCase):
                 **os.environ,
                 "UV_CACHE_DIR": str(Path(directory) / "cache"),
                 "UV_OFFLINE": "1",
+                "UV_PYTHON": sys.executable,
+                "UV_PYTHON_DOWNLOADS": "never",
             }
             completed = subprocess.run(
                 argv,
