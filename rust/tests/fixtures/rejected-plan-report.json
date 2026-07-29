@@ -1,0 +1,19 @@
+{
+  "bindings": {
+    "environment_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+    "policy_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+    "repository_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "revision_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+    "toolchain_sha256": "f123483a002951bec0907eb883c67ecdf3987561630947165f5ae30c3b34467a"
+  },
+  "findings": [
+    {
+      "code": "RUST_ADAPTER_GIR_REJECTED",
+      "message": "Rust project was rejected",
+      "field": "project",
+      "severity": "error"
+    }
+  ],
+  "mutation_count": 0,
+  "status": "FAIL"
+}

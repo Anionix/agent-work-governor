@@ -3,15 +3,15 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use agent_work_governor::{CheckRequest, Governor, Preset};
+use agent_work_governor::{CheckRequest, Governor, PlanBindings, PlanProject, Preset};
 use clap::error::ErrorKind;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 // LLM-CONTRACT
 // id: agent-work-governor.rust-cli
 // state: ARGUMENTS -> INFORMATIONAL_OUTPUT | TYPED_REQUEST -> JSON_REPORT | CLI_FAULT
-// preconditions: callers provide paths but cannot provide authority or trusted verdict flags
-// invariant: only informational output or a successful report exits zero; checks remain read-only
+// preconditions: callers provide explicit paths or plan bindings but no trusted verdict flags
+// invariant: only informational output or a successful report exits zero; all modes remain read-only
 // failure: usage exits 64, infrastructure faults exit 70, stopped checks exit 1
 // source: bundle:knowledge/policies/work-governor.md
 // knowledge: bundle:knowledge/policies/work-governor.md
@@ -72,6 +72,15 @@ enum Command {
         #[arg(long)]
         allow_non_git: bool,
     },
+    /// Produce a digest-bound canonical execution plan.
+    Plan {
+        /// Repository, revision, policy, toolchain, and environment bindings.
+        #[command(flatten)]
+        bindings: CliPlanBindings,
+        /// Caller-confirmed supported project profile.
+        #[command(subcommand)]
+        project: CliPlanProject,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -85,6 +94,82 @@ impl From<CliPreset> for Preset {
         match value {
             CliPreset::Safe => Self::Safe,
             CliPreset::OwnerOriginal => Self::OwnerOriginal,
+        }
+    }
+}
+
+#[derive(Debug, Args)]
+struct CliPlanBindings {
+    /// SHA-256 digest of the repository snapshot.
+    #[arg(long = "repository-sha256")]
+    repository: String,
+    /// SHA-256 digest identifying the exact revision.
+    #[arg(long = "revision-sha256")]
+    revision: String,
+    /// SHA-256 digest of the effective policy.
+    #[arg(long = "policy-sha256")]
+    policy: String,
+    /// SHA-256 digest of the unified toolchain lock.
+    #[arg(long = "toolchain-sha256")]
+    toolchain: String,
+    /// SHA-256 digest of the execution environment.
+    #[arg(long = "environment-sha256")]
+    environment: String,
+}
+
+impl CliPlanBindings {
+    fn into_model(self) -> PlanBindings {
+        PlanBindings::new(
+            self.repository,
+            self.revision,
+            self.policy,
+            self.toolchain,
+            self.environment,
+        )
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum CliPlanProject {
+    /// Confirm a Python-only uv/unittest repository.
+    PythonUvUnittest {
+        /// Repository-relative project working directory.
+        #[arg(long)]
+        working_directory: String,
+    },
+    /// Confirm a Rust-only Cargo workspace with required locked files.
+    RustCargoWorkspace {
+        /// Repository-relative project working directory.
+        #[arg(long)]
+        working_directory: String,
+    },
+    /// Confirm a mixed uv/unittest and Cargo workspace repository.
+    MixedUvCargo {
+        /// Repository-relative Python working directory.
+        #[arg(long)]
+        python_working_directory: String,
+        /// Repository-relative Rust working directory.
+        #[arg(long)]
+        rust_working_directory: String,
+    },
+}
+
+impl CliPlanProject {
+    fn into_model(self) -> PlanProject {
+        match self {
+            Self::PythonUvUnittest { working_directory } => {
+                PlanProject::PythonUvUnittest { working_directory }
+            }
+            Self::RustCargoWorkspace { working_directory } => {
+                PlanProject::RustCargoWorkspace { working_directory }
+            }
+            Self::MixedUvCargo {
+                python_working_directory,
+                rust_working_directory,
+            } => PlanProject::MixedUvCargo {
+                python_working_directory,
+                rust_working_directory,
+            },
         }
     }
 }
@@ -151,6 +236,9 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
             preset: preset.into(),
             allow_non_git,
         },
+        Command::Plan { bindings, project } => {
+            CheckRequest::plan(bindings.into_model(), project.into_model())
+        }
     };
 
     let report = Governor.check(request)?;

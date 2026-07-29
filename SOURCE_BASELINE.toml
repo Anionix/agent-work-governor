@@ -45,5 +45,7 @@ schema_bound_json_contracts = [
   "references/canonical-validators.lock.json=references/LLM-CONTRACT.md",
   "references/code-review.lock.json=references/LLM-CONTRACT.md",
   "references/okf-v0.2.lock.json=references/LLM-CONTRACT.md",
+  "rust/tests/fixtures/rejected-plan-report.json=rust/tests/fixtures/LLM-CONTRACT.md",
+  "rust/tests/fixtures/rust-plan-report.json=rust/tests/fixtures/LLM-CONTRACT.md",
   "toolchain.lock.json=toolchain.lock.LLM-CONTRACT.md",
 ]
