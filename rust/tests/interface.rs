@@ -1,10 +1,12 @@
 //! Public-interface and dry-run integration tests.
 
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::process::Command;
 
 use agent_work_governor::{
-    CheckReport, CheckRequest, Governor, PlanAction, PlanBindings, PlanProject, Preset, Status,
+    CheckReport, CheckRequest, EvidenceArtifact, Governor, MAX_CHECK_OUTPUT_BYTES, PlanAction,
+    PlanBindings, PlanProject, Preset, Status,
 };
 use tempfile::tempdir;
 
@@ -422,6 +424,81 @@ fn plan_library_and_cli_match_the_golden_report() -> Result<(), Box<dyn std::err
     assert!(!encoded.contains("\"authority\""));
     assert!(!encoded.contains("\"receipt\""));
     assert!(!encoded.contains("\"verdict\""));
+    Ok(())
+}
+
+#[test]
+fn verify_cli_matches_the_fail_closed_library_report() -> Result<(), Box<dyn std::error::Error>> {
+    let temporary = tempdir()?;
+    let receipt = temporary.path().join("receipt.json");
+    let evidence_root = temporary.path().join("evidence");
+    let evidence = "rust.tests.log";
+    let logical_evidence = format!(".governance/receipts/evidence/{evidence}");
+    fs::create_dir_all(&evidence_root)?;
+    fs::write(&receipt, "{}")?;
+    fs::write(evidence_root.join(evidence), "untrusted\n")?;
+    let expected_harness = "6666666666666666666666666666666666666666666666666666666666666666";
+    let expected_invocation = "7777777777777777777777777777777777777777777777777777777777777777";
+    let report = Governor.check(CheckRequest::verify(
+        valid_plan_bindings(),
+        PlanProject::RustCargoWorkspace {
+            working_directory: ".".into(),
+        },
+        expected_harness,
+        expected_invocation,
+        b"{}".to_vec(),
+        vec![EvidenceArtifact::new(
+            &logical_evidence,
+            b"untrusted\n".to_vec(),
+        )],
+    ))?;
+    let encoded = serde_json::to_string_pretty(&report)?;
+    let invoke = |root: &std::path::Path, evidence_path: &str| {
+        Command::new(env!("CARGO_BIN_EXE_agent-work-governor"))
+            .args([
+                "verify",
+                "--repository-sha256",
+                REPOSITORY_SHA256,
+                "--revision-sha256",
+                REVISION_SHA256,
+                "--policy-sha256",
+                POLICY_SHA256,
+                "--toolchain-sha256",
+                TOOLCHAIN_SHA256,
+                "--environment-sha256",
+                ENVIRONMENT_SHA256,
+                "--expected-harness-sha256",
+                expected_harness,
+                "--expected-invocation-sha256",
+                expected_invocation,
+            ])
+            .arg("--receipt")
+            .arg(&receipt)
+            .arg("--evidence-root")
+            .arg(root)
+            .arg("--evidence")
+            .arg(evidence_path)
+            .args(["rust-cargo-workspace", "--working-directory", "."])
+            .current_dir(temporary.path())
+            .output()
+    };
+    let output = invoke(&evidence_root, evidence)?;
+    assert_eq!(Some(1), output.status.code());
+    assert_eq!(format!("{encoded}\n").as_bytes(), output.stdout);
+    assert!(output.stderr.is_empty());
+    let outside = temporary.path().join("outside.log");
+    fs::write(&outside, "outside")?;
+    symlink(&outside, evidence_root.join("linked.log"))?;
+    fs::write(
+        evidence_root.join("oversized.log"),
+        vec![0_u8; usize::try_from(MAX_CHECK_OUTPUT_BYTES)? + 1],
+    )?;
+    for rejected in ["../outside.log", "linked.log", "oversized.log"] {
+        let output = invoke(&evidence_root, rejected)?;
+        assert_eq!(Some(70), output.status.code());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8(output.stderr)?.contains("INCONCLUSIVE"));
+    }
     Ok(())
 }
 

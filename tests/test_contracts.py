@@ -1967,6 +1967,66 @@ class SourceHygieneTests(unittest.TestCase):
             (PLUGIN_ROOT / "flake.nix").read_text(encoding="utf-8"),
         )
 
+    def test_shadow_workflow_is_observational_and_identity_bound(self) -> None:
+        workflow = (PLUGIN_ROOT / ".github/workflows/governor-shadow.yml").read_text(
+            encoding="utf-8"
+        )
+        for evidence in (
+            "workflow_run:",
+            "workflows: [governor]",
+            "permissions:\n  contents: read",
+            "github.event.workflow_run.event == 'pull_request'",
+            "path: control",
+            "persist-credentials: false",
+            "github.event.workflow_run.head_sha",
+            "repository: ${{ env.CANDIDATE_REPOSITORY }}",
+            '"path:$control#default"',
+            'nix store add-path "$subject"',
+            "--no-update-lock-file --no-write-lock-file",
+            "sudo /usr/bin/env -i",
+            "--runtime-root",
+            "--evidence-root",
+            "runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]",
+            "scripts/rust_dispatch.py",
+            "scripts/bounded_harness.py",
+            "PARITY_EVIDENCE",
+            "SHADOW_REGRESSION",
+            "SHADOW_INCONCLUSIVE",
+            '"reason_codes"',
+            '"candidate_archive_sha256"',
+            '"candidate_store_sha256"',
+            '"plan_report_sha256"',
+            '"receipt_sha256"',
+            '"evidence_set_sha256"',
+            '"verify_report_sha256"',
+            "GITHUB_STEP_SUMMARY",
+        ):
+            self.assertIn(evidence, workflow)
+        for forbidden in (
+            "secrets.",
+            "governor / validate",
+            "governor / authority",
+            "nix build .#default",
+            "nix develop -c",
+            "subject/flake.nix",
+            '"$subject/scripts/',
+            "sudo --preserve-env",
+        ):
+            self.assertNotIn(forbidden, workflow)
+        self.assertGreaterEqual(
+            workflow.count("--no-update-lock-file --no-write-lock-file"),
+            2,
+        )
+        self.assertIn(
+            ".github/workflows/governor-shadow.yml",
+            (PLUGIN_ROOT / "flake.nix").read_text(encoding="utf-8"),
+        )
+        promotion = (PLUGIN_ROOT / "docs/agents/shadow-ci.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("requires a separate Issue and protection-rule change", promotion)
+        self.assertIn("never\nreplace the legacy gate", promotion)
+
     def test_split_rust_toolchain_lock_has_no_stale_references(self) -> None:
         stale_lock = "rust/toolchain" + ".lock.json"
         stale_contract = "rust/toolchain" + ".lock.LLM-CONTRACT.md"
