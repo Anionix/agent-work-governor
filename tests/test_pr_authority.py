@@ -379,6 +379,26 @@ class AuthorityTests(unittest.TestCase):
             "```\nIssue/spec: #33\n```\nIssue/spec: #33",
             "Issue/spec: #33\n<!--",
             "Issue/spec: #33\n~~~",
+            "<script>\nIssue/spec: #33\n</script>",
+            "<STYLE>\nIssue/spec: #33\n</PRE>",
+            "<pre>Issue/spec: #33</pre>",
+            "<?governor\nIssue/spec: #33\n?>",
+            "<!DECLARATION\nIssue/spec: #33\n>",
+            "<![CDATA[\nIssue/spec: #33\n]]>",
+            "<div>\nIssue/spec: #33\n\n",
+            "<custom-tag>\nIssue/spec: #33\n\n",
+            "<script>\nIssue/spec: #33",
+            "<div>\nIssue/spec: #33\n\nIssue/spec: #33",
+            "<!-- note -->\n<custom-tag>\nIssue/spec: #33",
+            "<script>\r\nIssue/spec: #33\r\n</script>",
+            "# Heading\n<custom-tag>\nIssue/spec: #33\n\n",
+            "***\n<custom-tag>\nIssue/spec: #33\n\n",
+            "    code\n<custom-tag>\nIssue/spec: #33\n\n",
+            "<div>\n\u00a0\nIssue/spec: #33\n\n",
+            "<div>\n\f\nIssue/spec: #33\n\n",
+            "<script\f>\nIssue/spec: #33\n</script>",
+            "<script\v>\nIssue/spec: #33\n</script>",
+            "[x]: /url\n<custom-tag>\nIssue/spec: #33\n\n",
         )
         for body in invalid_bodies:
             with self.subTest(body=body):
@@ -392,6 +412,11 @@ class AuthorityTests(unittest.TestCase):
             "<!-- note -->\n```\nexample\n```\nIssue/spec: #33",
             "    ```\nIssue/spec: #33",
             "Introduction\r\nIssue/spec: #33\r\n",
+            "<div>example</div>\n\nIssue/spec: #33",
+            "<custom-tag>  \nexample\n\nIssue/spec: #33",
+            "<script>example</script>\nIssue/spec: #33",
+            "<?governor?>\nIssue/spec: #33",
+            "<![CDATA[example]]>\nIssue/spec: #33",
         )
         for body in valid_bodies:
             with self.subTest(body=body):
