@@ -874,12 +874,63 @@ class BoundedHarnessTests(unittest.TestCase):
                     None,
                     harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
                     harness.NetworkSandbox.LINUX,
+                    startup_failure=harness.NetworkStage.CANDIDATE_START,
                 )
             )
         self.assertEqual(
             "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
             raised.exception.code,
         )
+        self.assertEqual(harness.NetworkStage.CANDIDATE_START, raised.exception.stage)
+        self.assertEqual([], raised.exception.failed)
+
+    def test_network_fault_names_the_preflight_stage(self) -> None:
+        runtime = harness.RuntimePaths(
+            self.root / "run.json",
+            self.root / "evidence",
+            self.root / "artifacts",
+            self.root / "tmp",
+        )
+        for code in sorted(harness.NETWORK_FAULTS):
+            with (
+                self.subTest(code=code),
+                mock.patch.object(
+                    harness,
+                    "_network_sandbox",
+                    side_effect=harness.HarnessError(code),
+                ),
+                self.assertRaises(harness.HarnessError) as raised,
+            ):
+                asyncio.run(
+                    harness._verify_network_sandbox(
+                        harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
+                        runtime,
+                    )
+                )
+            self.assertEqual(
+                harness.NetworkStage.SANDBOX_SELECT, raised.exception.stage
+            )
+            self.assertEqual([], raised.exception.failed)
+            harness._fault(runtime.receipt, raised.exception)
+            fault = json.loads(
+                runtime.receipt.with_name("run.json.fault.json").read_text()
+            )
+            self.assertEqual(
+                {
+                    "code",
+                    "completed",
+                    "failed",
+                    "not_started",
+                    "running",
+                    "schema_version",
+                    "stage",
+                    "state",
+                },
+                set(fault),
+            )
+            self.assertEqual(harness.FAULT_SCHEMA_VERSION, fault["schema_version"])
+            self.assertEqual(harness.NetworkStage.SANDBOX_SELECT.value, fault["stage"])
+            self.assertEqual([], fault["failed"])
 
     def test_output_overflow_is_an_explicit_partial_fault(self) -> None:
         self.receipt.parent.mkdir(parents=True)
@@ -892,6 +943,7 @@ class BoundedHarnessTests(unittest.TestCase):
         fault = json.loads(self.receipt.with_name("run.json.fault.json").read_text())
         self.assertEqual("HARNESS_OUTPUT_LIMIT_EXCEEDED", fault["code"])
         self.assertEqual(["python.overflow"], fault["failed"])
+        self.assertIsNone(fault["stage"])
         self.assertEqual("HARNESS_FAULT", fault["state"])
 
     def test_interruption_is_typed_without_an_aggregate_receipt(self) -> None:
