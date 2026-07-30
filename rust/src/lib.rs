@@ -6,6 +6,7 @@ mod contract;
 mod governance_ir;
 mod model;
 mod okf;
+mod owner_scope;
 mod planning;
 mod policy;
 mod python_adapter;
@@ -19,6 +20,10 @@ pub use bootstrap::PlanAction;
 pub use governance_ir::execution_plan::CanonicalExecutionPlan;
 pub use model::{CheckReport, CheckRequest, Finding, Preset, RepositoryReport, Status};
 pub use okf::OkfStatus;
+pub use owner_scope::{
+    EffectiveAuthority, OwnerScopeFailure, OwnerScopeInput, ValidatedPolicyAuthority,
+    verify_owner_scope,
+};
 pub use planning::{PlanBindings, PlanProject, PlanReport};
 use thiserror::Error;
 pub use verification::{

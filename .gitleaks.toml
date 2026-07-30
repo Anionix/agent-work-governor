@@ -1,0 +1,17 @@
+# LLM-CONTRACT
+# id: agent-work-governor.gitleaks-source-scope
+# state: SOURCE_TREE -> DEFAULT_RULES + GENERATED_OUTPUT_EXCLUSION -> SECRET_FINDINGS
+# preconditions: checks may have populated ignored target and governance cache directories
+# invariant: default secret rules scan source while ignored generated dependencies stay outside scope
+# failure: missing or invalid configuration makes the gitleaks gate fail closed
+# source: https://github.com/gitleaks/gitleaks/blob/83d9cd684c87d95d656c1458ef04895a7f1cbd8e/README.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: paths
+# test: repo:tests/test_contracts.py
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignored generated build and dependency caches are not source"
+paths = ['''(^|/)(target|\.governance/cache)/''']
