@@ -808,21 +808,17 @@ class BoundedHarnessTests(unittest.TestCase):
             self.root / "artifacts",
             self.root / "tmp",
         )
-        process = mock.sentinel.process
+        stdout = mock.AsyncMock()
+        stdout.read.return_value = harness.SANDBOX_READY
+        process = SimpleNamespace(stdout=stdout)
         with (
             mock.patch.object(harness, "_linux_seccomp_fd", return_value=9),
-            mock.patch.object(harness.os, "pipe", return_value=(8, 10)),
             mock.patch.object(harness, "_sandboxed_argv", return_value=["bwrap"]),
             mock.patch.object(
                 harness.asyncio,
                 "create_subprocess_exec",
                 return_value=process,
             ) as spawn,
-            mock.patch.object(
-                harness.asyncio,
-                "to_thread",
-                new=mock.AsyncMock(return_value=harness.SANDBOX_READY),
-            ),
             mock.patch.object(harness.os, "close") as close,
         ):
             result = asyncio.run(
@@ -838,8 +834,32 @@ class BoundedHarnessTests(unittest.TestCase):
         self.assertIs(process, result)
         await_args = spawn.await_args
         assert await_args is not None
-        self.assertEqual((10, 9), await_args.kwargs["pass_fds"])
-        close.assert_has_calls([mock.call(10), mock.call(8), mock.call(9)])
+        self.assertEqual((9,), await_args.kwargs["pass_fds"])
+        stdout.read.assert_awaited_once_with(1)
+        self.assertEqual(1, close.call_args_list.count(mock.call(9)))
+
+    def test_candidate_exec_prefixes_output_with_readiness(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                harness.CANDIDATE_EXEC,
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                "import os;os.write(1,b'candidate-output')",
+            ],
+            check=False,
+            capture_output=True,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(
+            harness.SANDBOX_READY + b"candidate-output",
+            result.stdout,
+        )
 
     def test_sandbox_setup_without_readiness_is_typed(self) -> None:
         runtime = harness.RuntimePaths(
@@ -848,20 +868,16 @@ class BoundedHarnessTests(unittest.TestCase):
             self.root / "artifacts",
             self.root / "tmp",
         )
-        process = SimpleNamespace(returncode=1)
+        stdout = mock.AsyncMock()
+        stdout.read.return_value = b""
+        process = SimpleNamespace(returncode=1, stdout=stdout)
         with (
             mock.patch.object(harness, "_linux_seccomp_fd", return_value=9),
-            mock.patch.object(harness.os, "pipe", return_value=(8, 10)),
             mock.patch.object(harness, "_sandboxed_argv", return_value=["bwrap"]),
             mock.patch.object(
                 harness.asyncio,
                 "create_subprocess_exec",
                 return_value=process,
-            ),
-            mock.patch.object(
-                harness.asyncio,
-                "to_thread",
-                new=mock.AsyncMock(return_value=b""),
             ),
             mock.patch.object(harness.os, "close"),
             self.assertRaises(harness.HarnessError) as raised,
