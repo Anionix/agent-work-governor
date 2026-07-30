@@ -1,0 +1,154 @@
+# LLM-CONTRACT
+# id: agent-work-governor.kani-shadow
+# state: CANDIDATE_REVISION + PINNED_KANI -> PROVED_DECISION_CORE | SHADOW_FAILURE
+# preconditions: this candidate-controlled workflow is never a required authority check
+# invariant: exact source and bundle digests precede every proof; the negative canary must fail
+# failure: setup, any positive harness, or canary rejection exits non-zero without granting authority
+# source: https://github.com/model-checking/kani/blob/4feaaad1d6a2378a6ff6caa3b4fc5d6999c7bb5d/src/setup.rs
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: prove
+# test: bundle:rust/src/owner_scope.rs
+
+name: kani-shadow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kani-shadow-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  prove:
+    name: kani / shadow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the candidate revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install pinned Kani
+        shell: bash
+        run: |
+          # LLM contract: validated catalog + exact downloads -> PINNED_KANI or job failure.
+          set -euo pipefail
+          python3 scripts/toolchain_catalog.py toolchain.lock.json --require kani
+          version="$(
+            python3 scripts/toolchain_catalog.py toolchain.lock.json --tool-version kani
+          )"
+          IFS=$'\t' read -r source source_digest < <(
+            python3 scripts/toolchain_catalog.py toolchain.lock.json --tool-source kani
+          )
+          IFS=$'\t' read -r bundle bundle_digest < <(
+            python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          catalog = json.loads(Path("toolchain.lock.json").read_text(encoding="utf-8"))
+          pin = next(entry for entry in catalog["tools"] if entry["id"] == "kani")
+          artifact = pin["artifacts"]["x86_64-linux"]
+          print(f"{artifact['url']}\tsha256:{artifact['sha256']}")
+          PY
+          )
+          manifest_version="$(
+            python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(
+              Path("rust/kani-assurance.toml").read_text(encoding="utf-8")
+          )
+          assert manifest["mode"] == "shadow"
+          assert manifest["tool_id"] == "kani"
+          print(manifest["tool_version"])
+          PY
+          )"
+          test "$version" = "$manifest_version"
+
+          source_archive="$RUNNER_TEMP/kani-verifier.crate"
+          bundle_archive="$RUNNER_TEMP/kani-bundle.tar.gz"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output "$source_archive" "$source"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --output "$bundle_archive" "$bundle"
+          printf '%s  %s\n' "${source_digest#sha256:}" "$source_archive" |
+            sha256sum --check --strict
+          printf '%s  %s\n' "${bundle_digest#sha256:}" "$bundle_archive" |
+            sha256sum --check --strict
+
+          source_root="$RUNNER_TEMP/kani-verifier-source"
+          mkdir -p "$source_root"
+          tar -xzf "$source_archive" --strip-components=1 -C "$source_root"
+          cargo install --locked --path "$source_root" --root "$RUNNER_TEMP/kani-cli"
+          export PATH="$RUNNER_TEMP/kani-cli/bin:$PATH"
+          export KANI_HOME="$RUNNER_TEMP/kani-home"
+          cargo-kani setup --use-local-bundle "$bundle_archive"
+          cargo-kani --version | grep -F "$version"
+          {
+            printf 'PATH=%s\n' "$PATH"
+            printf 'KANI_HOME=%s\n' "$KANI_HOME"
+            printf 'KANI_VERSION=%s\n' "$version"
+          } >> "$GITHUB_ENV"
+
+      - name: Prove owner-scope decision core
+        shell: bash
+        run: |
+          # LLM contract: manifest harness set -> ALL_PROVED + CANARY_REJECTED or failure.
+          set -euo pipefail
+          if sed -n '/#\[cfg(kani)\]/,$p' rust/src/owner_scope.rs |
+            grep -F 'kani::assume'; then
+            echo "::error title=KANI_VACUOUS_ASSUMPTION::kani::assume is forbidden"
+            exit 1
+          fi
+          mapfile -t harnesses < <(
+            python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(
+              Path("rust/kani-assurance.toml").read_text(encoding="utf-8")
+          )
+          for harness in manifest["positive_harnesses"]:
+              print(harness)
+          PY
+          )
+          test "${#harnesses[@]}" -gt 0
+          assurance_log="$RUNNER_TEMP/kani-assurance.log"
+          for harness in "${harnesses[@]}"; do
+            cargo kani --manifest-path rust/Cargo.toml --lib --harness "$harness" \
+              2>&1 | tee -a "$assurance_log"
+          done
+          canary="$(
+            python3 - <<'PY'
+          import tomllib
+          from pathlib import Path
+
+          manifest = tomllib.loads(
+              Path("rust/kani-assurance.toml").read_text(encoding="utf-8")
+          )
+          print(manifest["negative_canary"])
+          PY
+          )"
+          canary_log="$RUNNER_TEMP/kani-negative-canary.log"
+          if cargo kani --manifest-path rust/Cargo.toml --lib \
+            --features kani-canary --harness "$canary" \
+            2>&1 | tee "$canary_log"; then
+            echo "::error title=KANI_NEGATIVE_CANARY_ACCEPTED::$canary"
+            exit 1
+          fi
+          grep -F 'VERIFICATION:- FAILED' "$canary_log"
+          grep -F 'the Kani runner must reject a false property' "$canary_log"
+          python3 scripts/validate_kani_assurance.py \
+            --root . \
+            --manifest rust/kani-assurance.toml \
+            --log "$assurance_log" \
+            --kani-version "$KANI_VERSION"
+          echo '{"authority":"none","negative_canary":"REJECTED","status":"PASS"}'

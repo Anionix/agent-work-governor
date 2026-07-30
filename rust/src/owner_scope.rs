@@ -85,6 +85,28 @@ pub struct ValidatedPolicyAuthority {
     authority: EffectiveAuthority,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct BindingChecks(u8);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DecisionInput {
+    bindings: BindingChecks,
+    issued_at: u64,
+    expires_at: u64,
+    now: u64,
+    signature_verified: bool,
+    policy: EffectiveAuthority,
+    receipt: EffectiveAuthority,
+    runtime: EffectiveAuthority,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DecisionFailure {
+    BindingMismatch,
+    ReceiptExpired,
+    SignatureInvalid,
+}
+
 /// Stable closed-failure evidence from receipt verification.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 #[error("{code}: {message}")]
@@ -163,56 +185,99 @@ pub fn verify_owner_scope(
     })?;
 
     let expected_key_id = sha256_hex(&public_key_array);
-    if payload.schema_version != RECEIPT_SCHEMA
-        || payload.repository_id != input.repository_id
-        || payload.owner_id != input.owner_id
-        || payload.repository_full_name != input.repository_full_name
-        || payload.policy_sha256 != policy.sha256
-        || payload.issuer != input.issuer
-        || input.trusted_key_sha256 != expected_key_id
-        || payload.key_id != expected_key_id
-    {
-        return Err(OwnerScopeFailure::new(
-            "OWNER_SCOPE_BINDING_MISMATCH",
-            "receipt identity, policy, issuer, or trusted key binding does not match",
-        ));
-    }
-    if payload.issued_at > input.now_epoch_seconds
-        || payload.expires_at <= input.now_epoch_seconds
-        || payload.issued_at >= payload.expires_at
-    {
-        return Err(OwnerScopeFailure::new(
-            "OWNER_SCOPE_RECEIPT_EXPIRED",
-            "receipt validity interval does not contain the caller-observed time",
-        ));
-    }
-
-    let signature_bytes = decode_hex::<64>(&receipt.signature_hex).ok_or_else(|| {
-        OwnerScopeFailure::new(
-            "OWNER_SCOPE_SIGNATURE_INVALID",
-            "signature_hex must be exactly 128 lower-case hexadecimal characters",
-        )
-    })?;
-    let signature = Signature::from_bytes(&signature_bytes);
     let mut message = RECEIPT_DOMAIN.to_vec();
     message.extend_from_slice(receipt.payload.get().as_bytes());
-    verifying_key
-        .verify_strict(&message, &signature)
-        .map_err(|_| {
-            OwnerScopeFailure::new(
+    let signature_verified =
+        decode_hex::<64>(&receipt.signature_hex).is_some_and(|signature_bytes| {
+            verifying_key
+                .verify_strict(&message, &Signature::from_bytes(&signature_bytes))
+                .is_ok()
+        });
+    decide(DecisionInput {
+        bindings: BindingChecks::from_array([
+            payload.schema_version == RECEIPT_SCHEMA,
+            payload.repository_id == input.repository_id
+                && payload.owner_id == input.owner_id
+                && payload.repository_full_name == input.repository_full_name,
+            payload.policy_sha256 == policy.sha256,
+            payload.issuer == input.issuer,
+            input.trusted_key_sha256 == expected_key_id && payload.key_id == expected_key_id,
+        ]),
+        issued_at: payload.issued_at,
+        expires_at: payload.expires_at,
+        now: input.now_epoch_seconds,
+        signature_verified,
+        policy: policy.authority,
+        receipt: EffectiveAuthority {
+            repository_write: payload.repository_write,
+            external_side_effects: payload.external_side_effects,
+        },
+        runtime: input.runtime_authority,
+    })
+    .map_err(DecisionFailure::owner_scope_failure)
+}
+
+fn decide(input: DecisionInput) -> Result<EffectiveAuthority, DecisionFailure> {
+    if !input.bindings.all() {
+        return Err(DecisionFailure::BindingMismatch);
+    }
+    if !input.time_is_valid() {
+        return Err(DecisionFailure::ReceiptExpired);
+    }
+    if !input.signature_verified {
+        return Err(DecisionFailure::SignatureInvalid);
+    }
+    Ok(EffectiveAuthority {
+        repository_write: input.policy.repository_write
+            && input.receipt.repository_write
+            && input.runtime.repository_write,
+        external_side_effects: input.policy.external_side_effects
+            && input.receipt.external_side_effects
+            && input.runtime.external_side_effects,
+    })
+}
+
+impl BindingChecks {
+    const ALL: u8 = 0b1_1111;
+
+    const fn from_array(checks: [bool; 5]) -> Self {
+        Self(
+            (checks[0] as u8)
+                | ((checks[1] as u8) << 1)
+                | ((checks[2] as u8) << 2)
+                | ((checks[3] as u8) << 3)
+                | ((checks[4] as u8) << 4),
+        )
+    }
+
+    const fn all(self) -> bool {
+        self.0 & Self::ALL == Self::ALL
+    }
+}
+
+impl DecisionInput {
+    const fn time_is_valid(self) -> bool {
+        self.issued_at <= self.now && self.now < self.expires_at
+    }
+}
+
+impl DecisionFailure {
+    const fn owner_scope_failure(self) -> OwnerScopeFailure {
+        match self {
+            Self::BindingMismatch => OwnerScopeFailure::new(
+                "OWNER_SCOPE_BINDING_MISMATCH",
+                "receipt identity, policy, issuer, or trusted key binding does not match",
+            ),
+            Self::ReceiptExpired => OwnerScopeFailure::new(
+                "OWNER_SCOPE_RECEIPT_EXPIRED",
+                "receipt validity interval does not contain the caller-observed time",
+            ),
+            Self::SignatureInvalid => OwnerScopeFailure::new(
                 "OWNER_SCOPE_SIGNATURE_INVALID",
                 "receipt signature does not verify with the trusted public key",
-            )
-        })?;
-
-    Ok(EffectiveAuthority {
-        repository_write: policy.authority.repository_write
-            && payload.repository_write
-            && input.runtime_authority.repository_write,
-        external_side_effects: policy.authority.external_side_effects
-            && payload.external_side_effects
-            && input.runtime_authority.external_side_effects,
-    })
+            ),
+        }
+    }
 }
 
 fn read_external(
@@ -329,5 +394,141 @@ fn encode_hex(bytes: &[u8]) -> String {
 impl OwnerScopeFailure {
     const fn new(code: &'static str, message: &'static str) -> Self {
         Self { code, message }
+    }
+}
+
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+
+    fn any_authority() -> EffectiveAuthority {
+        EffectiveAuthority {
+            repository_write: kani::any(),
+            external_side_effects: kani::any(),
+        }
+    }
+
+    fn any_input() -> DecisionInput {
+        DecisionInput {
+            bindings: BindingChecks(kani::any()),
+            issued_at: kani::any(),
+            expires_at: kani::any(),
+            now: kani::any(),
+            signature_verified: kani::any(),
+            policy: any_authority(),
+            receipt: any_authority(),
+            runtime: any_authority(),
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn decision_gate_equivalence() {
+        let input = any_input();
+        let decision = decide(input);
+        assert_eq!(
+            decision.is_ok(),
+            input.bindings.all()
+                && input.issued_at <= input.now
+                && input.now < input.expires_at
+                && input.signature_verified
+        );
+        kani::cover!(decision.is_ok(), "verified decision is reachable");
+        kani::cover!(
+            matches!(decision, Err(DecisionFailure::BindingMismatch)),
+            "binding mismatch is reachable"
+        );
+        kani::cover!(
+            matches!(decision, Err(DecisionFailure::ReceiptExpired)),
+            "expired receipt is reachable"
+        );
+        kani::cover!(
+            matches!(decision, Err(DecisionFailure::SignatureInvalid)),
+            "invalid signature is reachable"
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn binding_encoding_is_exact() {
+        let checks: [bool; 5] = [
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+            kani::any(),
+        ];
+        assert_eq!(
+            BindingChecks::from_array(checks).all(),
+            checks[0] && checks[1] && checks[2] && checks[3] && checks[4]
+        );
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn verified_authority_is_exact_intersection() {
+        let input = any_input();
+        if let Ok(authority) = decide(input) {
+            assert_eq!(
+                authority.repository_write,
+                input.policy.repository_write
+                    && input.receipt.repository_write
+                    && input.runtime.repository_write
+            );
+            assert_eq!(
+                authority.external_side_effects,
+                input.policy.external_side_effects
+                    && input.receipt.external_side_effects
+                    && input.runtime.external_side_effects
+            );
+            assert!(!authority.repository_write || input.policy.repository_write);
+            assert!(!authority.repository_write || input.receipt.repository_write);
+            assert!(!authority.repository_write || input.runtime.repository_write);
+            assert!(!authority.external_side_effects || input.policy.external_side_effects);
+            assert!(!authority.external_side_effects || input.receipt.external_side_effects);
+            assert!(!authority.external_side_effects || input.runtime.external_side_effects);
+        }
+    }
+
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn decision_paths_are_reachable() {
+        let authority = EffectiveAuthority {
+            repository_write: true,
+            external_side_effects: true,
+        };
+        let verified = decide(DecisionInput {
+            bindings: BindingChecks::from_array([true; 5]),
+            issued_at: 10,
+            expires_at: 12,
+            now: 11,
+            signature_verified: true,
+            policy: authority,
+            receipt: authority,
+            runtime: authority,
+        });
+        assert_eq!(verified, Ok(authority));
+
+        let denied = decide(DecisionInput {
+            signature_verified: false,
+            ..DecisionInput {
+                bindings: BindingChecks::from_array([true; 5]),
+                issued_at: 10,
+                expires_at: 12,
+                now: 11,
+                signature_verified: true,
+                policy: authority,
+                receipt: authority,
+                runtime: authority,
+            }
+        });
+        assert_eq!(denied, Err(DecisionFailure::SignatureInvalid));
+    }
+
+    #[cfg(feature = "kani-canary")]
+    #[kani::proof]
+    #[kani::unwind(1)]
+    fn negative_canary_must_fail() {
+        assert!(false, "the Kani runner must reject a false property");
     }
 }
