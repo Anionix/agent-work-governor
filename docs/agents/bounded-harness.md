@@ -35,9 +35,12 @@ network/user/PID/IPC/UTS namespaces, disable nested user namespaces, and drop
 every capability before becoming `nobody`. The trusted preflight's inherited,
 architecture-bound seccomp filter permits Unix, IPv4, and IPv6 sockets.
 Candidate filters permit Unix sockets only; VSOCK, packet, IPv4, IPv6,
-alternate-ABI, and `io_uring` socket paths fail with `EPERM`. On macOS, the
-trusted preflight uses a deny-default Seatbelt profile that permits only pinned
-system/toolchain, repository, and runtime paths plus IPv4/IPv6 loopback.
+alternate-ABI, and `io_uring` socket paths fail with `EPERM`. A Bubblewrap
+loopback `RTM_NEWADDR` denial with `EPERM` is reported only as the fixed
+`network-*-linux-loopback-rtnetlink-eperm` stage; launcher text is never
+emitted. On macOS, the trusted preflight uses a deny-default Seatbelt profile
+that permits only pinned system/toolchain, repository, and runtime paths plus
+IPv4/IPv6 loopback.
 Candidate checks use the same bounded file/process surface with no network
 allow rules, so a host-local HTTP, SOCKS, or browser debug broker cannot relay
 egress. A fixed stdout prefix proves that Bubblewrap or Seatbelt entered the
@@ -56,7 +59,9 @@ Fault schema `0.2` keeps check identifiers in `failed` and reports network
 preflight position separately in nullable `stage`. Network stage values are
 fixed by the harness: `network-sandbox-select`, `network-host-canaries`,
 `network-candidate-{start,create,ready-eof,ready-output,ready-timeout,result}`,
-or `network-trusted-{start,create,ready-eof,ready-output,ready-timeout,result}`.
+`network-candidate-linux-loopback-rtnetlink-eperm`,
+`network-trusted-{start,create,ready-eof,ready-output,ready-timeout,result}`, or
+`network-trusted-linux-loopback-rtnetlink-eperm`.
 Schema `0.1` faults did not contain `stage`.
 
 Example, with a trusted harness checkout:

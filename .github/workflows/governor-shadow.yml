@@ -341,12 +341,14 @@ jobs:
                   "network-candidate-ready-eof",
                   "network-candidate-ready-output",
                   "network-candidate-ready-timeout",
+                  "network-candidate-linux-loopback-rtnetlink-eperm",
                   "network-candidate-result",
                   "network-trusted-start",
                   "network-trusted-create",
                   "network-trusted-ready-eof",
                   "network-trusted-ready-output",
                   "network-trusted-ready-timeout",
+                  "network-trusted-linux-loopback-rtnetlink-eperm",
                   "network-trusted-result",
               }
               fields = {

@@ -75,6 +75,9 @@ NETWORK_BYPASS_EXIT = 81
 NETWORK_SETUP_EXIT = 82
 FAULT_SCHEMA_VERSION = "0.2"
 SANDBOX_READY = b"\x01"
+BWRAP_LOOPBACK_RTM_NEWADDR_EPERM = (
+    b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
+)
 # LLM contract: OS_SANDBOX_ENTERED -> STDOUT_READY_BYTE -> CANDIDATE_EXEC;
 # the fixed prefix crosses each launcher on its existing output channel, while
 # missing readiness proves setup failure before candidate outcome evaluation.
@@ -124,18 +127,30 @@ class NetworkStage(StrEnum):
     CANDIDATE_READY_EOF = "network-candidate-ready-eof"
     CANDIDATE_READY_OUTPUT = "network-candidate-ready-output"
     CANDIDATE_READY_TIMEOUT = "network-candidate-ready-timeout"
+    CANDIDATE_LINUX_LOOPBACK_RTMNETLINK_EPERM = (
+        "network-candidate-linux-loopback-rtnetlink-eperm"
+    )
     CANDIDATE_RESULT = "network-candidate-result"
     TRUSTED_START = "network-trusted-start"
     TRUSTED_CREATE = "network-trusted-create"
     TRUSTED_READY_EOF = "network-trusted-ready-eof"
     TRUSTED_READY_OUTPUT = "network-trusted-ready-output"
     TRUSTED_READY_TIMEOUT = "network-trusted-ready-timeout"
+    TRUSTED_LINUX_LOOPBACK_RTMNETLINK_EPERM = (
+        "network-trusted-linux-loopback-rtnetlink-eperm"
+    )
     TRUSTED_RESULT = "network-trusted-result"
 
 
 def _startup_stage(
     stage: NetworkStage | None,
-    reason: Literal["create", "ready-eof", "ready-output", "ready-timeout"],
+    reason: Literal[
+        "create",
+        "ready-eof",
+        "ready-output",
+        "ready-timeout",
+        "linux-loopback-rtnetlink-eperm",
+    ],
 ) -> NetworkStage | None:
     # LLM contract: fixed start phase + trusted observation -> fixed stage;
     # launcher output is never copied into evidence or allowed to select a token.
@@ -143,6 +158,30 @@ def _startup_stage(
     if stage not in {NetworkStage.CANDIDATE_START, NetworkStage.TRUSTED_START}:
         return stage
     return NetworkStage(f"{stage.value.removesuffix('-start')}-{reason}")
+
+
+def _startup_reason(
+    sandbox: NetworkSandbox,
+    observed: bytes,
+    *,
+    line_complete: bool,
+) -> Literal["ready-eof", "ready-output", "linux-loopback-rtnetlink-eperm"]:
+    # LLM contract: NO_READY_BYTE + COMPLETE_BOUNDED_TRUSTED_LAUNCHER_LINE ->
+    # FIXED_TOKEN; partial lines stay generic, and candidate bytes run only
+    # after READY so they can never select this diagnostic.
+    # Primary source:
+    # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/network.c#L137-L182
+    if observed == b"":
+        return "ready-eof"
+    if not line_complete:
+        return "ready-output"
+    first_line = observed.split(b"\n", 1)[0].rstrip(b"\r")
+    if (
+        sandbox == NetworkSandbox.LINUX
+        and first_line == BWRAP_LOOPBACK_RTM_NEWADDR_EPERM
+    ):
+        return "linux-loopback-rtnetlink-eperm"
+    return "ready-output"
 
 
 @dataclass(frozen=True)
@@ -1049,11 +1088,31 @@ async def _spawn(
                 stage=_startup_stage(startup_failure, "ready-timeout"),
             ) from error
         if ready != SANDBOX_READY:
+            observed = ready
+            line_complete = ready == b""
+            if ready and sandbox == NetworkSandbox.LINUX:
+                try:
+                    async with asyncio.timeout(0.25):
+                        while len(observed) < 256:
+                            chunk = await process.stdout.read(1)
+                            if chunk == b"":
+                                line_complete = True
+                                break
+                            observed += chunk
+                            if chunk == b"\n":
+                                line_complete = True
+                                break
+                except TimeoutError:
+                    pass
             raise HarnessError(
                 "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
                 stage=_startup_stage(
                     startup_failure,
-                    "ready-eof" if ready == b"" else "ready-output",
+                    _startup_reason(
+                        sandbox,
+                        observed,
+                        line_complete=line_complete,
+                    ),
                 ),
             )
         return process
