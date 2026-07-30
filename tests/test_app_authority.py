@@ -35,8 +35,8 @@ class FakeRequester:
     def __call__(
         self,
         url: str,
-        method: str,
         token: str,
+        method: str,
         document: dict[str, object] | None,
     ) -> object:
         self.calls.append((url, method, token, document))
@@ -228,13 +228,13 @@ class AppAuthorityTests(unittest.TestCase):
 
         def unavailable_demotion(
             url: str,
-            method: str,
             token: str,
+            method: str,
             document: dict[str, object] | None,
         ) -> object:
             if method == "PATCH":
                 raise publish_app_authority.PublishError("APP_CHECK_API_ERROR")
-            return requester(url, method, token, document)
+            return requester(url, token, method, document)
 
         with self.assertRaisesRegex(
             publish_app_authority.PublishError,
@@ -333,11 +333,11 @@ class AppAuthorityTests(unittest.TestCase):
 
         def wrong_head(
             url: str,
-            method: str,
             token: str,
+            method: str,
             document: dict[str, object] | None,
         ) -> object:
-            response = requester(url, method, token, document)
+            response = requester(url, token, method, document)
             if method == "POST":
                 assert isinstance(response, dict)
                 cast(dict[str, object], response)["head_sha"] = "b" * 40

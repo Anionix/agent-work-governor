@@ -123,6 +123,7 @@ class Result:
 class ApiResponse:
     document: object
     link: str | None = None
+    status: int = 200
 
 
 Fetcher = Callable[[str, str], ApiResponse]
@@ -201,24 +202,62 @@ def _loads_json(payload: bytes) -> object:
         raise ValueError("JSON nesting exceeds the bounded input") from error
 
 
-def _fetch_json(url: str, token: str) -> ApiResponse:
-    request = Request(
-        url,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "agent-work-governor/0.1",
-            "X-GitHub-Api-Version": API_VERSION,
-        },
+def github_request_json(
+    url: str,
+    token: str,
+    method: str = "GET",
+    document: dict[str, object] | None = None,
+) -> ApiResponse:
+    # LLM-CONTRACT
+    # id: agent-work-governor.github-rest-transport
+    # state: REQUEST_SPEC -> CANONICAL_REQUEST -> BOUNDED_RESPONSE -> TYPED_EVIDENCE
+    # preconditions: the protected-base caller supplies a repository-scoped token
+    # invariant: only canonical GitHub JSON is read; GET retries once; writes never retry
+    # failure: redirect, oversize, malformed JSON, or exhausted transport returns typed error
+    # source: https://github.com/github/docs/blob/72ef2d329866e5d0d52829f105f853da9bcf4260/content/rest/using-the-rest-api/best-practices-for-using-the-rest-api.md
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: github_request_json
+    # test: bundle:tests/test_pr_authority.py
+    if not token or not url.startswith(f"{CANONICAL_API_URL}/") or "#" in url:
+        raise ValueError("GitHub API URL is not canonical")
+    payload = (
+        None
+        if document is None
+        else json.dumps(document, sort_keys=True, separators=(",", ":")).encode()
     )
-    with build_opener(_NoRedirect).open(request, timeout=10.0) as response:
-        if response.geturl() != url:
-            raise ValueError("GitHub API redirected")
-        payload = response.read(MAX_RESPONSE_BYTES + 1)
-        link = response.headers.get("Link")
-    if len(payload) > MAX_RESPONSE_BYTES:
-        raise ValueError("GitHub response exceeds the bounded input")
-    return ApiResponse(_loads_json(payload), link)
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "agent-work-governor/0.1",
+        "X-GitHub-Api-Version": API_VERSION,
+    }
+    request = Request(url, data=payload, method=method, headers=headers)
+    opener = build_opener(_NoRedirect)
+    for attempt in range(2 if method == "GET" else 1):
+        try:
+            with opener.open(request, timeout=10.0) as response:
+                if response.geturl() != url:
+                    raise ValueError("GITHUB_API_REDIRECTED")
+                body = response.read(MAX_RESPONSE_BYTES + 1)
+                if len(body) > MAX_RESPONSE_BYTES:
+                    raise ValueError("GITHUB_API_RESPONSE_OVERSIZED")
+                link, status = response.headers.get("Link"), response.status
+            return ApiResponse(_loads_json(body), link, status)
+        except (HTTPException, OSError) as error:
+            http_error = error if isinstance(error, HTTPError) else None
+            status = http_error.code if http_error is not None else None
+            delay = (
+                http_error.headers.get("Retry-After")
+                if status == 429 and http_error is not None and http_error.headers
+                else None
+            )
+            if http_error is not None:
+                http_error.close()
+            retryable = status is None or status >= 500 or delay == "0"
+            if method != "GET" or attempt or not retryable:
+                raise
+    raise AssertionError("bounded request loop exhausted")
 
 
 def _mapping(value: object, code: str) -> dict[str, object]:
@@ -930,7 +969,7 @@ def validate_pr_authority(
     token: str,
     api_url: str,
     *,
-    fetcher: Fetcher = _fetch_json,
+    fetcher: Fetcher = github_request_json,
     require_body: bool = True,
 ) -> Result:
     if not _valid_repository(repository) or not token or api_url != CANONICAL_API_URL:
@@ -983,7 +1022,7 @@ def validate_immutable_pr_authority(
     token: str,
     api_url: str,
     *,
-    fetcher: Fetcher = _fetch_json,
+    fetcher: Fetcher = github_request_json,
 ) -> Result:
     """Validate only commit-scoped authority for an external App check."""
     result = validate_pr_authority(
