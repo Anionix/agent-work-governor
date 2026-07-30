@@ -19,7 +19,8 @@ control `Cargo.lock` vendor closure and pinned RustSec database. The harness
 rejects candidate lock drift and Cargo configuration before execution; only the
 Cargo target and coordination lock files are writable by `nobody`.
 
-Each matrix job emits one sorted JSON object to its log and job summary:
+Each matrix job emits one sorted schema-`0.2` JSON object to its log and job
+summary:
 
 - `PARITY_EVIDENCE`: Plan, bounded execution, and Rust Verify all completed
   successfully.
@@ -30,8 +31,12 @@ Each matrix job emits one sorted JSON object to its log and job summary:
 The JSON binds the control and candidate SHA, candidate repository, candidate
 archive and store digests, packaged manifest digest, runner, workflow-run ID and
 attempt, legacy conclusion, trusted Rust-input digest, all stage exits,
-structured reason codes, and the plan, receipt, evidence-set, and Verify-report
-digests. Runtime receipts remain outside OKF.
+structured reason codes, the nullable trusted network-preflight stage, and the
+plan, receipt, evidence-set, and Verify-report digests. Runtime receipts remain
+outside OKF.
+
+Schema `0.2` adds `network_preflight_stage`; schema `0.1` shadow evidence did
+not contain that field.
 
 ## Promotion criteria
 

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import tomllib
 import unittest
 import zipfile
@@ -2038,6 +2039,9 @@ class SourceHygieneTests(unittest.TestCase):
             "SHADOW_REGRESSION",
             "SHADOW_INCONCLUSIVE",
             '"reason_codes"',
+            '"network_preflight_stage"',
+            '"network-candidate-start"',
+            'value.get("schema_version") != "0.2"',
             '"observed_check_outcomes"',
             '"rust_failure_diagnostics"',
             '"UNKNOWN_NONZERO"',
@@ -2075,6 +2079,82 @@ class SourceHygieneTests(unittest.TestCase):
         )
         self.assertIn("requires a separate Issue and protection-rule change", promotion)
         self.assertIn("never\nreplace the legacy gate", promotion)
+
+    def test_shadow_evidence_v02_bounds_network_stage(self) -> None:
+        workflow = (PLUGIN_ROOT / ".github/workflows/governor-shadow.yml").read_text()
+        embedded = workflow.split(
+            """<<'PYTHON' > "$output/shadow.json"\n""",
+            1,
+        )[1].split("\n          PYTHON\n", 1)[0]
+        script = textwrap.dedent(embedded)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output, runtime = root / "output", root / "runtime"
+            output.mkdir()
+            runtime.mkdir()
+            arguments = [
+                str(output),
+                str(runtime),
+                *(["x"] * 8),
+                "1",
+                "1",
+                "0",
+                "70",
+                "-1",
+            ]
+            expected_keys = [
+                "candidate_archive_sha256",
+                "candidate_head_sha",
+                "candidate_repository",
+                "candidate_store_sha256",
+                "control_manifest_sha256",
+                "control_sha",
+                "evidence_set_sha256",
+                "execution_plan_sha256",
+                "legacy_conclusion",
+                "network_preflight_stage",
+                "observed_check_outcomes",
+                "rust_failure_diagnostics",
+                "plan_report_sha256",
+                "reason_codes",
+                "receipt_sha256",
+                "rust_inputs_sha256",
+                "runner",
+                "schema_version",
+                "stage_exit",
+                "state",
+                "verify_report_sha256",
+                "workflow_run_attempt",
+                "workflow_run_id",
+            ]
+            fault = {
+                "code": "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+                "completed": [],
+                "failed": [],
+                "not_started": [],
+                "running": [],
+                "state": "HARNESS_FAULT",
+            }
+            for version, stage, expected in (
+                ("0.2", "network-candidate-start", "network-candidate-start"),
+                ("0.2", ["network-candidate-start"], None),
+                ("0.2", "candidate-controlled", None),
+                ("0.1", "network-candidate-start", None),
+            ):
+                with self.subTest(version=version, stage=stage):
+                    fault["schema_version"], fault["stage"] = version, stage
+                    (runtime / "run.json.fault.json").write_text(json.dumps(fault))
+                    process = subprocess.run(
+                        [sys.executable, "-c", script, *arguments],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(0, process.returncode, process.stderr)
+                    result = json.loads(process.stdout)
+                    self.assertCountEqual(expected_keys, result)
+                    self.assertEqual("0.2", result["schema_version"])
+                    self.assertEqual(expected, result["network_preflight_stage"])
 
     def test_split_rust_toolchain_lock_has_no_stale_references(self) -> None:
         stale_lock = "rust/toolchain" + ".lock.json"

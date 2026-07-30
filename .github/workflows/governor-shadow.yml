@@ -329,6 +329,38 @@ jobs:
                                   found.add(item[key])
               return found
 
+          # LLM contract: trusted fault v0.2 + fixed NetworkStage -> public
+          # shadow evidence | null; unknown schema or candidate text is ignored.
+          # Primary source: bundle:scripts/bounded_harness.py
+          def network_preflight_stage(value):
+              allowed = {
+                  "network-sandbox-select",
+                  "network-host-canaries",
+                  "network-candidate-start",
+                  "network-candidate-result",
+                  "network-trusted-start",
+                  "network-trusted-result",
+              }
+              fields = {
+                  "code",
+                  "completed",
+                  "failed",
+                  "not_started",
+                  "running",
+                  "schema_version",
+                  "stage",
+                  "state",
+              }
+              if (
+                  not isinstance(value, dict)
+                  or set(value) != fields
+                  or value.get("schema_version") != "0.2"
+                  or value.get("state") != "HARNESS_FAULT"
+              ):
+                  return None
+              stage = value.get("stage")
+              return stage if isinstance(stage, str) and stage in allowed else None
+
           # LLM contract: untrusted aggregate receipt -> bounded diagnostics;
           # only trusted Verify and stage exits determine the semantic state.
           # Primary source: https://github.com/slsa-framework/slsa/blob/ae7fc76215004e8fae250c877eff8919bf048e3b/spec/verifying-artifacts.md
@@ -468,6 +500,7 @@ jobs:
                   else None
               ),
               "legacy_conclusion": "success",
+              "network_preflight_stage": network_preflight_stage(fault),
               "observed_check_outcomes": observed_outcomes(receipt),
               "rust_failure_diagnostics": rust_failure_diagnostics(receipt),
               "plan_report_sha256": plan_digest,
@@ -475,7 +508,7 @@ jobs:
               "receipt_sha256": receipt_digest,
               "rust_inputs_sha256": rust_inputs_sha,
               "runner": runner,
-              "schema_version": "0.1",
+              "schema_version": "0.2",
               "stage_exit": exits,
               "state": state,
               "verify_report_sha256": verify_digest,

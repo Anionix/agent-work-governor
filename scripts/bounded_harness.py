@@ -73,6 +73,7 @@ NETWORK_FAULTS = frozenset(
 )
 NETWORK_BYPASS_EXIT = 81
 NETWORK_SETUP_EXIT = 82
+FAULT_SCHEMA_VERSION = "0.2"
 SANDBOX_READY = b"\x01"
 # LLM contract: OS_SANDBOX_ENTERED -> READY_BYTE -> CANDIDATE_EXEC;
 # missing readiness proves setup failure before candidate outcome evaluation.
@@ -85,10 +86,17 @@ CANDIDATE_EXEC = (
 
 
 class HarnessError(RuntimeError):
-    def __init__(self, code: str, failed: str | None = None) -> None:
+    def __init__(
+        self,
+        code: str,
+        failed: str | None = None,
+        *,
+        stage: NetworkStage | None = None,
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.failed = [failed] if failed else []
+        self.stage = stage
         self.completed: list[str] = []
         self.running: list[str] = []
         self.not_started: list[str] = []
@@ -104,6 +112,17 @@ class CheckPhase(StrEnum):
 class NetworkSandbox(StrEnum):
     LINUX = "linux"
     MACOS = "macos"
+
+
+# LLM contract: PRECHECK_TRANSITION -> FIXED_STAGE_TOKEN | NO_DIAGNOSTIC;
+# candidate output can never select or alter a fault stage.
+class NetworkStage(StrEnum):
+    SANDBOX_SELECT = "network-sandbox-select"
+    HOST_CANARIES = "network-host-canaries"
+    CANDIDATE_START = "network-candidate-start"
+    CANDIDATE_RESULT = "network-candidate-result"
+    TRUSTED_START = "network-trusted-start"
+    TRUSTED_RESULT = "network-trusted-result"
 
 
 @dataclass(frozen=True)
@@ -931,6 +950,7 @@ async def _spawn(
     sandbox: NetworkSandbox | None,
     *,
     allow_loopback: bool = False,
+    startup_failure: NetworkStage | None = None,
 ) -> asyncio.subprocess.Process:
     if identity is None:
         return await asyncio.create_subprocess_exec(
@@ -995,10 +1015,11 @@ async def _spawn(
         os.close(ready_write)
         ready_write = -1
         ready = await asyncio.wait_for(asyncio.to_thread(os.read, ready_read, 1), 2)
-        _require(
-            ready == SANDBOX_READY,
-            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
-        )
+        if ready != SANDBOX_READY:
+            raise HarnessError(
+                "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+                stage=startup_failure,
+            )
         return process
     except asyncio.CancelledError:
         if process is not None and process.returncode is None:
@@ -1010,8 +1031,13 @@ async def _spawn(
             _kill(process)
             await process.wait()
         if isinstance(error, HarnessError):
+            if startup_failure is not None and error.stage is None:
+                error.stage = startup_failure
             raise
-        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
+        raise HarnessError(
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+            stage=startup_failure,
+        ) from error
     finally:
         os.close(ready_read)
         if ready_write >= 0:
@@ -1027,13 +1053,16 @@ async def _verify_network_sandbox(
     # LLM contract: HOST_CAPABILITY_PROBED -> CANDIDATE_POLICY_PROVED ->
     # TRUSTED_LOOPBACK_PROVED | TYPED_NETWORK_FAULT. An unavailable native
     # IPv6 route only removes that host canary; it never authorizes candidates.
-    sandbox = _network_sandbox(identity)
-    if sandbox is None:
-        return None
+    stage = NetworkStage.SANDBOX_SELECT
+    sandbox: NetworkSandbox | None = None
     process: asyncio.subprocess.Process | None = None
     unix_path = runtime.receipt.parent / ".network-canary.sock"
     unix_path.unlink(missing_ok=True)
     try:
+        sandbox = _network_sandbox(identity)
+        if sandbox is None:
+            return None
+        stage = NetworkStage.HOST_CANARIES
         with ExitStack() as stack:
             route = stack.enter_context(
                 socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1083,6 +1112,7 @@ async def _verify_network_sandbox(
                         "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
                     )
             harness = Path(__file__).resolve(strict=True)
+            stage = NetworkStage.CANDIDATE_START
             process = await _spawn(
                 [
                     sys.executable,
@@ -1096,7 +1126,9 @@ async def _verify_network_sandbox(
                 None,
                 identity,
                 sandbox,
+                startup_failure=stage,
             )
+            stage = NetworkStage.CANDIDATE_RESULT
             output, _ = await asyncio.wait_for(process.communicate(), 5)
             _require(len(output) <= 4096, "HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
             if process.returncode == NETWORK_BYPASS_EXIT:
@@ -1108,6 +1140,7 @@ async def _verify_network_sandbox(
                 if native_ipv6 is not None
                 else ["-", "0", "0"]
             )
+            stage = NetworkStage.TRUSTED_START
             process = await _spawn(
                 [
                     sys.executable,
@@ -1128,24 +1161,37 @@ async def _verify_network_sandbox(
                 identity,
                 sandbox,
                 allow_loopback=True,
+                startup_failure=stage,
             )
+            stage = NetworkStage.TRUSTED_RESULT
             output, _ = await asyncio.wait_for(process.communicate(), 5)
             _require(len(output) <= 4096, "HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
             _require(
                 write_canary.read_bytes() == b"network-sandbox-write-ok",
                 "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
             )
-    except HarnessError:
+    except HarnessError as error:
+        if error.code in NETWORK_FAULTS and error.stage is None:
+            error.stage = stage
         raise
     except (OSError, TimeoutError, ValueError) as error:
         if process is not None and process.returncode is None:
             _kill(process)
             await process.wait()
-        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
+        raise HarnessError(
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+            stage=stage,
+        ) from error
     if process.returncode == NETWORK_BYPASS_EXIT:
-        raise HarnessError("HARNESS_NETWORK_SANDBOX_BYPASS_DETECTED")
+        raise HarnessError(
+            "HARNESS_NETWORK_SANDBOX_BYPASS_DETECTED",
+            stage=NetworkStage.TRUSTED_RESULT,
+        )
     if process.returncode != 0:
-        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
+        raise HarnessError(
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+            stage=NetworkStage.TRUSTED_RESULT,
+        )
     return sandbox
 
 
@@ -1569,7 +1615,8 @@ def _fault(receipt: Path, error: HarnessError) -> None:
                     "failed": error.failed,
                     "not_started": error.not_started,
                     "running": error.running,
-                    "schema_version": "0.1",
+                    "schema_version": FAULT_SCHEMA_VERSION,
+                    "stage": error.stage.value if error.stage is not None else None,
                     "state": "HARNESS_FAULT",
                 }
             ),

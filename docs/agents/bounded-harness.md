@@ -51,6 +51,12 @@ policy, setup fault, or observed bypass returns a stable network-sandbox fault
 with exit 70; the shadow workflow classifies it as inconclusive before
 candidate execution.
 
+Fault schema `0.2` keeps check identifiers in `failed` and reports network
+preflight position separately in nullable `stage`. Network stage values are
+fixed by the harness: `network-sandbox-select`, `network-host-canaries`,
+`network-candidate-start`, `network-candidate-result`, `network-trusted-start`,
+or `network-trusted-result`. Schema `0.1` faults did not contain `stage`.
+
 Example, with a trusted harness checkout:
 
 ```bash
