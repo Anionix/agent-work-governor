@@ -9,13 +9,15 @@ import unittest
 from contextlib import redirect_stdout
 from http.client import HTTPException, HTTPMessage, IncompleteRead
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from urllib.error import HTTPError, URLError
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_ROOT / "scripts"))
 
 import validate_pr_authority
+
+transport = validate_pr_authority
 
 # LLM-CONTRACT
 # id: agent-work-governor.live-pr-authority-tests
@@ -1099,6 +1101,149 @@ class AuthorityTests(unittest.TestCase):
                 "name: governor / authority"
             )
         self.assertEqual(1, contexts)
+
+
+# LLM-CONTRACT
+# id: agent-work-governor.github-rest-transport-tests
+# state: BOUNDED_FAKE_IO -> REQUEST_ATTEMPTS -> TYPED_EVIDENCE | TYPED_FAILURE
+# preconditions: build_opener is replaced before any request is issued
+# invariant: tests perform no network access and never expose token or body bytes
+# failure: unittest exposes retry, redirect, size, JSON, or method-policy drift
+# source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/urllib.error.rst
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: GitHubTransportTests
+# test: bundle:tests/test_pr_authority.py
+class GitHubTransportTests(unittest.TestCase):
+    url = "https://api.github.com/repos/Anionix/example"
+
+    def response(
+        self,
+        body: bytes = b"{}",
+        *,
+        status: int = 200,
+        link: str | None = None,
+    ) -> MagicMock:
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.geturl.return_value = self.url
+        response.read.return_value = body
+        response.status = status
+        response.headers = HTTPMessage()
+        if link is not None:
+            response.headers["Link"] = link
+        return response
+
+    def invoke(
+        self,
+        outcomes: list[object],
+        *,
+        url: str | None = None,
+        method: str = "GET",
+        token: str = "installation-token",
+        document: dict[str, object] | None = None,
+    ) -> tuple[transport.ApiResponse | Exception, MagicMock]:
+        opener = MagicMock()
+        opener.open.side_effect = outcomes
+        try:
+            with patch.object(transport, "build_opener", return_value=opener):
+                target = url or self.url
+                result = transport.github_request_json(target, token, method, document)
+        except (HTTPException, OSError, ValueError) as error:
+            return error, opener
+        return result, opener
+
+    def success(
+        self,
+        outcomes: list[object],
+    ) -> tuple[transport.ApiResponse, MagicMock]:
+        result, opener = self.invoke(outcomes)
+        if isinstance(result, Exception):
+            raise result
+        return result, opener
+
+    def test_transport_returns_typed_status_link_and_body(self) -> None:
+        link = '<https://api.github.com/repositories/1?page=2>; rel="next"'
+        response, opener = self.success(
+            [self.response(b'{"ok":true}', status=200, link=link)]
+        )
+        self.assertEqual(
+            ({"ok": True}, 200, link),
+            (response.document, response.status, response.link),
+        )
+        request = opener.open.call_args.args[0]
+        self.assertEqual("GET", request.get_method())
+        self.assertEqual(
+            "Bearer installation-token", request.get_header("Authorization")
+        )
+
+    def test_retryable_get_retries_once_then_succeeds(self) -> None:
+        retry_now = HTTPMessage()
+        retry_now["Retry-After"] = "0"
+        for first in (
+            URLError("offline"),
+            HTTPError(self.url, 429, "rate", retry_now, None),
+            HTTPError(self.url, 503, "service", HTTPMessage(), None),
+        ):
+            with self.subTest(error=type(first).__name__):
+                response, opener = self.success(
+                    [first, self.response(b'{"attempt":2}')]
+                )
+                self.assertEqual({"attempt": 2}, response.document)
+                self.assertEqual(2, opener.open.call_count)
+
+    def test_get_retry_exhaustion_is_bounded(self) -> None:
+        result, opener = self.invoke([TimeoutError(), TimeoutError()])
+        self.assertIsInstance(result, TimeoutError)
+        self.assertEqual(2, opener.open.call_count)
+
+    def test_nonretryable_http_errors_do_not_retry(self) -> None:
+        for status in (404, 410, 302, 429):
+            result, opener = self.invoke(
+                [HTTPError(self.url, status, "fixture", HTTPMessage(), None)]
+            )
+            self.assertEqual(status, getattr(result, "code", None))
+            self.assertEqual(1, opener.open.call_count)
+
+    def test_oversize_and_malformed_json_fail_without_retry(self) -> None:
+        cases = (
+            (
+                b"x" * (transport.MAX_RESPONSE_BYTES + 1),
+                "GITHUB_API_RESPONSE_OVERSIZED",
+            ),
+            (b"{", "Expecting property name"),
+        )
+        for body, code in cases:
+            result, opener = self.invoke([self.response(body)])
+            self.assertIn(code, str(result))
+            self.assertEqual(1, opener.open.call_count)
+
+    def test_post_and_patch_never_retry(self) -> None:
+        for method in ("POST", "PATCH"):
+            result, opener = self.invoke(
+                [URLError("offline"), self.response()],
+                method=method,
+                document={"stable": "external-id"},
+            )
+            self.assertIsInstance(result, URLError)
+            self.assertEqual(1, opener.open.call_count)
+
+    def test_failure_excludes_token_and_response_body(self) -> None:
+        token = "secret-installation-token"
+        result, _opener = self.invoke(
+            [self.response(b'{"secret-response":')],
+            token=token,
+        )
+        self.assertNotIn(token, str(result))
+        self.assertNotIn("secret-response", str(result))
+
+    def test_noncanonical_origin_fails_before_io(self) -> None:
+        for url in (
+            "https://example.com/repos/Anionix/example",
+            "http://api.github.com/repos/Anionix/example",
+        ):
+            result, opener = self.invoke([self.response()], url=url)
+            self.assertIn("GitHub API URL is not canonical", str(result))
+            self.assertEqual(0, opener.open.call_count)
 
 
 if __name__ == "__main__":

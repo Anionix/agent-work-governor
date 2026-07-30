@@ -11,24 +11,20 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import cast
 from urllib.parse import urlencode
-from urllib.request import Request, build_opener
 
 from validate_pr_authority import (
-    API_VERSION,
     CANONICAL_API_URL,
     MAX_GITHUB_ID,
-    MAX_RESPONSE_BYTES,
     REPOSITORY_RE,
     SHA_RE,
     Result,
     _event_identity,
     _load_event,
-    _loads_json,
-    _NoRedirect,
     _Reject,
     _Uncertain,
     validate_immutable_pr_authority,
 )
+from validate_pr_authority import github_request_json as _request_json
 
 # LLM-CONTRACT
 # id: agent-work-governor.external-app-authority-check
@@ -60,40 +56,6 @@ class CheckTarget:
 
 class PublishError(RuntimeError):
     """A check run could not be bound to the expected GitHub App."""
-
-
-def _request_json(
-    url: str,
-    method: str,
-    token: str,
-    document: JsonObject | None,
-) -> object:
-    payload = None
-    if document is not None:
-        payload = json.dumps(
-            document,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode("utf-8")
-    request = Request(
-        url,
-        data=payload,
-        method=method,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "User-Agent": "agent-work-governor/0.1",
-            "X-GitHub-Api-Version": API_VERSION,
-        },
-    )
-    with build_opener(_NoRedirect).open(request, timeout=10.0) as response:
-        if response.geturl() != url:
-            raise PublishError("APP_CHECK_REDIRECTED")
-        response_payload = response.read(MAX_RESPONSE_BYTES + 1)
-    if len(response_payload) > MAX_RESPONSE_BYTES:
-        raise PublishError("APP_CHECK_RESPONSE_OVERSIZED")
-    return _loads_json(response_payload)
 
 
 def _mapping(value: object) -> JsonObject:
@@ -130,9 +92,15 @@ class Publisher:
         document: JsonObject | None = None,
     ) -> object:
         try:
-            return self.requester(url, method, self.token, document)
+            response = self.requester(url, self.token, method, document)
+            return getattr(response, "document", response)
         except PublishError:
             raise
+        except ValueError as error:
+            code = str(error).replace("GITHUB_API", "APP_CHECK", 1)
+            if code not in {"APP_CHECK_REDIRECTED", "APP_CHECK_RESPONSE_OVERSIZED"}:
+                code = "APP_CHECK_API_ERROR"
+            raise PublishError(code) from error
         except Exception as error:
             raise PublishError("APP_CHECK_API_ERROR") from error
 
