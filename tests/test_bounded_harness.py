@@ -742,6 +742,7 @@ class BoundedHarnessTests(unittest.TestCase):
             allow_loopback=True,
         )
         self.assertNotIn("(allow network-", candidate[2])
+        self.assertIn('(import "dyld-support.sb")', candidate[2])
         self.assertNotIn("\n(allow file-read*)\n", candidate[2])
         self.assertIn(f'(subpath "{self.root}")', candidate[2])
         self.assertIn('(subpath "/nix/store")', candidate[2])

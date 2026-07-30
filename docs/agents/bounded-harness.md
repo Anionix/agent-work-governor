@@ -85,6 +85,7 @@ Primary sources:
 - [Linux `IORING_OP_SOCKET` ABI](https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/io_uring.h)
 - [XNU socket-connect MAC hook](https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/security/mac_socket.c#L147-L164)
 - [Bubblewrap sandbox model](https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/README.md#sandboxing)
-- Apple-shipped `sandbox-exec(1)` plus
+- [Apple dyld shared-cache discovery](https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/DyldProcessConfig.cpp#L1107-L1125)
+- Apple-shipped `sandbox-exec(1)` and `dyld-support.sb` plus
   `/usr/share/sandbox/com.apple.CommCenter.sb` (`remote ip "localhost:*"`) and
   `/usr/share/sandbox/mds_stores.sb` (`file-read* (subpath ...)`)

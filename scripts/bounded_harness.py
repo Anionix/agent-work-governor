@@ -502,8 +502,10 @@ def _macos_profile(
     # CANDIDATE -> NO_NETWORK_RULES. Host-shared loopback is never exposed to
     # candidate bytes because an ambient localhost broker could relay egress.
     # Primary sources: Apple-shipped sandbox-exec(1),
+    # /System/Library/Sandbox/Profiles/dyld-support.sb (process bootstrap),
     # /usr/share/sandbox/com.apple.CommCenter.sb (remote localhost filter), and
     # /usr/share/sandbox/mds_stores.sb (file-read subpath filter).
+    # https://github.com/apple-oss-distributions/dyld/blob/fd8d0c4d52320ebf64db34f3cb280310d905c5ae/dyld/DyldProcessConfig.cpp#L1107-L1125
     # https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/security/mac_socket.c#L147-L164
     readable = [
         Path("/nix/store"),
@@ -542,6 +544,7 @@ def _macos_profile(
     return f"""
 (version 1)
 (deny default)
+(import "dyld-support.sb")
 (allow process-exec process-fork)
 (allow process-info* (target same-sandbox))
 (allow signal (target same-sandbox))
