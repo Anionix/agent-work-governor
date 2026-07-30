@@ -55,14 +55,20 @@ policy, setup fault, or observed bypass returns a stable network-sandbox fault
 with exit 70; the shadow workflow classifies it as inconclusive before
 candidate execution.
 
-Fault schema `0.2` keeps check identifiers in `failed` and reports network
-preflight position separately in nullable `stage`. Network stage values are
-fixed by the harness: `network-sandbox-select`, `network-host-canaries`,
+Fault schema `0.3` keeps check identifiers in `failed`, reports network
+preflight position separately in nullable `stage`, and may bind
+`launcher_diagnostic_sha256` to the complete newline-terminated first
+trusted-launcher line observed before READY. The harness never emits the raw
+line, never digests EOF-partial or oversized output, and launches candidate
+bytes only after READY.
+Network stage values are fixed by the harness: `network-sandbox-select`,
+`network-host-canaries`,
 `network-candidate-{start,create,ready-eof,ready-output,ready-timeout,result}`,
 `network-candidate-linux-loopback-rtnetlink-eperm`,
 `network-trusted-{start,create,ready-eof,ready-output,ready-timeout,result}`, or
 `network-trusted-linux-loopback-rtnetlink-eperm`.
-Schema `0.1` faults did not contain `stage`.
+Schema `0.2` faults did not contain `launcher_diagnostic_sha256`; schema `0.1`
+faults did not contain `stage`.
 
 Example, with a trusted harness checkout:
 

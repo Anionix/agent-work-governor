@@ -73,7 +73,7 @@ NETWORK_FAULTS = frozenset(
 )
 NETWORK_BYPASS_EXIT = 81
 NETWORK_SETUP_EXIT = 82
-FAULT_SCHEMA_VERSION = "0.2"
+FAULT_SCHEMA_VERSION = "0.3"
 SANDBOX_READY = b"\x01"
 BWRAP_LOOPBACK_RTM_NEWADDR_EPERM = (
     b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
@@ -95,11 +95,13 @@ class HarnessError(RuntimeError):
         failed: str | None = None,
         *,
         stage: NetworkStage | None = None,
+        launcher_diagnostic_sha256: str | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.failed = [failed] if failed else []
         self.stage = stage
+        self.launcher_diagnostic_sha256 = launcher_diagnostic_sha256
         self.completed: list[str] = []
         self.running: list[str] = []
         self.not_started: list[str] = []
@@ -160,28 +162,32 @@ def _startup_stage(
     return NetworkStage(f"{stage.value.removesuffix('-start')}-{reason}")
 
 
-def _startup_reason(
+def _startup_observation(
     sandbox: NetworkSandbox,
     observed: bytes,
     *,
     line_complete: bool,
-) -> Literal["ready-eof", "ready-output", "linux-loopback-rtnetlink-eperm"]:
+) -> tuple[
+    Literal["ready-eof", "ready-output", "linux-loopback-rtnetlink-eperm"],
+    str | None,
+]:
     # LLM contract: NO_READY_BYTE + COMPLETE_BOUNDED_TRUSTED_LAUNCHER_LINE ->
-    # FIXED_TOKEN; partial lines stay generic, and candidate bytes run only
-    # after READY so they can never select this diagnostic.
+    # FIXED_TOKEN + DIAGNOSTIC_DIGEST; partial lines stay generic and undigested,
+    # while candidate bytes run only after READY and can never select either.
     # Primary source:
     # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/network.c#L137-L182
     if observed == b"":
-        return "ready-eof"
+        return "ready-eof", None
     if not line_complete:
-        return "ready-output"
+        return "ready-output", None
     first_line = observed.split(b"\n", 1)[0].rstrip(b"\r")
+    digest = hashlib.sha256(first_line).hexdigest()
     if (
         sandbox == NetworkSandbox.LINUX
         and first_line == BWRAP_LOOPBACK_RTM_NEWADDR_EPERM
     ):
-        return "linux-loopback-rtnetlink-eperm"
-    return "ready-output"
+        return "linux-loopback-rtnetlink-eperm", digest
+    return "ready-output", digest
 
 
 @dataclass(frozen=True)
@@ -1089,14 +1095,13 @@ async def _spawn(
             ) from error
         if ready != SANDBOX_READY:
             observed = ready
-            line_complete = ready == b""
-            if ready and sandbox == NetworkSandbox.LINUX:
+            line_complete = ready in {b"", b"\n"}
+            if ready and not line_complete:
                 try:
                     async with asyncio.timeout(0.25):
                         while len(observed) < 256:
                             chunk = await process.stdout.read(1)
                             if chunk == b"":
-                                line_complete = True
                                 break
                             observed += chunk
                             if chunk == b"\n":
@@ -1104,15 +1109,19 @@ async def _spawn(
                                 break
                 except TimeoutError:
                     pass
+            reason, diagnostic_sha256 = _startup_observation(
+                sandbox,
+                observed,
+                line_complete=line_complete,
+            )
             raise HarnessError(
                 "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
                 stage=_startup_stage(
                     startup_failure,
-                    _startup_reason(
-                        sandbox,
-                        observed,
-                        line_complete=line_complete,
-                    ),
+                    reason,
+                ),
+                launcher_diagnostic_sha256=(
+                    diagnostic_sha256 if startup_failure is not None else None
                 ),
             )
         return process
@@ -1705,6 +1714,7 @@ def _fault(receipt: Path, error: HarnessError) -> None:
                     "code": error.code,
                     "completed": error.completed,
                     "failed": error.failed,
+                    "launcher_diagnostic_sha256": (error.launcher_diagnostic_sha256),
                     "not_started": error.not_started,
                     "running": error.running,
                     "schema_version": FAULT_SCHEMA_VERSION,

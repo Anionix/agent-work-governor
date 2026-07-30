@@ -871,10 +871,66 @@ class BoundedHarnessTests(unittest.TestCase):
             self.root / "artifacts",
             self.root / "tmp",
         )
+        known_digest = hashlib.sha256(
+            harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM
+        ).hexdigest()
         cases = (
-            ("create", OSError(), harness.NetworkStage.CANDIDATE_CREATE),
-            ("ready-eof", b"", harness.NetworkStage.CANDIDATE_READY_EOF),
-            ("ready-output", b"x", harness.NetworkStage.CANDIDATE_READY_OUTPUT),
+            (
+                "create",
+                OSError(),
+                harness.NetworkStage.CANDIDATE_CREATE,
+                None,
+                harness.NetworkStage.CANDIDATE_START,
+            ),
+            (
+                "ready-eof",
+                b"",
+                harness.NetworkStage.CANDIDATE_READY_EOF,
+                None,
+                harness.NetworkStage.CANDIDATE_START,
+            ),
+            (
+                "first-byte-newline",
+                b"\n",
+                harness.NetworkStage.CANDIDATE_READY_OUTPUT,
+                hashlib.sha256(b"").hexdigest(),
+                harness.NetworkStage.CANDIDATE_START,
+            ),
+            (
+                "oversized",
+                tuple(bytes((byte,)) for byte in b"x" * 256),
+                harness.NetworkStage.CANDIDATE_READY_OUTPUT,
+                None,
+                harness.NetworkStage.CANDIDATE_START,
+            ),
+            (
+                "generic-newline",
+                tuple(bytes((byte,)) for byte in b"generic\n"),
+                harness.NetworkStage.CANDIDATE_READY_OUTPUT,
+                hashlib.sha256(b"generic").hexdigest(),
+                harness.NetworkStage.CANDIDATE_START,
+            ),
+            (
+                "macos-newline",
+                tuple(bytes((byte,)) for byte in b"macos\n"),
+                harness.NetworkStage.CANDIDATE_READY_OUTPUT,
+                hashlib.sha256(b"macos").hexdigest(),
+                harness.NetworkStage.CANDIDATE_START,
+            ),
+            (
+                "generic-eof-partial",
+                (*tuple(bytes((byte,)) for byte in b"generic"), b""),
+                harness.NetworkStage.CANDIDATE_READY_OUTPUT,
+                None,
+                harness.NetworkStage.CANDIDATE_START,
+            ),
+            (
+                "bounded-eof-partial",
+                (*tuple(bytes((byte,)) for byte in b"x" * 255), b""),
+                harness.NetworkStage.CANDIDATE_READY_OUTPUT,
+                None,
+                harness.NetworkStage.CANDIDATE_START,
+            ),
             (
                 "linux-loopback-rtnetlink-eperm",
                 tuple(
@@ -882,14 +938,25 @@ class BoundedHarnessTests(unittest.TestCase):
                     for byte in harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM + b"\n"
                 ),
                 harness.NetworkStage.CANDIDATE_LINUX_LOOPBACK_RTMNETLINK_EPERM,
+                known_digest,
+                harness.NetworkStage.CANDIDATE_START,
             ),
             (
                 "ready-timeout",
                 TimeoutError(),
                 harness.NetworkStage.CANDIDATE_READY_TIMEOUT,
+                None,
+                harness.NetworkStage.CANDIDATE_START,
+            ),
+            (
+                "ordinary-complete",
+                tuple(bytes((byte,)) for byte in b"candidate-derived\n"),
+                None,
+                None,
+                None,
             ),
         )
-        for name, observed, expected in cases:
+        for name, observed, expected_stage, expected_digest, startup_failure in cases:
             with self.subTest(name=name):
                 stdout = mock.AsyncMock()
                 process = SimpleNamespace(returncode=1, stdout=stdout)
@@ -922,17 +989,32 @@ class BoundedHarnessTests(unittest.TestCase):
                             runtime,
                             None,
                             harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
-                            harness.NetworkSandbox.LINUX,
-                            startup_failure=harness.NetworkStage.CANDIDATE_START,
+                            (
+                                harness.NetworkSandbox.MACOS
+                                if name == "macos-newline"
+                                else harness.NetworkSandbox.LINUX
+                            ),
+                            startup_failure=startup_failure,
                         )
                     )
                 self.assertEqual(
                     "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
                     raised.exception.code,
                 )
-                self.assertEqual(expected, raised.exception.stage)
+                self.assertEqual(expected_stage, raised.exception.stage)
                 self.assertEqual([], raised.exception.failed)
+                self.assertEqual(
+                    expected_digest,
+                    raised.exception.launcher_diagnostic_sha256,
+                )
+                if name == "first-byte-newline":
+                    self.assertEqual(1, stdout.read.await_count)
 
+        known_reason, observed_digest = harness._startup_observation(
+            harness.NetworkSandbox.LINUX,
+            harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM + b"\n",
+            line_complete=True,
+        )
         self.assertEqual(
             harness.NetworkStage.TRUSTED_READY_EOF,
             harness._startup_stage(harness.NetworkStage.TRUSTED_START, "ready-eof"),
@@ -941,32 +1023,40 @@ class BoundedHarnessTests(unittest.TestCase):
             harness.NetworkStage.CANDIDATE_LINUX_LOOPBACK_RTMNETLINK_EPERM,
             harness._startup_stage(
                 harness.NetworkStage.CANDIDATE_START,
-                harness._startup_reason(
-                    harness.NetworkSandbox.LINUX,
-                    harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM + b"\n",
-                    line_complete=True,
-                ),
+                known_reason,
             ),
         )
         self.assertEqual(
-            "ready-output",
-            harness._startup_reason(
+            known_digest,
+            observed_digest,
+        )
+        self.assertEqual(
+            (
+                "ready-output",
+                hashlib.sha256(b"untrusted").hexdigest(),
+            ),
+            harness._startup_observation(
                 harness.NetworkSandbox.MACOS,
                 b"untrusted",
                 line_complete=True,
             ),
         )
         self.assertEqual(
-            "ready-output",
-            harness._startup_reason(
+            (
+                "ready-output",
+                hashlib.sha256(
+                    harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM + b"-candidate"
+                ).hexdigest(),
+            ),
+            harness._startup_observation(
                 harness.NetworkSandbox.LINUX,
                 harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM + b"-candidate\n",
                 line_complete=True,
             ),
         )
         self.assertEqual(
-            "ready-output",
-            harness._startup_reason(
+            ("ready-output", None),
+            harness._startup_observation(
                 harness.NetworkSandbox.LINUX,
                 harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM,
                 line_complete=False,
@@ -1009,6 +1099,7 @@ class BoundedHarnessTests(unittest.TestCase):
                     "code",
                     "completed",
                     "failed",
+                    "launcher_diagnostic_sha256",
                     "not_started",
                     "running",
                     "schema_version",
@@ -1020,6 +1111,7 @@ class BoundedHarnessTests(unittest.TestCase):
             self.assertEqual(harness.FAULT_SCHEMA_VERSION, fault["schema_version"])
             self.assertEqual(harness.NetworkStage.SANDBOX_SELECT.value, fault["stage"])
             self.assertEqual([], fault["failed"])
+            self.assertIsNone(fault["launcher_diagnostic_sha256"])
 
     def test_output_overflow_is_an_explicit_partial_fault(self) -> None:
         self.receipt.parent.mkdir(parents=True)

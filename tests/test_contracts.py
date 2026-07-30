@@ -2039,11 +2039,12 @@ class SourceHygieneTests(unittest.TestCase):
             "SHADOW_REGRESSION",
             "SHADOW_INCONCLUSIVE",
             '"reason_codes"',
+            '"launcher_diagnostic_sha256"',
             '"network_preflight_stage"',
             '"network-candidate-start"',
             '"network-candidate-ready-eof"',
             '"network-candidate-linux-loopback-rtnetlink-eperm"',
-            'value.get("schema_version") != "0.2"',
+            'value.get("schema_version") != "0.3"',
             '"observed_check_outcomes"',
             '"rust_failure_diagnostics"',
             '"UNKNOWN_NONZERO"',
@@ -2082,7 +2083,7 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertIn("requires a separate Issue and protection-rule change", promotion)
         self.assertIn("never\nreplace the legacy gate", promotion)
 
-    def test_shadow_evidence_v02_bounds_network_stage(self) -> None:
+    def test_shadow_evidence_v03_bounds_launcher_diagnostics(self) -> None:
         workflow = (PLUGIN_ROOT / ".github/workflows/governor-shadow.yml").read_text()
         embedded = workflow.split(
             """<<'PYTHON' > "$output/shadow.json"\n""",
@@ -2114,6 +2115,7 @@ class SourceHygieneTests(unittest.TestCase):
                 "evidence_set_sha256",
                 "execution_plan_sha256",
                 "legacy_conclusion",
+                "launcher_diagnostic_sha256",
                 "network_preflight_stage",
                 "observed_check_outcomes",
                 "rust_failure_diagnostics",
@@ -2129,22 +2131,79 @@ class SourceHygieneTests(unittest.TestCase):
                 "workflow_run_attempt",
                 "workflow_run_id",
             ]
-            fault = {
+            fault: dict[str, object] = {
                 "code": "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
                 "completed": [],
                 "failed": [],
+                "launcher_diagnostic_sha256": None,
                 "not_started": [],
                 "running": [],
                 "state": "HARNESS_FAULT",
             }
-            for version, stage, expected in (
-                ("0.2", "network-candidate-start", "network-candidate-start"),
-                ("0.2", ["network-candidate-start"], None),
-                ("0.2", "candidate-controlled", None),
-                ("0.1", "network-candidate-start", None),
+            for version, stage, digest, expected_stage, expected_digest in (
+                (
+                    "0.3",
+                    "network-candidate-ready-output",
+                    "a" * 64,
+                    "network-candidate-ready-output",
+                    "a" * 64,
+                ),
+                ("0.3", "network-candidate-start", "a" * 64, None, None),
+                ("0.3", ["network-candidate-start"], "a" * 64, None, None),
+                ("0.3", "candidate-controlled", "a" * 64, None, None),
+                ("0.3", "network-candidate-start", "A" * 64, None, None),
+                ("0.3", "network-candidate-start", "candidate", None, None),
+                ("0.3", None, "a" * 64, None, None),
+                ("0.3", "network-candidate-ready-eof", "a" * 64, None, None),
+                ("0.3", "network-candidate-result", "a" * 64, None, None),
+                (
+                    "0.3",
+                    "network-candidate-linux-loopback-rtnetlink-eperm",
+                    None,
+                    None,
+                    None,
+                ),
+                (
+                    "0.3",
+                    "network-candidate-linux-loopback-rtnetlink-eperm",
+                    "a" * 64,
+                    None,
+                    None,
+                ),
+                (
+                    "0.3",
+                    "network-candidate-linux-loopback-rtnetlink-eperm",
+                    hashlib.sha256(
+                        b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
+                    ).hexdigest(),
+                    "network-candidate-linux-loopback-rtnetlink-eperm",
+                    hashlib.sha256(
+                        b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
+                    ).hexdigest(),
+                ),
+                (
+                    "0.3",
+                    "network-trusted-ready-output",
+                    "b" * 64,
+                    None,
+                    None,
+                ),
+                ("0.2", "network-candidate-start", None, None, None),
             ):
-                with self.subTest(version=version, stage=stage):
+                code = (
+                    "HARNESS_INTERRUPTED"
+                    if stage == "network-trusted-ready-output"
+                    else "HARNESS_NETWORK_SANDBOX_SETUP_FAILED"
+                )
+                with self.subTest(
+                    version=version,
+                    stage=stage,
+                    digest=digest,
+                    code=code,
+                ):
+                    fault["code"] = code
                     fault["schema_version"], fault["stage"] = version, stage
+                    fault["launcher_diagnostic_sha256"] = digest
                     (runtime / "run.json.fault.json").write_text(json.dumps(fault))
                     process = subprocess.run(
                         [sys.executable, "-c", script, *arguments],
@@ -2155,8 +2214,15 @@ class SourceHygieneTests(unittest.TestCase):
                     self.assertEqual(0, process.returncode, process.stderr)
                     result = json.loads(process.stdout)
                     self.assertCountEqual(expected_keys, result)
-                    self.assertEqual("0.2", result["schema_version"])
-                    self.assertEqual(expected, result["network_preflight_stage"])
+                    self.assertEqual("0.3", result["schema_version"])
+                    self.assertEqual(
+                        expected_stage,
+                        result["network_preflight_stage"],
+                    )
+                    self.assertEqual(
+                        expected_digest,
+                        result["launcher_diagnostic_sha256"],
+                    )
 
     def test_split_rust_toolchain_lock_has_no_stale_references(self) -> None:
         stale_lock = "rust/toolchain" + ".lock.json"
