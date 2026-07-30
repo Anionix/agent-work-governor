@@ -67,7 +67,7 @@ class DuplicateJsonKey(ValueError):
     """Raised before JSON object keys can overwrite one another."""
 
 
-def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+def unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
@@ -224,7 +224,7 @@ def validate_catalog(
     try:
         document = json.loads(
             path.read_text(encoding="utf-8"),
-            object_pairs_hook=_unique_object,
+            object_pairs_hook=unique_json_object,
         )
     except DuplicateJsonKey as error:
         return {}, [_finding("TOOLCHAIN_DUPLICATE_JSON_KEY", field=str(error))]

@@ -1,13 +1,17 @@
 //! Public-interface and dry-run integration tests.
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::symlink;
 use std::process::Command;
+use std::sync::LazyLock;
 
 use agent_work_governor::{
     CheckReport, CheckRequest, EvidenceArtifact, Governor, MAX_CHECK_OUTPUT_BYTES,
     OwnerScopeVerification, PlanAction, PlanBindings, PlanProject, Preset, Status,
 };
+use common::toolchain_sha256;
 use tempfile::tempdir;
 
 // LLM-CONTRACT
@@ -393,7 +397,7 @@ fn bootstrap_rejects_a_regular_file_repository() -> Result<(), Box<dyn std::erro
 const REPOSITORY_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const REVISION_SHA256: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 const POLICY_SHA256: &str = "3333333333333333333333333333333333333333333333333333333333333333";
-const TOOLCHAIN_SHA256: &str = "07563cabf73829235b84d0a9f413f863197f0d77fc1989fcca1787f40b35502e";
+static TOOLCHAIN_SHA256: LazyLock<String> = LazyLock::new(toolchain_sha256);
 const ENVIRONMENT_SHA256: &str = "5555555555555555555555555555555555555555555555555555555555555555";
 
 fn plan_bindings(values: [&str; 5]) -> PlanBindings {
@@ -405,7 +409,7 @@ fn valid_plan_bindings() -> PlanBindings {
         REPOSITORY_SHA256,
         REVISION_SHA256,
         POLICY_SHA256,
-        TOOLCHAIN_SHA256,
+        TOOLCHAIN_SHA256.as_str(),
         ENVIRONMENT_SHA256,
     ])
 }
@@ -430,7 +434,7 @@ fn assert_plan_cli_matches_library(
             "--policy-sha256",
             POLICY_SHA256,
             "--toolchain-sha256",
-            TOOLCHAIN_SHA256,
+            TOOLCHAIN_SHA256.as_str(),
             "--environment-sha256",
             ENVIRONMENT_SHA256,
         ])
@@ -498,7 +502,7 @@ fn verify_cli_matches_the_fail_closed_library_report() -> Result<(), Box<dyn std
                 "--policy-sha256",
                 POLICY_SHA256,
                 "--toolchain-sha256",
-                TOOLCHAIN_SHA256,
+                TOOLCHAIN_SHA256.as_str(),
                 "--environment-sha256",
                 ENVIRONMENT_SHA256,
                 "--expected-harness-sha256",
@@ -589,7 +593,7 @@ fn malformed_bindings_and_toolchain_drift_fail_without_a_plan()
         REPOSITORY_SHA256,
         REVISION_SHA256,
         POLICY_SHA256,
-        TOOLCHAIN_SHA256,
+        TOOLCHAIN_SHA256.as_str(),
         ENVIRONMENT_SHA256,
     ];
     for index in 0..valid.len() {

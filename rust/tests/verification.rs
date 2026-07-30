@@ -1,14 +1,16 @@
 //! Public aggregate run-receipt verification tests.
 
-use std::error::Error;
+mod common;
+
+use std::{error::Error, sync::LazyLock};
 
 use agent_work_governor::{
     CheckOutcome, CheckReceipt, CheckReport, CheckRequest, EvidenceArtifact, Governor,
     MAX_CHECK_OUTPUT_BYTES, MAX_RUN_RECEIPT_BYTES, PlanBindings, PlanProject, RunReceipt, Status,
     VerificationOutcome, VerificationReason, VerificationReport,
 };
+use common::{sha256_hex, toolchain_sha256};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 // LLM-CONTRACT
 // id: agent-work-governor.receipt-verification-tests
@@ -24,7 +26,7 @@ use sha2::{Digest, Sha256};
 const REPOSITORY_SHA256: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const REVISION_SHA256: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 const POLICY_SHA256: &str = "3333333333333333333333333333333333333333333333333333333333333333";
-const TOOLCHAIN_SHA256: &str = "07563cabf73829235b84d0a9f413f863197f0d77fc1989fcca1787f40b35502e";
+static TOOLCHAIN_SHA256: LazyLock<String> = LazyLock::new(toolchain_sha256);
 const ENVIRONMENT_SHA256: &str = "5555555555555555555555555555555555555555555555555555555555555555";
 const HARNESS_SHA256: &str = "6666666666666666666666666666666666666666666666666666666666666666";
 const INVOCATION_SHA256: &str = "7777777777777777777777777777777777777777777777777777777777777777";
@@ -44,7 +46,7 @@ fn bindings() -> PlanBindings {
         REPOSITORY_SHA256,
         REVISION_SHA256,
         POLICY_SHA256,
-        TOOLCHAIN_SHA256,
+        TOOLCHAIN_SHA256.as_str(),
         ENVIRONMENT_SHA256,
     )
 }
@@ -53,16 +55,6 @@ fn project() -> PlanProject {
     PlanProject::RustCargoWorkspace {
         working_directory: ".".into(),
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
 }
 
 fn valid_fixture() -> Result<Fixture, Box<dyn Error>> {
@@ -571,7 +563,7 @@ fn malformed_oversized_or_self_authorizing_receipts_never_pass() -> Result<(), B
         "invalid",
         REVISION_SHA256,
         POLICY_SHA256,
-        TOOLCHAIN_SHA256,
+        TOOLCHAIN_SHA256.as_str(),
         ENVIRONMENT_SHA256,
     );
     let (plan_rejected, succeeded) = verify_bytes(
