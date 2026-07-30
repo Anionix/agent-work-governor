@@ -37,7 +37,7 @@ extra-paths = ["./scripts"]
 [tool.pyrefly]
 # LLM contract: repository Python sources -> one host-independent analysis graph.
 # Primary source: https://github.com/facebook/pyrefly/blob/b87de05834c401898c79fd9686b806c051dd3667/website/docs/configuration.mdx
-project-includes = ["scripts/**/*.py", "tests/**/*.py"]
+project-includes = ["scripts/**/*.py", "tests/**/*.py", "rust/tests/fixtures/*.py"]
 python-platform = "linux"
 python-version = "3.14"
 search-path = ["scripts"]

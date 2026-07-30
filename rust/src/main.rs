@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use agent_work_governor::{
     CheckRequest, EffectiveAuthority, EvidenceArtifact, Governor, MAX_CHECK_OUTPUT_BYTES,
     MAX_RUN_RECEIPT_BYTES, OwnerScopeInput, PlanBindings, PlanProject, Preset,
+    RepositoryPolicySnapshot, evaluate_owner_scope,
 };
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -41,6 +42,15 @@ enum Command {
         /// Plugin source or installed bundle root.
         #[arg(long)]
         plugin_root: Option<PathBuf>,
+        /// Repository-external owner-scope evidence and caller grants.
+        #[command(flatten)]
+        owner_scope: CliOwnerScope,
+    },
+    /// Evaluate only the signed owner-scope authority boundary.
+    OwnerScope {
+        /// Governed repository root.
+        #[arg(long)]
+        repo: PathBuf,
         /// Repository-external owner-scope evidence and caller grants.
         #[command(flatten)]
         owner_scope: CliOwnerScope,
@@ -383,6 +393,7 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
                 owner_scope: owner_scope.into_model(),
             }
         }
+        Command::OwnerScope { repo, owner_scope } => return run_owner_scope(&repo, owner_scope),
         Command::Policy { policy } => CheckRequest::Policy { path: policy },
         Command::Contract {
             path,
@@ -430,6 +441,18 @@ fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     };
 
     let report = Governor.check(request)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(if report.succeeded() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
+}
+
+fn run_owner_scope(repository: &Path, owner_scope: CliOwnerScope) -> anyhow::Result<ExitCode> {
+    let input = owner_scope.into_model();
+    let snapshot = RepositoryPolicySnapshot::load(repository)?;
+    let report = evaluate_owner_scope(&snapshot, input.as_ref());
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(if report.succeeded() {
         ExitCode::SUCCESS

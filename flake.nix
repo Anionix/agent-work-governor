@@ -711,6 +711,13 @@
         pkgs:
         let
           toolchain = mkToolchain pkgs;
+          rustPlatform = pkgs.makeRustPlatform {
+            cargo = toolchain.rust;
+            rustc = toolchain.rust;
+          };
+          cargoVendor = rustPlatform.importCargoLock {
+            lockFile = ./rust/Cargo.lock;
+          };
         in
         {
           default = pkgs.mkShellNoCC {
@@ -740,6 +747,16 @@
               export UV_TOOL_DIR="$PWD/.governance/cache/uv-tools"
               export XDG_CACHE_HOME="$PWD/.governance/cache/xdg"
               mkdir -p "$CARGO_HOME" "$UV_CACHE_DIR" "$UV_TOOL_DIR" "$XDG_CACHE_HOME"
+              # LLM contract: isolated Cargo home + locked vendor closure ->
+              # offline differential execution or an immediate dependency failure.
+              cat > "$CARGO_HOME/config.toml" <<'CARGO_CONFIG'
+              [source.crates-io]
+              replace-with = "vendored-sources"
+              [source.vendored-sources]
+              directory = "${cargoVendor}"
+              [net]
+              offline = true
+              CARGO_CONFIG
             '';
           };
         }

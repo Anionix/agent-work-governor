@@ -23,8 +23,8 @@ pub use model::{
 };
 pub use okf::OkfStatus;
 pub use owner_scope::{
-    EffectiveAuthority, OwnerScopeFailure, OwnerScopeInput, ValidatedPolicyAuthority,
-    verify_owner_scope,
+    EffectiveAuthority, OwnerScopeFailure, OwnerScopeInput, OwnerScopeReport,
+    RepositoryPolicySnapshot, evaluate_owner_scope,
 };
 pub use planning::{PlanBindings, PlanProject, PlanReport};
 use thiserror::Error;
@@ -98,11 +98,18 @@ impl Governor {
                 repo,
                 plugin_root,
                 owner_scope,
-            } => Ok(CheckReport::Repository(check_repository(
-                &repo,
-                &plugin_root,
-                owner_scope.as_ref(),
-            )?)),
+            } => {
+                let snapshot =
+                    RepositoryPolicySnapshot::load(&repo).map_err(|error| GovernorError::Read {
+                        path: repo,
+                        source: std::io::Error::other(error.to_string()),
+                    })?;
+                Ok(CheckReport::Repository(self.check_repository(
+                    &snapshot,
+                    &plugin_root,
+                    owner_scope.as_ref(),
+                )?))
+            }
             CheckRequest::Plan { bindings, project } => {
                 Ok(CheckReport::Plan(planning::build_plan(bindings, project)?))
             }
@@ -123,19 +130,30 @@ impl Governor {
             )?)),
         }
     }
+
+    /// Check one repository through an already captured policy/identity snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GovernorError`] when a non-authority input cannot be read.
+    pub fn check_repository(
+        &self,
+        snapshot: &RepositoryPolicySnapshot,
+        plugin_root: &Path,
+        owner_scope: Option<&OwnerScopeInput>,
+    ) -> Result<RepositoryReport, GovernorError> {
+        check_repository(snapshot, plugin_root, owner_scope)
+    }
 }
 
 fn check_repository(
-    repo: &Path,
+    snapshot: &RepositoryPolicySnapshot,
     plugin_root: &Path,
     owner_scope_input: Option<&OwnerScopeInput>,
 ) -> Result<RepositoryReport, GovernorError> {
-    let canonical_repo = repo.canonicalize().map_err(|source| GovernorError::Read {
-        path: repo.to_path_buf(),
-        source,
-    })?;
+    let canonical_repo = snapshot.repository().to_path_buf();
     let policy_path = canonical_repo.join(".agent-work-governor/policy.toml");
-    let (policy, policy_authority) = policy::evaluate_policy(&policy_path)?;
+    let policy = policy::evaluate_policy_snapshot(&policy_path, snapshot.policy_bytes());
     let okf = okf::validate_bundle(&plugin_root.join("knowledge"))?;
     let mut findings = policy.findings;
 
@@ -153,8 +171,8 @@ fn check_repository(
     let mut owner_scope_verification = OwnerScopeVerification::NotApplicable;
     let mut effective_authority = EffectiveAuthority::default();
     if owner_scope {
-        match (owner_scope_input, policy_authority.as_ref()) {
-            (None, _) => {
+        match owner_scope_input {
+            None => {
                 owner_scope_verification = OwnerScopeVerification::Required;
                 findings.push(Finding::path(
                     "OWNER_SCOPE_RECEIPT_REQUIRED",
@@ -162,21 +180,16 @@ fn check_repository(
                     "owner-original authority requires repository-external receipt evidence",
                 ));
             }
-            (Some(input), Some(authority)) => {
-                match verify_owner_scope(&canonical_repo, input, authority) {
-                    Ok(verified) => {
-                        owner_scope_verification = OwnerScopeVerification::Verified;
-                        effective_authority = verified;
-                    }
-                    Err(error) => {
-                        owner_scope_verification = OwnerScopeVerification::Rejected;
-                        findings.push(Finding::path(error.code, &canonical_repo, error.message));
-                    }
+            Some(input) => match snapshot.verify(input) {
+                Ok(verified) => {
+                    owner_scope_verification = OwnerScopeVerification::Verified;
+                    effective_authority = verified;
                 }
-            }
-            (Some(_), None) => {
-                owner_scope_verification = OwnerScopeVerification::Rejected;
-            }
+                Err(error) => {
+                    owner_scope_verification = OwnerScopeVerification::Rejected;
+                    findings.push(Finding::path(error.code, &canonical_repo, error.message));
+                }
+            },
         }
     } else if owner_scope_input.is_some() {
         owner_scope_verification = OwnerScopeVerification::Rejected;

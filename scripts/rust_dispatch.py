@@ -37,6 +37,8 @@ SOURCE_INPUTS = (
     Path("rust/deny.toml"),
     Path("rust/rust-toolchain.toml"),
     Path("rust/rustfmt.toml"),
+    Path("rust/tests/fixtures/owner-scope-differential.json"),
+    Path("rust/tests/fixtures/python_owner_scope_adapter.py"),
     Path("scripts/canonical_runtime_runner.py"),
     Path("scripts/bounded_harness.py"),
     Path("scripts/doctor.py"),

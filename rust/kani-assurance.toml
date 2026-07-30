@@ -15,8 +15,8 @@ subject = "owner_scope::decide"
 tool_id = "kani"
 tool_version = "0.67.0"
 source_path = "rust/src/owner_scope.rs"
-source_sha256 = "3ea5efed9cc67507d103dad69c7b278bbcfba03c673ec0b4d5a040aa7bf93ae4"
-harness_sha256 = "3ea5efed9cc67507d103dad69c7b278bbcfba03c673ec0b4d5a040aa7bf93ae4"
+source_sha256 = "72197c7e723875a201b39b5bf613942fd6672a4b4d9a8443796509d8bc893ac0"
+harness_sha256 = "72197c7e723875a201b39b5bf613942fd6672a4b4d9a8443796509d8bc893ac0"
 invocation = "cargo kani --manifest-path rust/Cargo.toml --lib --harness <positive_harness>"
 positive_harnesses = [
   "decision_gate_equivalence",

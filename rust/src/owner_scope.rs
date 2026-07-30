@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::os::fd::OwnedFd;
+use std::path::{Component, Path, PathBuf};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use rustix::fs::{CWD, FileType, Mode, OFlags, fstat, openat};
@@ -8,19 +9,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 
+use crate::{OwnerScopeVerification, Status};
+
 const RECEIPT_SCHEMA: &str = "0.1";
 const RECEIPT_DOMAIN: &[u8] = b"agent-work-governor-owner-scope-v1\n";
 const MAX_RECEIPT_BYTES: usize = 16 * 1024;
+const MAX_POLICY_BYTES: usize = 64 * 1024;
+const MAX_DIRECTORY_ANCESTORS: usize = 4_096;
 
 // LLM-CONTRACT
 // id: agent-work-governor.owner-scope-receipt
 // state: EXTERNAL_BYTES + TRUSTED_BINDINGS -> VERIFIED_INTERSECTION | CLOSED_FAILURE
-// preconditions: the caller supplies repository identity, time, runtime grants, trusted key, and validated policy bytes
-// invariant: repository policy cannot widen signed receipt capability or caller runtime authority
+// preconditions: the caller supplies repository identity, time, runtime grants, trusted key, and validated owner-original policy bytes
+// invariant: only owner-original policy can verify; policy cannot widen signed receipt capability or caller runtime authority
 // failure: every missing, malformed, stale, mismatched, local, or invalid signature yields zero authority
 // source: https://github.com/dalek-cryptography/curve25519-dalek/blob/8016d6d9b9cdbaa681f24147e0b9377cc8cef934/ed25519-dalek/src/verifying.rs
 // knowledge: repo:knowledge/policies/work-governor.md
-// enforced_by: verify_owner_scope
+// enforced_by: verify_owner_scope_with_boundary
 // test: repo:rust/tests/owner_scope.rs
 
 #[derive(Debug, Deserialize)]
@@ -49,9 +54,9 @@ struct ReceiptPayload {
 /// Untrusted evidence and runtime grants supplied by one protected caller.
 ///
 /// Its non-optional fields form the protected all-or-none input set. This input
-/// is never effective authority. [`verify_owner_scope`] derives only the
-/// intersection of validated policy, signed receipt capabilities, and runtime
-/// grants. Missing, unsafe, stale, malformed, signature-invalid, or
+/// is never effective authority. [`RepositoryPolicySnapshot::verify`] derives
+/// only the intersection of validated policy, signed receipt capabilities, and
+/// runtime grants. Missing, unsafe, stale, malformed, signature-invalid, or
 /// binding-mismatched evidence is a closed failure and grants zero authority.
 #[derive(Clone, Debug)]
 pub struct OwnerScopeInput {
@@ -76,7 +81,8 @@ pub struct OwnerScopeInput {
 }
 
 /// Authority bits left after all independent grants are intersected.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct EffectiveAuthority {
     /// Permission to mutate the governed repository.
     pub repository_write: bool,
@@ -84,11 +90,47 @@ pub struct EffectiveAuthority {
     pub external_side_effects: bool,
 }
 
+// LLM-CONTRACT
+// id: agent-work-governor.owner-scope-pure-report
+// state: REPOSITORY_SNAPSHOT + OPTIONAL_RECEIPT_INPUT -> VERIFIED_INTERSECTION | CLOSED_FAILURE
+// preconditions: the caller supplies one opaque repository identity captured with its exact policy bytes
+// invariant: only verified policy AND receipt AND runtime bits can appear in a PASS report
+// failure: missing or invalid evidence emits a zero-authority FAIL report with a stable code
+// source: repo:knowledge/policies/work-governor.md
+// knowledge: repo:knowledge/policies/work-governor.md
+// enforced_by: evaluate_owner_scope
+// test: repo:rust/tests/owner_scope.rs
+
+/// Pure owner-scope decision emitted independently of repository readiness checks.
+///
+/// Fields stay private so callers can only construct this report through the
+/// validated evaluator; it is an output-only wire type.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerScopeReport {
+    status: Status,
+    code: String,
+    owner_scope_verification: OwnerScopeVerification,
+    effective_authority: EffectiveAuthority,
+    mutation_count: u64,
+}
+
 /// Policy digest and authority derived from the same validated byte snapshot.
 #[derive(Clone, Debug)]
-pub struct ValidatedPolicyAuthority {
+pub(crate) struct ValidatedPolicyAuthority {
     sha256: String,
+    repository_scope: String,
     authority: EffectiveAuthority,
+}
+
+/// Opaque repository identity and policy bytes captured through one descriptor tree.
+pub struct RepositoryPolicySnapshot {
+    boundary: RepositoryBoundary,
+    policy_bytes: Option<Vec<u8>>,
+}
+
+struct RepositoryBoundary {
+    root: OwnedFd,
+    canonical_path: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -129,8 +171,8 @@ impl ValidatedPolicyAuthority {
     /// # Errors
     ///
     /// Returns a closed failure when the bytes do not form a valid governor policy.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, OwnerScopeFailure> {
-        let (sha256, repository_write, external_side_effects) =
+    pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Self, OwnerScopeFailure> {
+        let (sha256, repository_scope, repository_write, external_side_effects) =
             crate::policy::validated_authority(bytes).ok_or_else(|| {
                 OwnerScopeFailure::new(
                     "OWNER_SCOPE_POLICY_INVALID",
@@ -139,6 +181,7 @@ impl ValidatedPolicyAuthority {
             })?;
         Ok(Self {
             sha256,
+            repository_scope,
             authority: EffectiveAuthority {
                 repository_write,
                 external_side_effects,
@@ -147,24 +190,89 @@ impl ValidatedPolicyAuthority {
     }
 }
 
-/// Verify one signed external receipt and return only the three-way authority intersection.
-///
-/// # Errors
-///
-/// Returns a stable closed-failure code when evidence or any trusted binding is invalid.
-pub fn verify_owner_scope(
-    repository: &Path,
+impl RepositoryPolicySnapshot {
+    /// Open the governed repository and its current policy as one symlink-free snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a closed failure when the repository or policy cannot be opened
+    /// as bounded regular descriptor-backed inputs.
+    pub fn load(repository: &Path) -> Result<Self, OwnerScopeFailure> {
+        // LLM contract: repository path -> opaque root fd + exact policy bytes
+        // or closed policy state; later renames cannot separate identity from policy.
+        let failure = policy_failure();
+        let boundary = RepositoryBoundary::open(repository, failure)?;
+        let policy_bytes = openat(
+            &boundary.root,
+            ".agent-work-governor",
+            directory_flags(),
+            Mode::empty(),
+        )
+        .ok()
+        .and_then(|gate| {
+            openat(
+                &gate,
+                "policy.toml",
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            )
+            .ok()
+        })
+        .and_then(|policy| read_bounded_file(policy, MAX_POLICY_BYTES, failure).ok());
+        Ok(Self {
+            boundary,
+            policy_bytes,
+        })
+    }
+
+    /// Verify one receipt against the exact policy and repository identity in
+    /// this snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a stable closed failure when policy, evidence, or a trusted
+    /// binding is invalid.
+    pub fn verify(&self, input: &OwnerScopeInput) -> Result<EffectiveAuthority, OwnerScopeFailure> {
+        let policy = self
+            .policy_bytes
+            .as_deref()
+            .ok_or_else(policy_failure)
+            .and_then(ValidatedPolicyAuthority::from_bytes)?;
+        if policy.repository_scope != "owner_original" {
+            return Err(OwnerScopeFailure::new(
+                "OWNER_SCOPE_NOT_APPLICABLE",
+                "external owner-scope evidence requires an owner-original policy",
+            ));
+        }
+        verify_owner_scope_with_boundary(&self.boundary, input, &policy)
+    }
+
+    pub(crate) fn policy_bytes(&self) -> Option<&[u8]> {
+        self.policy_bytes.as_deref()
+    }
+
+    pub(crate) fn repository(&self) -> &Path {
+        &self.boundary.canonical_path
+    }
+}
+
+impl RepositoryBoundary {
+    fn open(repository: &Path, failure: OwnerScopeFailure) -> Result<Self, OwnerScopeFailure> {
+        let canonical_path = repository.canonicalize().map_err(|_| failure)?;
+        Ok(Self {
+            root: open_directory_path(&canonical_path, failure)?,
+            canonical_path,
+        })
+    }
+}
+
+fn verify_owner_scope_with_boundary(
+    boundary: &RepositoryBoundary,
     input: &OwnerScopeInput,
     policy: &ValidatedPolicyAuthority,
 ) -> Result<EffectiveAuthority, OwnerScopeFailure> {
-    let repository = repository.canonicalize().map_err(|_| {
-        OwnerScopeFailure::new(
-            "OWNER_SCOPE_EVIDENCE_INVALID",
-            "governed repository path cannot be canonicalized",
-        )
-    })?;
-    let receipt_bytes = read_external(&repository, &input.receipt_path, MAX_RECEIPT_BYTES)?;
-    let public_key_bytes = read_external(&repository, &input.public_key_path, 32)?;
+    let receipt_bytes = read_external(boundary, &input.receipt_path, MAX_RECEIPT_BYTES)?;
+    let public_key_bytes = read_external(boundary, &input.public_key_path, 32)?;
     let public_key_array: [u8; 32] = public_key_bytes.try_into().map_err(|_| {
         OwnerScopeFailure::new(
             "OWNER_SCOPE_KEY_INVALID",
@@ -221,6 +329,58 @@ pub fn verify_owner_scope(
         runtime: input.runtime_authority,
     })
     .map_err(DecisionFailure::owner_scope_failure)
+}
+
+/// Evaluate owner scope against policy bytes and repository identity captured
+/// through the same descriptor tree.
+#[must_use]
+pub fn evaluate_owner_scope(
+    snapshot: &RepositoryPolicySnapshot,
+    input: Option<&OwnerScopeInput>,
+) -> OwnerScopeReport {
+    let Some(input) = input else {
+        return OwnerScopeReport::closed(
+            OwnerScopeVerification::Required,
+            "OWNER_SCOPE_RECEIPT_REQUIRED",
+        );
+    };
+    OwnerScopeReport::from_verification(snapshot.verify(input))
+}
+
+impl OwnerScopeReport {
+    fn from_verification(
+        result: Result<EffectiveAuthority, OwnerScopeFailure>,
+    ) -> OwnerScopeReport {
+        match result {
+            Ok(effective_authority) => Self {
+                status: Status::Pass,
+                code: "OWNER_SCOPE_VERIFIED".to_owned(),
+                owner_scope_verification: OwnerScopeVerification::Verified,
+                effective_authority,
+                mutation_count: 0,
+            },
+            Err(error) => Self::closed(OwnerScopeVerification::Rejected, error.code),
+        }
+    }
+
+    fn closed(owner_scope_verification: OwnerScopeVerification, code: &'static str) -> Self {
+        Self {
+            status: Status::Fail,
+            code: code.to_owned(),
+            owner_scope_verification,
+            effective_authority: EffectiveAuthority {
+                repository_write: false,
+                external_side_effects: false,
+            },
+            mutation_count: 0,
+        }
+    }
+
+    /// Whether the pure authority decision passed.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        self.status == Status::Pass
+    }
 }
 
 fn decide(input: DecisionInput) -> Result<EffectiveAuthority, DecisionFailure> {
@@ -287,77 +447,119 @@ impl DecisionFailure {
 }
 
 fn read_external(
-    repository: &Path,
+    boundary: &RepositoryBoundary,
     path: &Path,
     maximum: usize,
 ) -> Result<Vec<u8>, OwnerScopeFailure> {
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| {
-        OwnerScopeFailure::new(
-            "OWNER_SCOPE_EVIDENCE_INVALID",
-            "owner-scope evidence is missing or unreadable",
-        )
-    })?;
+    let failure = evidence_failure();
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| failure)?;
     if !metadata.file_type().is_file() {
-        return Err(OwnerScopeFailure::new(
-            "OWNER_SCOPE_EVIDENCE_INVALID",
-            "owner-scope evidence must be a regular non-symlink file",
-        ));
+        return Err(failure);
     }
-    let canonical = path.canonicalize().map_err(|_| {
-        OwnerScopeFailure::new(
-            "OWNER_SCOPE_EVIDENCE_INVALID",
-            "owner-scope evidence path cannot be canonicalized",
-        )
-    })?;
-    if canonical.starts_with(repository) {
+    let canonical = path.canonicalize().map_err(|_| failure)?;
+    let parent = canonical
+        .parent()
+        .ok_or(failure)
+        .and_then(|path| open_directory_path(path, failure))?;
+    if directory_is_within_repository(&parent, &boundary.root, failure)? {
         return Err(OwnerScopeFailure::new(
             "OWNER_SCOPE_EVIDENCE_INSIDE_REPOSITORY",
             "owner-scope evidence must be stored outside the governed repository",
         ));
     }
+    let name = canonical.file_name().ok_or(failure)?;
     let descriptor = openat(
-        CWD,
-        &canonical,
+        &parent,
+        name,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
-    .map_err(|_| {
-        OwnerScopeFailure::new(
-            "OWNER_SCOPE_EVIDENCE_INVALID",
-            "owner-scope evidence could not be opened safely",
-        )
-    })?;
-    let stat = fstat(&descriptor).map_err(|_| {
-        OwnerScopeFailure::new(
-            "OWNER_SCOPE_EVIDENCE_INVALID",
-            "owner-scope evidence metadata could not be read",
-        )
-    })?;
+    .map_err(|_| failure)?;
+    read_bounded_file(descriptor, maximum, failure)
+}
+
+fn directory_flags() -> OFlags {
+    OFlags::RDONLY | OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK
+}
+
+fn open_directory_path(
+    path: &Path,
+    failure: OwnerScopeFailure,
+) -> Result<OwnedFd, OwnerScopeFailure> {
+    let mut directory = openat(CWD, "/", directory_flags(), Mode::empty()).map_err(|_| failure)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::CurDir => {}
+            Component::Normal(part) => {
+                directory = openat(&directory, part, directory_flags(), Mode::empty())
+                    .map_err(|_| failure)?;
+            }
+            Component::ParentDir | Component::Prefix(_) => return Err(failure),
+        }
+    }
+    Ok(directory)
+}
+
+fn directory_is_within_repository(
+    directory: &OwnedFd,
+    repository: &OwnedFd,
+    failure: OwnerScopeFailure,
+) -> Result<bool, OwnerScopeFailure> {
+    let repository_stat = fstat(repository).map_err(|_| failure)?;
+    let mut current =
+        openat(directory, ".", directory_flags(), Mode::empty()).map_err(|_| failure)?;
+    for _ in 0..MAX_DIRECTORY_ANCESTORS {
+        let current_stat = fstat(&current).map_err(|_| failure)?;
+        if current_stat.st_dev == repository_stat.st_dev
+            && current_stat.st_ino == repository_stat.st_ino
+        {
+            return Ok(true);
+        }
+        let parent =
+            openat(&current, "..", directory_flags(), Mode::empty()).map_err(|_| failure)?;
+        let parent_stat = fstat(&parent).map_err(|_| failure)?;
+        if parent_stat.st_dev == current_stat.st_dev && parent_stat.st_ino == current_stat.st_ino {
+            return Ok(false);
+        }
+        current = parent;
+    }
+    Err(failure)
+}
+
+fn read_bounded_file(
+    descriptor: OwnedFd,
+    maximum: usize,
+    failure: OwnerScopeFailure,
+) -> Result<Vec<u8>, OwnerScopeFailure> {
+    let stat = fstat(&descriptor).map_err(|_| failure)?;
     if !FileType::from_raw_mode(stat.st_mode).is_file()
         || usize::try_from(stat.st_size).map_or(true, |size| size > maximum)
     {
-        return Err(OwnerScopeFailure::new(
-            "OWNER_SCOPE_EVIDENCE_INVALID",
-            "owner-scope evidence is not a bounded regular file",
-        ));
+        return Err(failure);
     }
     let mut bytes = Vec::new();
     File::from(descriptor)
         .take(u64::try_from(maximum).unwrap_or(u64::MAX) + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| {
-            OwnerScopeFailure::new(
-                "OWNER_SCOPE_EVIDENCE_INVALID",
-                "owner-scope evidence bytes could not be read",
-            )
-        })?;
+        .map_err(|_| failure)?;
     if bytes.len() > maximum {
-        return Err(OwnerScopeFailure::new(
-            "OWNER_SCOPE_EVIDENCE_INVALID",
-            "owner-scope evidence exceeds its byte bound",
-        ));
+        return Err(failure);
     }
     Ok(bytes)
+}
+
+const fn policy_failure() -> OwnerScopeFailure {
+    OwnerScopeFailure::new(
+        "OWNER_SCOPE_POLICY_INVALID",
+        "repository policy could not be read as bounded descriptor-backed bytes",
+    )
+}
+
+const fn evidence_failure() -> OwnerScopeFailure {
+    OwnerScopeFailure::new(
+        "OWNER_SCOPE_EVIDENCE_INVALID",
+        "owner-scope evidence or repository identity could not be opened safely",
+    )
 }
 
 fn decode_hex<const N: usize>(value: &str) -> Option<[u8; N]> {
