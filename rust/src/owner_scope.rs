@@ -46,7 +46,13 @@ struct ReceiptPayload {
     external_side_effects: bool,
 }
 
-/// Caller-owned bindings for one repository-external owner receipt.
+/// Untrusted evidence and runtime grants supplied by one protected caller.
+///
+/// Its non-optional fields form the protected all-or-none input set. This input
+/// is never effective authority. [`verify_owner_scope`] derives only the
+/// intersection of validated policy, signed receipt capabilities, and runtime
+/// grants. Missing, unsafe, stale, malformed, signature-invalid, or
+/// binding-mismatched evidence is a closed failure and grants zero authority.
 #[derive(Clone, Debug)]
 pub struct OwnerScopeInput {
     /// Path to the signed receipt outside the governed repository.

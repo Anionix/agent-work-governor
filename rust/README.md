@@ -22,9 +22,15 @@ agent-work-governor contract src/lib.rs --repo-root .. --bundle-root ..
 agent-work-governor bootstrap --repo /path/to/repo --plugin-root .. --preset owner-original
 ```
 
-The crate never accepts `--trust-receipt`, `--skip-review`, `--skip-ast`, or caller-supplied
-authority. Owner-repository checks remain fail-closed until trusted Review and AST Adapters exist.
-The Rust version does not reinterpret OKF `verified` metadata or repository-local JSON as runtime
+The crate never accepts `--trust-receipt`, `--skip-review`, `--skip-ast`, or direct
+caller-supplied authority. It accepts caller-supplied evidence and runtime grants only as
+untrusted `OwnerScopeInput` fields. The CLI requires all owner-scope fields together. Missing,
+partial, repository-local, symlinked, oversized, expired, malformed, signature-invalid, or
+binding-mismatched evidence yields zero authority and a closed failure. Only successful
+verification derives `policy ∩ signed receipt ∩ runtime grant` as effective authority.
+
+Owner-repository checks remain fail-closed until trusted Review and AST Adapters exist. The Rust
+version does not reinterpret OKF `verified` metadata or repository-local JSON as runtime
 authorization.
 
 ## Bundled runtime
