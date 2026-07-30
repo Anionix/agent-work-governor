@@ -111,6 +111,7 @@ class AuthorityTests(unittest.TestCase):
         commit: object | None = None,
         issue: object | None = None,
         commit_repository: str | None = None,
+        require_body: bool = True,
     ) -> validate_pr_authority.Result:
         pull_url = f"{self.api}/repos/{self.repository}/pulls/33"
         commit_url = (
@@ -170,7 +171,12 @@ class AuthorityTests(unittest.TestCase):
                     )
             self.fail(f"unexpected URL: {url}")
 
-        return validate_pr_authority.validate_pr_authority(
+        validator = (
+            validate_pr_authority.validate_pr_authority
+            if require_body
+            else validate_pr_authority.validate_immutable_pr_authority
+        )
+        return validator(
             self.event() if event is None else event,
             self.repository,
             "secret-token",
@@ -201,6 +207,17 @@ class AuthorityTests(unittest.TestCase):
                 result.issue_number,
                 result.body,
             ),
+        )
+
+    def test_immutable_app_authority_ignores_mutable_body_evidence(self) -> None:
+        result = self.validate(
+            live=self.pull(body="Issue/spec: #999"),
+            second_live=self.pull(body="body changed during evaluation"),
+            require_body=False,
+        )
+        self.assertEqual(
+            ("PASS", "IMMUTABLE_AUTHORITY_VERIFIED", 33),
+            (result.status, result.code, result.issue_number),
         )
 
     def test_deterministic_identity_mismatches_fail(self) -> None:
@@ -795,8 +812,17 @@ class AuthorityTests(unittest.TestCase):
             'git remote add origin "https://github.com/${TRUSTED_REPOSITORY}.git"',
             'git -c protocol.version=2 fetch --quiet --no-tags --depth=1 origin "$TRUSTED_SHA"',
             '[[ "$(git rev-parse HEAD)" == "$TRUSTED_SHA" ]]',
+            "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
+            "permission-checks: write",
+            "permission-contents: read",
+            "permission-issues: read",
+            "permission-pull-requests: read",
+            "AWG_AUTHORITY_APP_ID: ${{ vars.AWG_AUTHORITY_APP_ID }}",
+            "AWG_AUTHORITY_TOKEN: ${{ steps.app-token.outputs.token }}",
+            "cancel-in-progress: false",
             "GITHUB_TOKEN: ${{ github.token }}",
             "python3 -B scripts/validate_pr_authority.py",
+            "python3 -B scripts/publish_app_authority.py",
         ):
             self.assertIn(evidence, authority)
         permission_block = authority.split("permissions:\n", 1)[1].split("\n\n", 1)[0]
@@ -816,6 +842,14 @@ class AuthorityTests(unittest.TestCase):
             self.assertNotIn(forbidden, authority)
         self.assertEqual(1, authority.count("permissions:"))
         self.assertEqual(1, authority.count("GITHUB_TOKEN:"))
+        legacy_gate = authority.split(
+            "      - name: Validate live pull request authority\n", 1
+        )[1].split("      - name: Publish immutable App authority\n", 1)[0]
+        self.assertNotIn("        if:", legacy_gate)
+        self.assertIn(
+            "        run: python3 -B scripts/validate_pr_authority.py",
+            legacy_gate,
+        )
         contexts = 0
         workflows = PLUGIN_ROOT / ".github/workflows"
         for workflow in (*workflows.glob("*.yml"), *workflows.glob("*.yaml")):

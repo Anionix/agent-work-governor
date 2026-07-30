@@ -33,6 +33,9 @@ SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 PIN_FIELDS = frozenset({"id", "language", "version", "source", "source_digest"})
 FLOATING_VERSIONS = frozenset({"head", "latest", "main", "master", "nightly", "stable"})
 CANONICAL_GIT_REPOSITORIES: Final[dict[str, str]] = {
+    "actions/create-github-app-token": (
+        "https://github.com/actions/create-github-app-token"
+    ),
     "cachix/install-nix-action": "https://github.com/cachix/install-nix-action",
     "cargo": "https://github.com/rust-lang/cargo",
     "clippy": "https://github.com/rust-lang/rust",
