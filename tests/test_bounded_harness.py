@@ -876,6 +876,14 @@ class BoundedHarnessTests(unittest.TestCase):
             ("ready-eof", b"", harness.NetworkStage.CANDIDATE_READY_EOF),
             ("ready-output", b"x", harness.NetworkStage.CANDIDATE_READY_OUTPUT),
             (
+                "linux-loopback-rtnetlink-eperm",
+                tuple(
+                    bytes((byte,))
+                    for byte in harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM + b"\n"
+                ),
+                harness.NetworkStage.CANDIDATE_LINUX_LOOPBACK_RTMNETLINK_EPERM,
+            ),
+            (
                 "ready-timeout",
                 TimeoutError(),
                 harness.NetworkStage.CANDIDATE_READY_TIMEOUT,
@@ -890,7 +898,9 @@ class BoundedHarnessTests(unittest.TestCase):
                     spawn.side_effect = observed
                 else:
                     spawn.return_value = process
-                    if isinstance(observed, bytes):
+                    if isinstance(observed, tuple):
+                        stdout.read.side_effect = observed
+                    elif isinstance(observed, bytes):
                         stdout.read.return_value = observed
                     else:
                         stdout.read.side_effect = observed
@@ -926,6 +936,41 @@ class BoundedHarnessTests(unittest.TestCase):
         self.assertEqual(
             harness.NetworkStage.TRUSTED_READY_EOF,
             harness._startup_stage(harness.NetworkStage.TRUSTED_START, "ready-eof"),
+        )
+        self.assertEqual(
+            harness.NetworkStage.CANDIDATE_LINUX_LOOPBACK_RTMNETLINK_EPERM,
+            harness._startup_stage(
+                harness.NetworkStage.CANDIDATE_START,
+                harness._startup_reason(
+                    harness.NetworkSandbox.LINUX,
+                    harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM + b"\n",
+                    line_complete=True,
+                ),
+            ),
+        )
+        self.assertEqual(
+            "ready-output",
+            harness._startup_reason(
+                harness.NetworkSandbox.MACOS,
+                b"untrusted",
+                line_complete=True,
+            ),
+        )
+        self.assertEqual(
+            "ready-output",
+            harness._startup_reason(
+                harness.NetworkSandbox.LINUX,
+                harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM + b"-candidate\n",
+                line_complete=True,
+            ),
+        )
+        self.assertEqual(
+            "ready-output",
+            harness._startup_reason(
+                harness.NetworkSandbox.LINUX,
+                harness.BWRAP_LOOPBACK_RTM_NEWADDR_EPERM,
+                line_complete=False,
+            ),
         )
 
     def test_network_fault_names_the_preflight_stage(self) -> None:
