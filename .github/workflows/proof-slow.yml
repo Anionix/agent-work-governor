@@ -1,8 +1,8 @@
 # LLM-CONTRACT
 # id: agent-work-governor.proof-slow-nix
-# state: CHANGE_SET -> PROOF_REQUIRED -> LOCKED_NIX_PROOF -> REQUIRED_PASS | CODE_FAIL | INFRA_INCONCLUSIVE; CHANGE_SET -> NO_PROOF_CLAIM -> REQUIRED_PASS; PR_METADATA_EDIT -> PRIOR_SAME_HEAD_REQUIRED_CHECK -> PRESERVED_HEAD_PASS | FULL_PROOF | INFRA_INCONCLUSIVE
+# state: CHANGE_SET -> REQUIRED_REPOSITORY_CONTROLS -> PROOF_REQUIRED -> LOCKED_NIX_PROOF -> REQUIRED_PASS | CODE_FAIL | INFRA_INCONCLUSIVE; CHANGE_SET -> REQUIRED_REPOSITORY_CONTROLS -> NO_PROOF_CLAIM -> REQUIRED_PASS; PR_METADATA_EDIT -> PRIOR_SAME_HEAD_REQUIRED_CHECK -> PRESERVED_HEAD_PASS | FULL_PROOF | INFRA_INCONCLUSIVE
 # preconditions: change sets and reconciliation events are classified; edited without changes.base is metadata-only
-# invariant: non-documentation changes require Nix; a metadata edit that replaces pending proof inherits its proof obligation
+# invariant: every new head passes repository controls; non-documentation changes require Nix; a metadata edit that replaces pending proof inherits its proof obligation
 # failure: code faults exit 1; infrastructure exits 2; missing prior proof falls back to full proof; malformed readback fails closed
 # source: https://github.com/github/docs/blob/7e8499908e9935b0e437faea77e48dcf5284c222/content/actions/reference/workflows-and-actions/workflow-syntax.md
 # knowledge: bundle:knowledge/policies/work-governor.md
@@ -156,7 +156,7 @@ jobs:
   nix:
     name: proof-slow / nix
     needs: select
-    if: needs.select.outputs.required == 'true'
+    if: needs.select.result == 'success' && needs.select.outputs.preserved != 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
@@ -165,6 +165,7 @@ jobs:
       PR_BODY: ${{ github.event.pull_request.body || '' }}
     steps:
       - name: Record proof start
+        if: needs.select.outputs.required == 'true'
         run: |
           # LLM contract: selected proof job -> timestamp or job failure.
           echo "PROOF_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
@@ -179,7 +180,15 @@ jobs:
           fetch-depth: 0
           ref: ${{ env.EXPECTED_HEAD_SHA }}
 
+      - name: Enforce required repository controls
+        shell: bash
+        run: |
+          # LLM contract: reviewed tree + commit identities -> REQUIRED_CONTROLS_PASS | CODE_FAIL.
+          bash scripts/validate_repository_controls.sh \
+            "$BASE_SHA" "$EXPECTED_HEAD_SHA"
+
       - name: Validate unified toolchain catalog
+        if: needs.select.outputs.required == 'true'
         shell: bash
         run: |
           # LLM contract: catalog bytes + declared projections ->
@@ -235,6 +244,7 @@ jobs:
       # LLM contract: pinned flake -> Nix environment or job failure.
       # Source: https://github.com/cachix/install-nix-action/releases/tag/v31.11.0
       - name: Install Nix
+        if: needs.select.outputs.required == 'true'
         id: install-nix
         continue-on-error: true
         uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
@@ -245,13 +255,14 @@ jobs:
           install_url: file://${{ runner.temp }}/nix-install
 
       - name: Classify Nix installation
-        if: steps.install-nix.outcome != 'success'
+        if: needs.select.outputs.required == 'true' && steps.install-nix.outcome != 'success'
         run: |
           # LLM contract: failed pinned installer -> typed infrastructure closure.
           echo '{"classification":"INFRA_INCONCLUSIVE","code":"NIX_INSTALL_FAILED","gate":"proof-slow-nix","status":"INCONCLUSIVE"}'
           exit 2
 
       - name: Verify regenerated flake lock pair
+        if: needs.select.outputs.required == 'true'
         shell: bash
         run: |
           python3 scripts/run_typed_ci.py \
@@ -309,6 +320,7 @@ jobs:
           TYPED_COMMAND
 
       - name: Assert installed Nix identity
+        if: needs.select.outputs.required == 'true'
         shell: bash
         run: |
           python3 scripts/run_typed_ci.py \
@@ -331,6 +343,7 @@ jobs:
           TYPED_COMMAND
 
       - name: Check reproducible environment
+        if: needs.select.outputs.required == 'true'
         shell: bash
         run: |
           # LLM contract: locked proof run -> PASS | CODE_FAIL | INFRA_INCONCLUSIVE.
@@ -367,6 +380,7 @@ jobs:
           exit 1
 
       - name: Check shadow input byte stability
+        if: needs.select.outputs.required == 'true'
         shell: bash
         run: |
           python3 scripts/run_typed_ci.py \
@@ -408,6 +422,7 @@ jobs:
           TYPED_COMMAND
 
       - name: Check locked Rust dependency policy
+        if: needs.select.outputs.required == 'true'
         shell: bash
         run: |
           python3 scripts/run_typed_ci.py \
@@ -464,6 +479,7 @@ jobs:
           TYPED_COMMAND
 
       - name: Check locked Python toolchain and dependencies
+        if: needs.select.outputs.required == 'true'
         shell: bash
         env:
           AUDIT_REQUIREMENTS: ${{ runner.temp }}/agent-work-governor-requirements.txt
@@ -521,6 +537,7 @@ jobs:
           TYPED_COMMAND
 
       - name: Report proof duration
+        if: needs.select.outputs.required == 'true'
         run: |
           # LLM contract: completed proof job -> comparable duration and cache evidence.
           duration="$(($(date +%s) - PROOF_STARTED_EPOCH))"
@@ -565,7 +582,7 @@ jobs:
             exit 2
           fi
           if [[ "$PROOF_REQUIRED" == "false" &&
-            "$PROOF_RESULT" == "skipped" ]]; then
+            "$PROOF_RESULT" == "success" ]]; then
             echo '{"classification":"CODE_OK","gate":"governor-required","proof_claim":"none","status":"PASS"}'
             exit 0
           fi

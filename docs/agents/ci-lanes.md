@@ -21,6 +21,9 @@ Markdown link/reference syntax is rejected.
 cutover. It passes without a proof claim for irrelevant changes and otherwise
 fails closed unless `proof-slow / nix` passes. `shadow-fast / validate` is
 advisory. No candidate or proof lane can emit the reserved external App identity.
+Repository required files, tracked ignored output, Action SHA pins, and diff
+validity share one validator that runs in both the early shadow lane and the
+required proof job on every new head; only expensive Nix remains path-selected.
 Metadata-only PR edits keep the same required name without rerunning Nix. They
 queue behind any proof already running, then use the GitHub Checks API to require
 an earlier successful `governor / validate` from GitHub Actions on the identical

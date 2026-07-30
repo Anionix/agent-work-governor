@@ -61,29 +61,8 @@ jobs:
             code_fail TOOLCHAIN_CATALOG
           python3 scripts/project_toolchain_digest.py --check ||
             code_fail TOOLCHAIN_PROJECTION
-          required=(AGENTS.md CONTRIBUTING.md SECURITY.md flake.nix flake.lock)
-          for path in "${required[@]}"; do
-            test -f "$path" || {
-              echo '{"classification":"CODE_FAIL","code":"REPOSITORY_CONTRACT_MISSING","status":"FAIL"}'
-              exit 1
-            }
-          done
-          forbidden="$(git ls-files --cached --ignored --exclude-standard)"
-          test -z "$forbidden" || {
-            echo '{"classification":"CODE_FAIL","code":"TRACKED_RUNTIME_OUTPUT","status":"FAIL"}'
-            echo "$forbidden"
-            exit 1
-          }
-          unpinned="$(
-            grep -RhoE 'uses:[[:space:]]+[^[:space:]]+@[^[:space:]]+' \
-              .github/workflows |
-              grep -Ev '@[0-9a-f]{40}$' || true
-          )"
-          test -z "$unpinned" || {
-            echo '{"classification":"CODE_FAIL","code":"UNPINNED_ACTION","status":"FAIL"}'
-            echo "$unpinned"
-            exit 1
-          }
+          bash scripts/validate_repository_controls.sh \
+            "$BASE_SHA" "$EXPECTED_HEAD_SHA"
           if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
             labels=('^Issue/spec:' '^State transition and fail-closed outcome:' '^- Primary sources:' '^- Reviewed commit:' '^- Code-review skill digest:' '^- Checks:')
             for label in "${labels[@]}"; do
@@ -105,8 +84,6 @@ jobs:
               "- Code-review skill digest: 6a65cc61114f96db07ec41e3920e67c9c5bf70dd6e0901eb9460ebcb2bdc209f" \
               <<<"$PR_BODY" || code_fail REVIEW_SKILL_MISMATCH
           fi
-          git diff --check "$BASE_SHA...HEAD" || code_fail DIFF_INVALID
-
       - name: Install pinned shadow tools
         shell: bash
         run: |
