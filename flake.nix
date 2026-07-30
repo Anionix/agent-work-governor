@@ -543,9 +543,12 @@
                 nativeBuildInputs = [ toolchain.git ];
               }
               ''
-                # LLM contract: pinned Cargo/RustSec inputs -> immutable offline
-                # runtime, or the Nix build fails without emitting an output.
+                # LLM contract: pinned Cargo/RustSec inputs -> canonical commit
+                # without worktree state -> immutable offline runtime, or the
+                # Nix build fails without emitting an output.
                 # Primary source: https://github.com/rust-lang/cargo/blob/c980f4866141969fab6254a680546a277789d6f0/src/doc/src/reference/source-replacement.md
+                # Primary source: https://git-scm.com/docs/index-format
+                # Primary source: https://git-scm.com/docs/git-gc
                 mkdir -p "$out/vendor" "$out/advisory-db"
                 cp -LR ${cargoVendor}/. "$out/vendor/"
                 cp -R ${lockedRustSec}/. "$out/advisory-db/"
@@ -553,6 +556,8 @@
                 find "$out/advisory-db" -type d -exec chmod 755 {} +
                 find "$out/advisory-db" -type f -exec chmod 644 {} +
                 git -C "$out/advisory-db" init -q -b main
+                git -C "$out/advisory-db" config maintenance.auto false
+                git -C "$out/advisory-db" config gc.auto 0
                 git -C "$out/advisory-db" add -A
                 GIT_AUTHOR_NAME=RustSec GIT_AUTHOR_EMAIL=security@rustsec.org \
                   GIT_COMMITTER_NAME=RustSec GIT_COMMITTER_EMAIL=security@rustsec.org \
@@ -560,6 +565,12 @@
                   GIT_COMMITTER_DATE="@${toString lockedRustSec.lastModified} +0000" \
                   git -C "$out/advisory-db" commit -q -m \
                     "Pinned RustSec ${lockedRustSec.rev}"
+                git_dir="$out/advisory-db/.git"
+                rm -rf "$git_dir/branches" "$git_dir/hooks" "$git_dir/info" \
+                  "$git_dir/logs"
+                rm "$git_dir/COMMIT_EDITMSG" "$git_dir/description" "$git_dir/index"
+                find "$git_dir/objects" -maxdepth 1 -type f -delete
+                test ! -e "$out/advisory-db/.git/index"
                 cat > "$out/config.toml" <<EOF
                 [source.crates-io]
                 replace-with = "vendored-sources"
