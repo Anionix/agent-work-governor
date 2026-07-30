@@ -20,8 +20,9 @@ such as `/tmp` on Linux or `/private/tmp` on macOS. The harness owns the root,
 receipt, and evidence directories. Only the artifacts directory is transferred
 to the candidate identity.
 
-Every check starts in a new session with supplementary groups removed. The
-harness kills that process group after success, timeout, cancellation, or
+Every check starts in one launcher-owned new session with supplementary groups
+removed; Linux Bubblewrap inherits that session instead of repeating `setsid()`.
+The harness kills that process group after success, timeout, cancellation, or
 output overflow. A descendant can create a new session, so process-group
 termination alone is not the security boundary. Distinct UID ownership ensures
 that such a survivor cannot replace receipt or evidence bytes; an ephemeral

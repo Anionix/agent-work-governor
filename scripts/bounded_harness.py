@@ -671,7 +671,6 @@ def _sandboxed_argv(
         "--unshare-ipc",
         "--unshare-uts",
         "--die-with-parent",
-        "--new-session",
         "--disable-userns",
         "--cap-drop",
         "ALL",
@@ -1010,6 +1009,13 @@ async def _spawn(
         )
         macos = sandbox == NetworkSandbox.MACOS
         inherited = () if seccomp_fd is None else (seccomp_fd,)
+        # LLM contract: LAUNCHER_SETSID -> SANDBOX_INHERITS_DETACHED_SESSION;
+        # a second Bubblewrap setsid would fail closed before READY because the
+        # launcher is already the process-group leader.
+        # Primary sources:
+        # https://docs.python.org/3.14/library/subprocess.html#popen-constructor
+        # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L3563-L3565
+        # https://pubs.opengroup.org/onlinepubs/9799919799/functions/setsid.html
         try:
             process = await asyncio.create_subprocess_exec(
                 *command,
