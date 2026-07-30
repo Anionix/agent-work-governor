@@ -192,6 +192,41 @@ jobs:
       - name: Check reproducible environment
         run: nix flake check --no-update-lock-file --no-write-lock-file --print-build-logs
 
+      - name: Check shadow input byte stability
+        shell: bash
+        run: |
+          # LLM contract: canonical shadow inputs -> two local rebuilds ->
+          # identical NAR digests, or this candidate fails before merge.
+          # Primary sources:
+          # https://nix.dev/manual/nix/2.34/command-ref/new-cli/nix3-build
+          # https://git-scm.com/docs/index-format
+          # https://git-scm.com/docs/git-config#Documentation/git-config.txt-safedirectory
+          set -euo pipefail
+          target="path:.#shadow-inputs"
+          rust_inputs="$(
+            nix build --no-update-lock-file --no-write-lock-file \
+              "$target" --no-link --print-out-paths
+          )"
+          rust_inputs_sha256="$(
+            nix hash path --type sha256 --base16 "$rust_inputs"
+          )"
+          for attempt in 1 2; do
+            rebuilt="$(
+              nix build --no-update-lock-file --no-write-lock-file \
+                "$target" --rebuild --no-link --print-out-paths
+            )"
+            rebuilt_sha256="$(nix hash path --type sha256 --base16 "$rebuilt")"
+            if [[ "$rebuilt" != "$rust_inputs" ||
+              "$rebuilt_sha256" != "$rust_inputs_sha256" ]]; then
+              echo "::error title=SHADOW_INPUTS_NOT_REPRODUCIBLE::attempt=$attempt"
+              exit 1
+            fi
+          done
+          test ! -e "$rust_inputs/advisory-db/.git/index"
+          git -c "safe.directory=$rust_inputs/advisory-db" \
+            -C "$rust_inputs/advisory-db" rev-parse --verify 'HEAD^{commit}' \
+            >/dev/null
+
       - name: Check locked Rust dependency policy
         shell: bash
         run: |

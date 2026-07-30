@@ -1942,6 +1942,15 @@ class SourceHygieneTests(unittest.TestCase):
         ):
             self.assertIn(evidence, workflow)
         self.assertNotIn("nix flake update", workflow)
+        for evidence in (
+            "Check shadow input byte stability",
+            '"$target" --rebuild --no-link --print-out-paths',
+            'nix hash path --type sha256 --base16 "$rebuilt"',
+            'test ! -e "$rust_inputs/advisory-db/.git/index"',
+            "safe.directory=$rust_inputs/advisory-db",
+            "'HEAD^{commit}'",
+        ):
+            self.assertIn(evidence, workflow)
         self.assertLess(
             workflow.index("command -v nix >/dev/null 2>&1"),
             workflow.index("uses: cachix/install-nix-action@"),
@@ -1965,6 +1974,13 @@ class SourceHygieneTests(unittest.TestCase):
             "TOOLCHAIN_RUST_COMPONENT_SELF_TEST_FAILED",
             "TOOLCHAIN_PACKAGE_SOURCE_URL_MISMATCH",
             "TOOLCHAIN_PACKAGE_SOURCE_DIGEST_MISMATCH",
+        ):
+            self.assertIn(evidence, flake)
+        for evidence in (
+            "config maintenance.auto false",
+            "config gc.auto 0",
+            'rm "$git_dir/COMMIT_EDITMSG" "$git_dir/description" "$git_dir/index"',
+            'find "$git_dir/objects" -maxdepth 1 -type f -delete',
         ):
             self.assertIn(evidence, flake)
         for evidence in (
