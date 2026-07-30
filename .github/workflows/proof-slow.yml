@@ -1,6 +1,6 @@
 # LLM-CONTRACT
 # id: agent-work-governor.proof-slow-nix
-# state: CHANGE_SET -> REQUIRED_REPOSITORY_CONTROLS -> PROOF_REQUIRED -> LOCKED_NIX_PROOF -> REQUIRED_PASS | CODE_FAIL | INFRA_INCONCLUSIVE; CHANGE_SET -> REQUIRED_REPOSITORY_CONTROLS -> NO_PROOF_CLAIM -> REQUIRED_PASS; PR_METADATA_EDIT -> PRIOR_SAME_HEAD_REQUIRED_CHECK -> PRESERVED_HEAD_PASS | FULL_PROOF | INFRA_INCONCLUSIVE
+# state: CHANGE_SET -> REQUIRED_REPOSITORY_CONTROLS -> PROOF_REQUIRED -> LOCKED_NIX_PROOF -> REQUIRED_PASS | CODE_FAIL | INFRA_INCONCLUSIVE; CHANGE_SET -> REQUIRED_REPOSITORY_CONTROLS -> NO_PROOF_CLAIM -> REQUIRED_PASS; PR_METADATA_EDIT -> PRIOR_SAME_HEAD_PROOF_WORKFLOW -> PROOF_WORKFLOW_IDENTITY_BOUND_SUCCESS | FULL_PROOF_FALLBACK | INFRA_INCONCLUSIVE
 # preconditions: change sets and reconciliation events are classified; edited without changes.base is metadata-only
 # invariant: every new head passes repository controls; non-documentation changes require Nix; a metadata edit that replaces pending proof inherits its proof obligation
 # failure: code faults exit 1; infrastructure exits 2; missing prior proof falls back to full proof; malformed readback fails closed
@@ -23,6 +23,7 @@ on:
     - cron: "17 3 * * *"
 
 permissions:
+  actions: read
   checks: read
   contents: read
 
@@ -54,32 +55,51 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          # LLM contract: metadata-only event + immutable head check history ->
-          # PRIOR_REQUIRED_SUCCESS | FULL_PROOF_FALLBACK | INFRA_INCONCLUSIVE.
-          # Source: https://docs.github.com/actions/how-tos/write-workflows/choose-what-workflows-do/use-github-cli
+          # LLM contract: metadata-only event + workflow-bound immutable run history ->
+          # PROOF_WORKFLOW_IDENTITY_BOUND_SUCCESS | FULL_PROOF_FALLBACK |
+          # INFRA_INCONCLUSIVE.
+          # Source: https://docs.github.com/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow
           set -euo pipefail
           [[ "$GH_API_URL" == "https://api.github.com" ]]
           [[ "$GH_REPOSITORY" =~ ^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$ ]]
           [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
-          query="[
-            .total_count,
-            ([
-              .check_runs[] |
+          query="
+            def bound_run:
               select(
-                .name == \"governor / validate\" and
+                (.id | type) == \"number\" and
+                (.id | floor) == .id and .id > 0 and
+                (.workflow_id | type) == \"number\" and
+                (.workflow_id | floor) == .workflow_id and .workflow_id > 0 and
+                (.run_attempt | type) == \"number\" and
+                (.run_attempt | floor) == .run_attempt and .run_attempt > 0 and
+                .name == \"proof-slow-nix\" and
+                .path == \".github/workflows/proof-slow.yml\" and
                 .head_sha == \"$PR_HEAD_SHA\" and
+                .event == \"pull_request\" and
                 .status == \"completed\" and
                 .conclusion == \"success\" and
-                .app.slug == \"github-actions\"
-              )
-            ] | length)
+                .repository.full_name == \"$GH_REPOSITORY\"
+              );
+            [
+              (if (
+                (.total_count | type) == \"number\" and
+                (.workflow_runs | type) == \"array\"
+              ) then
+                (.total_count | floor) == .total_count and .total_count >= 0
+              else false end),
+              .total_count,
+              (.workflow_runs | length),
+              ([.workflow_runs[] | bound_run] | length),
+              ([.workflow_runs[] | bound_run | .id] | unique | length),
+              ([.workflow_runs[] | bound_run | .workflow_id] | unique | length)
           ] | @tsv"
           readback() {
             gh api --method GET \
               -H "X-GitHub-Api-Version: 2026-03-10" \
-              "repos/$GH_REPOSITORY/commits/$PR_HEAD_SHA/check-runs" \
-              -f "check_name=governor / validate" \
-              -f filter=all \
+              "repos/$GH_REPOSITORY/actions/workflows/proof-slow.yml/runs" \
+              -f "head_sha=$PR_HEAD_SHA" \
+              -f event=pull_request \
+              -f status=success \
               -F per_page=100 \
               --jq "$query"
           }
@@ -93,23 +113,32 @@ jobs:
             [[ "$readback_exit" -eq 0 ]] && break
           done
           if [[ "$readback_exit" -ne 0 ]]; then
-            echo '{"classification":"INFRA_INCONCLUSIVE","code":"PRIOR_REQUIRED_READBACK_FAILED","status":"INCONCLUSIVE"}'
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"PRIOR_PROOF_WORKFLOW_READBACK_FAILED","status":"INCONCLUSIVE"}'
             exit 2
           fi
-          IFS=$'\t' read -r total prior_count extra <<<"$evidence"
-          if [[ -n "${extra:-}" || ! "$total" =~ ^[0-9]{1,3}$ ||
-            ! "$prior_count" =~ ^[0-9]{1,3}$ || "$total" -gt 100 ]]; then
-            echo '{"classification":"INFRA_INCONCLUSIVE","code":"PRIOR_REQUIRED_RESPONSE_INVALID","status":"INCONCLUSIVE"}'
+          IFS=$'\t' read -r schema_valid total row_count prior_count \
+            unique_count workflow_count extra <<<"$evidence"
+          if [[ -n "${extra:-}" || "$schema_valid" != "true" ||
+            ! "$total" =~ ^[0-9]{1,3}$ ||
+            ! "$row_count" =~ ^[0-9]{1,3}$ ||
+            ! "$prior_count" =~ ^[0-9]{1,3}$ ||
+            ! "$unique_count" =~ ^[0-9]{1,3}$ ||
+            ! "$workflow_count" =~ ^[0-9]{1,3}$ || "$total" -gt 100 ||
+            "$total" -ne "$row_count" || "$row_count" -ne "$prior_count" ||
+            "$prior_count" -ne "$unique_count" ||
+            ( "$prior_count" -eq 0 && "$workflow_count" -ne 0 ) ||
+            ( "$prior_count" -gt 0 && "$workflow_count" -ne 1 ) ]]; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"PRIOR_PROOF_WORKFLOW_RESPONSE_INVALID","status":"INCONCLUSIVE"}'
             exit 2
           fi
           if [[ "$prior_count" -lt 1 ]]; then
             echo "preserved=false" >> "$GITHUB_OUTPUT"
-            printf '{"classification":"CODE_OK","code":"PRIOR_REQUIRED_CHECK_MISSING_FALLBACK","head_sha":"%s","status":"PASS"}\n' \
+            printf '{"classification":"CODE_OK","code":"PRIOR_PROOF_WORKFLOW_MISSING_FALLBACK","head_sha":"%s","status":"PASS"}\n' \
               "$PR_HEAD_SHA"
             exit 0
           fi
           echo "preserved=true" >> "$GITHUB_OUTPUT"
-          printf '{"classification":"CODE_OK","code":"PRIOR_REQUIRED_CHECK_PRESERVED","head_sha":"%s","prior_successes":%s,"status":"PASS"}\n' \
+          printf '{"classification":"CODE_OK","code":"PRIOR_PROOF_WORKFLOW_IDENTITY_BOUND","head_sha":"%s","prior_successes":%s,"status":"PASS"}\n' \
             "$PR_HEAD_SHA" "$prior_count"
 
       - name: Check out the candidate revision
