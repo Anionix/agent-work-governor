@@ -1889,8 +1889,12 @@ class SourceHygieneTests(unittest.TestCase):
             nar_hash = base64.b64decode(locked["narHash"].removeprefix("sha256-")).hex()
             self.assertEqual(pins[tool]["source_digest"], f"sha256:{nar_hash}")
 
-        workflow = (PLUGIN_ROOT / ".github/workflows/governor.yml").read_text(
-            encoding="utf-8"
+        workflow = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                PLUGIN_ROOT / ".github/workflows/governor.yml",
+                PLUGIN_ROOT / ".github/workflows/governor-authority.yml",
+            )
         )
         workflow_actions = dict(
             re.findall(r"uses:\s+([^@\s]+)@([0-9a-f]{40})", workflow)

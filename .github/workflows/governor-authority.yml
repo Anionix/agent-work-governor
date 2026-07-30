@@ -1,9 +1,9 @@
 # LLM-CONTRACT
 # id: agent-work-governor.live-pr-authority-workflow
-# state: PR_EVENT -> TRUSTED_SHA_FETCH -> LIVE_UNIQUE_PR -> COMMIT_AUTHORITY -> BODY_EVIDENCE -> REPOSITORY_ISSUE -> PASS | JOB_FAILURE
+# state: PR_EVENT -> TRUSTED_SHA_FETCH -> LEGACY_BODY_AUTHORITY -> OPTIONAL_APP_INSTALLATION_TOKEN -> APP_BOUND_CHECK | JOB_FAILURE
 # preconditions: pull_request_target resolves workflow code from the protected default branch
-# invariant: candidate code, body/trailer drift, non-Issues, and incomplete API evidence never admit
-# failure: the unique governor / authority job exits non-zero and blocks merge
+# invariant: candidate code never executes, legacy body authority always gates the job, and only the configured App id emits the reserved shadow check
+# failure: partial App configuration, identity drift, or incomplete API evidence blocks both job and App check
 # source: https://github.com/github/docs/blob/7e8499908e9935b0e437faea77e48dcf5284c222/content/actions/reference/security/securely-using-pull_request_target.md
 # knowledge: bundle:knowledge/policies/work-governor.md
 # enforced_by: authority
@@ -23,7 +23,7 @@ permissions:
 
 concurrency:
   group: governor-authority-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   authority:
@@ -48,7 +48,64 @@ jobs:
           git checkout --quiet --detach FETCH_HEAD
           [[ "$(git rev-parse HEAD)" == "$TRUSTED_SHA" ]]
 
+      - name: Validate the pinned App token action
+        env:
+          EXPECTED_ACTION_SHA: bcd2ba49218906704ab6c1aa796996da409d3eb1
+        run: |
+          # LLM contract: protected workflow + unified catalog ->
+          # EXACT_APP_TOKEN_ACTION or job failure before external authority.
+          set -euo pipefail
+          IFS=$'\t' read -r _ action_digest < <(
+            python3 scripts/toolchain_catalog.py toolchain.lock.json \
+              --tool-source actions/create-github-app-token
+          )
+          [[ "$action_digest" == "git:$EXPECTED_ACTION_SHA" ]]
+          action_key="uses"
+          test "$(
+            grep -Fxc \
+              "        ${action_key}: actions/create-github-app-token@$EXPECTED_ACTION_SHA" \
+              .github/workflows/governor-authority.yml
+          )" -eq 1
+
+      - name: Select the authority publisher
+        id: app-config
+        env:
+          APP_ID: ${{ vars.AWG_AUTHORITY_APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.AWG_AUTHORITY_APP_PRIVATE_KEY }}
+        run: |
+          # LLM contract: complete App configuration -> APP_MODE; absent pair ->
+          # LEGACY_BOOTSTRAP; a partial pair fails before validation.
+          set -euo pipefail
+          if [[ -z "$APP_ID" && -z "$APP_PRIVATE_KEY" ]]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          elif [[ "$APP_ID" =~ ^[1-9][0-9]{0,18}$ && -n "$APP_PRIVATE_KEY" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error title=AUTHORITY_APP_CONFIG_PARTIAL::App id and private key must be configured together"
+            exit 1
+          fi
+
+      # Source: https://github.com/actions/create-github-app-token/releases/tag/v3.2.0
+      - name: Create the repository-scoped authority App token
+        if: steps.app-config.outputs.configured == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: ${{ vars.AWG_AUTHORITY_APP_ID }}
+          private-key: ${{ secrets.AWG_AUTHORITY_APP_PRIVATE_KEY }}
+          permission-checks: write
+          permission-contents: read
+          permission-issues: read
+          permission-pull-requests: read
+
       - name: Validate live pull request authority
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 -B scripts/validate_pr_authority.py
+
+      - name: Publish immutable App authority
+        if: steps.app-config.outputs.configured == 'true'
+        env:
+          AWG_AUTHORITY_APP_ID: ${{ vars.AWG_AUTHORITY_APP_ID }}
+          AWG_AUTHORITY_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: python3 -B scripts/publish_app_authority.py

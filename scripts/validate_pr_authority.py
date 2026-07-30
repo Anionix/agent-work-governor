@@ -7,7 +7,7 @@ import json
 import os
 import re
 from collections.abc import Callable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from http.client import HTTPException, HTTPMessage, IncompleteRead
 from pathlib import Path
 from typing import IO, Literal, cast
@@ -694,6 +694,7 @@ def validate_pr_authority(
     api_url: str,
     *,
     fetcher: Fetcher = _fetch_json,
+    require_body: bool = True,
 ) -> Result:
     if not _valid_repository(repository) or not token or api_url != CANONICAL_API_URL:
         return Result("INCONCLUSIVE", "AUTHORITY_INPUT_INVALID")
@@ -707,9 +708,11 @@ def validate_pr_authority(
         first = _live_snapshot(identity, token, fetcher)
         issue_number = _commit_issue_number(first, token, fetcher)
         second = _live_snapshot(identity, token, fetcher)
-        if first != second:
+        stable_first = first if require_body else replace(first, body="")
+        stable_second = second if require_body else replace(second, body="")
+        if stable_first != stable_second:
             raise _Reject("AUTHORITY_STATE_CHANGED")
-        if _body_issue_number(second.body) != issue_number:
+        if require_body and _body_issue_number(second.body) != issue_number:
             raise _Reject("AUTHORITY_BODY_ISSUE_MISMATCH")
         _require_repository_issue(
             identity.repository,
@@ -728,6 +731,34 @@ def validate_pr_authority(
         head_sha=second.head_sha,
         issue_number=issue_number,
         body=second.body,
+    )
+
+
+# LLM contract: immutable event + commit trailer + repository Issue ->
+# COMMIT_SCOPED_AUTHORITY, while mutable PR body drift cannot widen or revoke it;
+# any immutable/API mismatch retains the validator's fail-closed result.
+# Primary source: https://docs.github.com/en/rest/checks/runs
+def validate_immutable_pr_authority(
+    event: object,
+    repository: str,
+    token: str,
+    api_url: str,
+    *,
+    fetcher: Fetcher = _fetch_json,
+) -> Result:
+    """Validate only commit-scoped authority for an external App check."""
+    result = validate_pr_authority(
+        event,
+        repository,
+        token,
+        api_url,
+        fetcher=fetcher,
+        require_body=False,
+    )
+    return (
+        replace(result, code="IMMUTABLE_AUTHORITY_VERIFIED")
+        if result.status == "PASS"
+        else result
     )
 
 

@@ -87,6 +87,7 @@
       ) typedTools;
       # LLM contract: tool ID + declared identity -> canonical kind/repository or evaluation failure.
       canonicalGitRepositories = {
+        "actions/create-github-app-token" = "https://github.com/actions/create-github-app-token";
         "cachix/install-nix-action" = "https://github.com/cachix/install-nix-action";
         cargo = "https://github.com/rust-lang/cargo";
         clippy = "https://github.com/rust-lang/rust";
