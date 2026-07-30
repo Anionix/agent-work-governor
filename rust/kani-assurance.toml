@@ -1,0 +1,53 @@
+# LLM-CONTRACT
+# id: agent-work-governor.kani-owner-scope-assurance
+# state: PINNED_KANI + DECISION_HARNESSES -> SHADOW_ASSURANCE | CHECK_FAILURE
+# preconditions: the workflow verifies the source crate and platform bundle digests
+# invariant: only the listed pure decision claims are attributed to Kani
+# failure: a missing positive harness or accepted negative canary fails the shadow check
+# source: https://github.com/model-checking/kani/blob/4feaaad1d6a2378a6ff6caa3b4fc5d6999c7bb5d/README.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: positive_harnesses
+# test: bundle:rust/src/owner_scope.rs
+
+schema_version = "0.1"
+mode = "shadow"
+subject = "owner_scope::decide"
+tool_id = "kani"
+tool_version = "0.67.0"
+source_path = "rust/src/owner_scope.rs"
+source_sha256 = "306e562ed8cc3747960f98b5d232219b71a99b8abbc6d39bc25eb231f1515d38"
+harness_sha256 = "306e562ed8cc3747960f98b5d232219b71a99b8abbc6d39bc25eb231f1515d38"
+invocation = "cargo kani --manifest-path rust/Cargo.toml --lib --harness <positive_harness>"
+positive_harnesses = [
+  "decision_gate_equivalence",
+  "binding_encoding_is_exact",
+  "verified_authority_is_exact_intersection",
+  "decision_paths_are_reachable",
+]
+negative_canary = "negative_canary_must_fail"
+expected_covers = [
+  "verified decision is reachable",
+  "binding mismatch is reachable",
+  "expired receipt is reachable",
+  "invalid signature is reachable",
+]
+non_vacuity = "no assumptions; concrete success and failure witnesses are asserted"
+claims = [
+  "verification succeeds exactly when binding, time, and signature gates are open",
+  "effective authority equals policy AND receipt AND runtime authority",
+  "effective authority never widens any input authority",
+]
+excluded = [
+  "Ed25519 correctness",
+  "SHA-256 correctness",
+  "JSON and TOML parsing",
+  "filesystem and symlink semantics",
+  "GitHub Actions identity or merge authority",
+  "Lean-to-Rust refinement",
+]
+
+[bounds]
+binding_mask_bits = 8
+timestamp_bits = 64
+authority_bits = 6
+unwind = 1
