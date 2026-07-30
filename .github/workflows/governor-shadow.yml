@@ -329,10 +329,11 @@ jobs:
                                   found.add(item[key])
               return found
 
-          # LLM contract: trusted fault v0.2 + fixed NetworkStage -> public
-          # shadow evidence | null; unknown schema or candidate text is ignored.
+          # LLM contract: trusted fault v0.3 + fixed NetworkStage + bounded
+          # launcher digest -> public shadow evidence | null; unknown schema,
+          # malformed digests, and candidate text are ignored.
           # Primary source: bundle:scripts/bounded_harness.py
-          def network_preflight_stage(value):
+          def network_preflight(value):
               allowed = {
                   "network-sandbox-select",
                   "network-host-canaries",
@@ -355,6 +356,7 @@ jobs:
                   "code",
                   "completed",
                   "failed",
+                  "launcher_diagnostic_sha256",
                   "not_started",
                   "running",
                   "schema_version",
@@ -364,12 +366,41 @@ jobs:
               if (
                   not isinstance(value, dict)
                   or set(value) != fields
-                  or value.get("schema_version") != "0.2"
+                  or value.get("schema_version") != "0.3"
                   or value.get("state") != "HARNESS_FAULT"
               ):
-                  return None
+                  return None, None
               stage = value.get("stage")
-              return stage if isinstance(stage, str) and stage in allowed else None
+              if stage is not None and (
+                  not isinstance(stage, str) or stage not in allowed
+              ):
+                  return None, None
+              digest = value.get("launcher_diagnostic_sha256")
+              if digest is not None and (
+                  not isinstance(digest, str)
+                  or len(digest) != 64
+                  or any(character not in "0123456789abcdef" for character in digest)
+                  or value.get("code") != "HARNESS_NETWORK_SANDBOX_SETUP_FAILED"
+              ):
+                  return None, None
+              digest_stages = {
+                  "network-candidate-ready-output",
+                  "network-candidate-linux-loopback-rtnetlink-eperm",
+                  "network-trusted-ready-output",
+                  "network-trusted-linux-loopback-rtnetlink-eperm",
+              }
+              if digest is not None and stage not in digest_stages:
+                  return None, None
+              fixed_digest_stages = {
+                  "network-candidate-linux-loopback-rtnetlink-eperm",
+                  "network-trusted-linux-loopback-rtnetlink-eperm",
+              }
+              fixed_digest = (
+                  "d6d3a3b00b0b48907031e259b7ffed5025e92519672917a50181571db45a7036"
+              )
+              if stage in fixed_digest_stages and digest != fixed_digest:
+                  return None, None
+              return stage, digest
 
           # LLM contract: untrusted aggregate receipt -> bounded diagnostics;
           # only trusted Verify and stage exits determine the semantic state.
@@ -496,6 +527,7 @@ jobs:
               state = "SHADOW_INCONCLUSIVE"
           if state != "PARITY_EVIDENCE" and not reason_codes:
               reason_codes.add("SHADOW_OUTPUT_INCOMPLETE")
+          network_stage, launcher_digest = network_preflight(fault)
           result = {
               "candidate_archive_sha256": candidate_archive_sha,
               "candidate_head_sha": candidate_head_sha,
@@ -510,7 +542,8 @@ jobs:
                   else None
               ),
               "legacy_conclusion": "success",
-              "network_preflight_stage": network_preflight_stage(fault),
+              "launcher_diagnostic_sha256": launcher_digest,
+              "network_preflight_stage": network_stage,
               "observed_check_outcomes": observed_outcomes(receipt),
               "rust_failure_diagnostics": rust_failure_diagnostics(receipt),
               "plan_report_sha256": plan_digest,
@@ -518,7 +551,7 @@ jobs:
               "receipt_sha256": receipt_digest,
               "rust_inputs_sha256": rust_inputs_sha,
               "runner": runner,
-              "schema_version": "0.2",
+              "schema_version": "0.3",
               "stage_exit": exits,
               "state": state,
               "verify_report_sha256": verify_digest,
