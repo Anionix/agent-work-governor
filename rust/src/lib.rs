@@ -236,9 +236,9 @@ fn check_repository(
 // LLM-CONTRACT
 // id: agent-work-governor.rust-static-interface
 // state: REQUEST -> PURE_CHECKS -> REPORT | PLANNED | VERIFIED | INFRASTRUCTURE_FAULT
-// preconditions: paths are explicit and external attestations are not caller supplied
-// invariant: check never mutates a repository and only receipt verification can derive runtime PASS
-// failure: return typed infrastructure faults or fail-closed findings
+// preconditions: paths and caller-supplied evidence/runtime grants are explicit protected inputs
+// invariant: inputs grant zero authority; verification derives policy AND receipt AND runtime
+// failure: missing, partial, unsafe, stale, malformed, invalid, or mismatched evidence fails closed
 // source: bundle:knowledge/policies/work-governor.md
 // knowledge: bundle:knowledge/policies/work-governor.md
 // enforced_by: check

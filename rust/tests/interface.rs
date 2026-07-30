@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::LazyLock;
 
 use agent_work_governor::{
-    CheckReport, CheckRequest, EvidenceArtifact, Governor, MAX_CHECK_OUTPUT_BYTES,
+    CheckReport, CheckRequest, EvidenceArtifact, Governor, MAX_CHECK_OUTPUT_BYTES, OwnerScopeInput,
     OwnerScopeVerification, PlanAction, PlanBindings, PlanProject, Preset, Status,
 };
 use common::toolchain_sha256;
@@ -60,6 +60,42 @@ fn partial_owner_scope_cli_inputs_are_usage_errors() -> Result<(), Box<dyn std::
         assert!(String::from_utf8(output.stderr)?.contains("required"));
     }
     Ok(())
+}
+
+#[test]
+fn public_owner_scope_docs_distinguish_untrusted_inputs_from_authority() {
+    let normalize = |source: &str| {
+        source
+            .lines()
+            .flat_map(|line| line.trim().trim_start_matches('/').split_whitespace())
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let contract = normalize(include_str!("../src/lib.rs"));
+    let input_docs = normalize(include_str!("../src/owner_scope.rs"));
+    let readme = normalize(include_str!("../README.md"));
+
+    let _: Option<OwnerScopeInput> = None;
+    assert!(!contract.contains("external attestations are not caller supplied"));
+    assert!(!readme.contains("or caller-supplied authority."));
+    assert!(contract.contains("inputs grant zero authority; verification derives"));
+    assert!(input_docs.contains("protected all-or-none input set"));
+    assert!(input_docs.contains("This input is never effective authority."));
+    assert!(readme.contains("requires all owner-scope fields together"));
+    assert!(readme.contains("policy ∩ signed receipt ∩ runtime grant"));
+    for closed_failure in [
+        "Missing",
+        "partial",
+        "repository-local",
+        "symlinked",
+        "oversized",
+        "expired",
+        "malformed",
+        "signature-invalid",
+        "binding-mismatched",
+    ] {
+        assert!(readme.contains(closed_failure), "{closed_failure}");
+    }
 }
 
 fn copy_required_plugin_sources(
