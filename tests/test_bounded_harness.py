@@ -780,6 +780,7 @@ class BoundedHarnessTests(unittest.TestCase):
             )
         self.assertIn("--unshare-user", command)
         self.assertIn("--disable-userns", command)
+        self.assertNotIn("--new-session", command)
         self.assertIn(
             ["--add-seccomp-fd", "9"],
             [command[index : index + 2] for index in range(len(command))],
@@ -835,6 +836,7 @@ class BoundedHarnessTests(unittest.TestCase):
         await_args = spawn.await_args
         assert await_args is not None
         self.assertEqual((9,), await_args.kwargs["pass_fds"])
+        self.assertIs(True, await_args.kwargs["start_new_session"])
         stdout.read.assert_awaited_once_with(1)
         self.assertEqual(1, close.call_args_list.count(mock.call(9)))
 
