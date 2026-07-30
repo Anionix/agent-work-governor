@@ -154,6 +154,11 @@ class BoundedHarnessTests(unittest.TestCase):
     def result(self) -> dict[str, Any]:
         return json.loads(self.receipt.read_text())
 
+    def assert_harness_pass(self, result: int, receipt: Path) -> None:
+        fault_path = receipt.with_name(f"{receipt.name}.fault.json")
+        fault = fault_path.read_text() if fault_path.exists() else "fault missing"
+        self.assertEqual(0, result, fault)
+
     def test_exact_argv_nonzero_and_deterministic_receipt(self) -> None:
         sentinel = self.root / "must-not-exist"
         atom = f"x;touch {sentinel}"
@@ -494,6 +499,20 @@ class BoundedHarnessTests(unittest.TestCase):
         descendant.assert_called_once_with(
             "10.0.0.1", 1234, native_ipv6, 1235, "/tmp/canary.sock"
         )
+        arguments[2:5] = ["-", "0", "0"]
+        with (
+            mock.patch.object(harness, "_loopback_fixture", return_value=True),
+            mock.patch.object(harness, "_egress_blocked", return_value=True) as parent,
+            mock.patch.object(
+                harness, "_descendant_egress_blocked", return_value=True
+            ) as descendant,
+        ):
+            self.assertEqual(0, harness._network_probe(arguments))
+        parent.assert_called_once_with("10.0.0.1", 1234, None, 1235, "/tmp/canary.sock")
+        descendant.assert_called_once_with(
+            "10.0.0.1", 1234, None, 1235, "/tmp/canary.sock"
+        )
+        arguments[2:5] = ["fd00::1", "4321", "0"]
         for parent, descendant in ((False, True), (True, False)):
             with (
                 self.subTest(parent=parent, descendant=descendant),
@@ -622,7 +641,64 @@ class BoundedHarnessTests(unittest.TestCase):
             raised.exception.code,
         )
 
-    def test_missing_native_ipv6_route_fails_closed(self) -> None:
+    def test_candidate_ip_policy_probe_requires_eperm_for_both_families(
+        self,
+    ) -> None:
+        denied: list[socket.AddressFamily] = []
+
+        def deny(family: socket.AddressFamily, _: socket.SocketKind) -> socket.socket:
+            denied.append(family)
+            raise OSError(errno.EPERM, "policy")
+
+        with mock.patch.object(harness.socket, "socket", side_effect=deny):
+            self.assertEqual(0, harness._candidate_ip_policy_probe())
+        self.assertEqual(
+            [
+                socket.AF_INET,
+                socket.AF_INET,
+                socket.AF_INET6,
+                socket.AF_INET6,
+            ],
+            denied,
+        )
+
+        with mock.patch.object(
+            harness.socket,
+            "socket",
+            side_effect=OSError(errno.EAFNOSUPPORT, "host"),
+        ):
+            self.assertEqual(
+                harness.NETWORK_SETUP_EXIT,
+                harness._candidate_ip_policy_probe(),
+            )
+
+        class DatagramAllowed:
+            def __init__(self, kind: socket.SocketKind) -> None:
+                self.kind = kind
+
+            def __enter__(self) -> Self:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def connect_ex(self, _: tuple[str, int]) -> int:
+                return errno.EPERM
+
+            def sendto(self, _: bytes, target: tuple[str, int]) -> int:
+                return 1
+
+        with mock.patch.object(
+            harness.socket,
+            "socket",
+            side_effect=lambda _family, kind: DatagramAllowed(kind),
+        ):
+            self.assertEqual(
+                harness.NETWORK_BYPASS_EXIT,
+                harness._candidate_ip_policy_once(),
+            )
+
+    def test_missing_native_ipv6_route_is_not_used_as_policy_proof(self) -> None:
         class NoRouteSocket:
             def connect(self, _: tuple[str, int]) -> None:
                 raise OSError(errno.ENETUNREACH, "no route")
@@ -637,13 +713,8 @@ class BoundedHarnessTests(unittest.TestCase):
                 "socket",
                 return_value=NoRouteSocket(),
             ),
-            self.assertRaises(harness.HarnessError) as raised,
         ):
-            harness._native_ipv6_listener(stack)
-        self.assertEqual(
-            "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
-            raised.exception.code,
-        )
+            self.assertIsNone(harness._native_ipv6_listener(stack))
 
     def test_macos_candidate_profile_denies_loopback_brokers(self) -> None:
         runtime = harness.RuntimePaths(
@@ -938,7 +1009,7 @@ finally:
                     "1",
                 ]
             )
-        self.assertEqual(0, result)
+        self.assert_harness_pass(result, receipt)
         self.assertEqual(
             {"EXITED": {"exit_code": 0}},
             json.loads(receipt.read_text())["checks"][0]["outcome"],
@@ -1012,7 +1083,7 @@ finally:
                     "1",
                 ]
             )
-        self.assertEqual(0, result)
+        self.assert_harness_pass(result, receipt)
         time.sleep(0.4)
         self.assertEqual("yes", blocked.read_text())
         self.assertNotEqual(b"forged", receipt.read_bytes())
