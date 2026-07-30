@@ -141,7 +141,12 @@ class FlakeLockPairTests(unittest.TestCase):
         self.assertEqual(first.stdout, second.stdout)
 
 
-@unittest.skipUnless(shutil.which("git") and shutil.which("nix"), "requires git+nix")
+@unittest.skipUnless(
+    os.environ.get("AWG_RUN_NIX_INTEGRATION") == "1"
+    and shutil.which("git")
+    and shutil.which("nix"),
+    "requires explicit git+nix integration",
+)
 class FlakeLockPairNixIntegrationTests(unittest.TestCase):
     def run_command(self, *command: str, cwd: Path) -> None:
         process = subprocess.run(

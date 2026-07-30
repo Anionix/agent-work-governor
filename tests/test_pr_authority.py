@@ -50,6 +50,28 @@ class AuthorityTests(unittest.TestCase):
             },
         }
 
+    def evidence_body(
+        self,
+        issue_evidence: str = "Issue/spec: #33",
+        *,
+        head_sha: str | None = None,
+    ) -> str:
+        return "\n".join(
+            (
+                issue_evidence,
+                "State transition and fail-closed outcome: INPUT -> PASS | FAIL",
+                "",
+                "## Evidence",
+                "- Primary sources: https://docs.github.com/",
+                f"- Reviewed commit: {head_sha or self.head_sha}",
+                (
+                    "- Code-review skill digest: "
+                    f"{validate_pr_authority.REVIEW_SKILL_DIGEST}"
+                ),
+                "- Checks: focused authority tests",
+            )
+        )
+
     def pull(
         self,
         *,
@@ -57,17 +79,20 @@ class AuthorityTests(unittest.TestCase):
         state: str = "open",
         head_sha: str | None = None,
         base_sha: str | None = None,
-        body: str = "Issue/spec: #33",
+        body: str | None = None,
         repository_id: int | None = None,
         head_repository: str | None = None,
         base_ref: str = "main",
     ) -> dict[str, object]:
+        resolved_head = head_sha or self.head_sha
         return {
             "number": number,
             "state": state,
-            "body": body,
+            "body": self.evidence_body(head_sha=resolved_head)
+            if body is None
+            else body,
             "head": {
-                "sha": head_sha or self.head_sha,
+                "sha": resolved_head,
                 "repo": {"full_name": head_repository or self.repository},
             },
             "base": {
@@ -197,7 +222,7 @@ class AuthorityTests(unittest.TestCase):
                 33,
                 self.head_sha,
                 33,
-                "Issue/spec: #33",
+                self.evidence_body(),
             ),
             (
                 result.status,
@@ -369,17 +394,230 @@ class AuthorityTests(unittest.TestCase):
         )
         for body in invalid_bodies:
             with self.subTest(body=body):
-                result = self.validate(live=self.pull(body=body))
+                result = self.validate(live=self.pull(body=self.evidence_body(body)))
                 self.assertEqual(
                     ("FAIL", "AUTHORITY_BODY_ISSUE_INVALID"),
                     (result.status, result.code),
                 )
 
-        result = self.validate(live=self.pull(body="Issue/spec: #24"))
+        result = self.validate(
+            live=self.pull(body=self.evidence_body("Issue/spec: #24"))
+        )
         self.assertEqual(
             ("FAIL", "AUTHORITY_BODY_ISSUE_MISMATCH"),
             (result.status, result.code),
         )
+
+    def test_review_evidence_is_visible_unique_and_head_bound(self) -> None:
+        valid = self.evidence_body()
+        invalid = (
+            (
+                valid.replace(
+                    "- Reviewed commit: " + self.head_sha,
+                    "- Reviewed commit: " + "c" * 40,
+                ),
+                "AUTHORITY_REVIEWED_COMMIT_MISMATCH",
+            ),
+            (
+                valid.replace(
+                    validate_pr_authority.REVIEW_SKILL_DIGEST,
+                    "0" * 64,
+                ),
+                "AUTHORITY_REVIEW_SKILL_MISMATCH",
+            ),
+            (
+                valid.replace("- Checks: focused authority tests", "- Checks:"),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Checks: focused authority tests",
+                    "- Checks: <!-- hidden -->",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "State transition and fail-closed outcome: INPUT -> PASS | FAIL",
+                    "State transition and fail-closed outcome: <!-- hidden -->",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Primary sources: https://docs.github.com/",
+                    "```\n- Primary sources: https://docs.github.com/\n```",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n- Checks: duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - Checks: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - Check&#115;: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + f"\n> - Reviewed comm&#105;t: {'c' * 40}",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - Check**s**: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - [Check][field]s: quoted duplicate",
+                "AUTHORITY_BODY_ISSUE_INVALID",
+            ),
+            (
+                valid + "\n> - Check[s]: quoted duplicate\n\n[s]: https://example.com/",
+                "AUTHORITY_BODY_ISSUE_INVALID",
+            ),
+            (
+                valid
+                + "\n> - [Check](https://example.com/foo(bar))s: quoted duplicate",
+                "AUTHORITY_BODY_ISSUE_INVALID",
+            ),
+            (
+                valid + "\n> - Check`s`: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - Check<span>s</span>: quoted duplicate",
+                "AUTHORITY_BODY_ISSUE_INVALID",
+            ),
+            (
+                valid + '\n> - Check<span title=">">s</span>: quoted duplicate',
+                "AUTHORITY_BODY_ISSUE_INVALID",
+            ),
+            (
+                valid + "\n> - Check<!-- hidden -->s: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - Check<!--\n> hidden\n> -->s: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid
+                + "\n> - Check<ruby>&#x200b;<rp>junk</rp><rt></rt>"
+                + "<rp></rp></ruby>s: quoted duplicate",
+                "AUTHORITY_BODY_ISSUE_INVALID",
+            ),
+            (
+                valid + "\n> - Check<video>x</video>s: quoted duplicate",
+                "AUTHORITY_BODY_ISSUE_INVALID",
+            ),
+            (
+                valid + "\n> - Checks\\: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - Check\u034fs: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - Check\ufe0fs: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - Check~~\u200b~~s: quoted duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n> - \u202e:skcehC\u202c quoted duplicate",
+                "AUTHORITY_BODY_ISSUE_INVALID",
+            ),
+            (
+                valid + "\n- [ ] Checks: task-list duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid + "\n<!-- note\n--> - Checks: visible duplicate",
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Checks: focused authority tests",
+                    "- Checks: focused; - Checks: duplicate",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Checks: focused authority tests",
+                    f"- Checks: focused; - Reviewed commit: {'c' * 40}",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Primary sources: https://docs.github.com/",
+                    "- Primary sources: local-note",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Primary sources: https://docs.github.com/",
+                    "- Primary sources: https://",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Primary sources: https://docs.github.com/",
+                    "- Primary sources: https://docs.github.com/%ZZ",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Primary sources: https://docs.github.com/",
+                    "- Primary sources: https://docs.github.com/{invalid}",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Primary sources: https://docs.github.com/",
+                    "- Primary sources: https://docs.github.com/[invalid",
+                ),
+                "AUTHORITY_BODY_ISSUE_INVALID",
+            ),
+            (
+                valid.replace(
+                    "- Primary sources: https://docs.github.com/",
+                    "- Primary sources: https://docs.github.com:/",
+                ),
+                "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+            ),
+        )
+        for body, code in invalid:
+            with self.subTest(code=code):
+                result = self.validate(live=self.pull(body=body))
+                self.assertEqual(("FAIL", code), (result.status, result.code))
+
+    def test_repository_template_task_list_is_valid_non_authority_text(self) -> None:
+        template = (PLUGIN_ROOT / ".github/pull_request_template.md").read_text()
+        task_lines = tuple(
+            line for line in template.splitlines() if line.startswith("- [ ] ")
+        )
+        self.assertEqual(3, len(task_lines))
+
+        for checked in (" ", "x", "X"):
+            checklist = "\n".join(
+                line.replace("- [ ] ", f"- [{checked}] ", 1) for line in task_lines
+            )
+            with self.subTest(checked=checked):
+                body = self.evidence_body() + "\n\n## Checklist\n\n" + checklist
+                result = self.validate(live=self.pull(body=body))
+                self.assertEqual("PASS", result.status)
 
     def test_body_issue_evidence_must_be_reader_visible_markdown(self) -> None:
         invalid_bodies = (
@@ -416,10 +654,15 @@ class AuthorityTests(unittest.TestCase):
             "<script\f>\nIssue/spec: #33\n</script>",
             "<script\v>\nIssue/spec: #33\n</script>",
             "[x]: /url\n<custom-tag>\nIssue/spec: #33\n\n",
+            "<div>example</div>\n\nIssue/spec: #33",
+            "<custom-tag>  \nexample\n\nIssue/spec: #33",
+            "<script>example</script>\nIssue/spec: #33",
+            "<?governor?>\nIssue/spec: #33",
+            "<![CDATA[example]]>\nIssue/spec: #33",
         )
         for body in invalid_bodies:
             with self.subTest(body=body):
-                result = self.validate(live=self.pull(body=body))
+                result = self.validate(live=self.pull(body=self.evidence_body(body)))
                 self.assertEqual(
                     ("FAIL", "AUTHORITY_BODY_ISSUE_INVALID"),
                     (result.status, result.code),
@@ -429,15 +672,10 @@ class AuthorityTests(unittest.TestCase):
             "<!-- note -->\n```\nexample\n```\nIssue/spec: #33",
             "    ```\nIssue/spec: #33",
             "Introduction\r\nIssue/spec: #33\r\n",
-            "<div>example</div>\n\nIssue/spec: #33",
-            "<custom-tag>  \nexample\n\nIssue/spec: #33",
-            "<script>example</script>\nIssue/spec: #33",
-            "<?governor?>\nIssue/spec: #33",
-            "<![CDATA[example]]>\nIssue/spec: #33",
         )
         for body in valid_bodies:
             with self.subTest(body=body):
-                result = self.validate(live=self.pull(body=body))
+                result = self.validate(live=self.pull(body=self.evidence_body(body)))
                 self.assertEqual("PASS", result.status)
 
     def test_issue_must_exist_in_the_repository_and_not_be_a_pull_request(
@@ -801,6 +1039,7 @@ class AuthorityTests(unittest.TestCase):
         authority_path = PLUGIN_ROOT / ".github/workflows/governor-authority.yml"
         authority = authority_path.read_text(encoding="utf-8")
         for evidence in (
+            "name: authority-fast",
             "pull_request_target:",
             "branches: [main]",
             "contents: read",
@@ -810,7 +1049,8 @@ class AuthorityTests(unittest.TestCase):
             "runs-on: ubuntu-24.04",
             "TRUSTED_SHA: ${{ github.sha }}",
             'git remote add origin "https://github.com/${TRUSTED_REPOSITORY}.git"',
-            'git -c protocol.version=2 fetch --quiet --no-tags --depth=1 origin "$TRUSTED_SHA"',
+            "git -c protocol.version=2 fetch \\",
+            '--quiet --no-tags --depth=1 origin "$TRUSTED_SHA"',
             '[[ "$(git rev-parse HEAD)" == "$TRUSTED_SHA" ]]',
             "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1",
             "permission-checks: write",
@@ -823,6 +1063,8 @@ class AuthorityTests(unittest.TestCase):
             "GITHUB_TOKEN: ${{ github.token }}",
             "python3 -B scripts/validate_pr_authority.py",
             "python3 -B scripts/publish_app_authority.py",
+            '"classification":"CODE_FAIL"',
+            '"classification":"INFRA_INCONCLUSIVE"',
         ):
             self.assertIn(evidence, authority)
         permission_block = authority.split("permissions:\n", 1)[1].split("\n\n", 1)[0]
@@ -847,7 +1089,7 @@ class AuthorityTests(unittest.TestCase):
         )[1].split("      - name: Publish immutable App authority\n", 1)[0]
         self.assertNotIn("        if:", legacy_gate)
         self.assertIn(
-            "        run: python3 -B scripts/validate_pr_authority.py",
+            "          python3 -B scripts/validate_pr_authority.py |",
             legacy_gate,
         )
         contexts = 0

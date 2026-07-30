@@ -1,8 +1,9 @@
 # Shadow Plan/Verify
 
-`governor-shadow` observes the Plan → bounded harness → Verify path after the
-legacy `governor` workflow succeeds. It runs on Linux x86-64, Linux ARM64, and
-macOS ARM64. The legacy check remains the only merge authority.
+`proof-slow-cross-runner` observes the Plan → bounded harness → Verify path
+after a relevant-path `proof-slow-nix` workflow succeeds. It runs on Linux
+x86-64, Linux ARM64, and macOS ARM64. The existing required checks remain
+unchanged until the external App cutover.
 
 Each job separates two trees:
 
@@ -42,8 +43,8 @@ Schema `0.3` adds `launcher_diagnostic_sha256`; schema `0.2` added
 ## Promotion criteria
 
 Promotion requires a separate Issue and protection-rule change after all three
-targets show reproducible parity across at least 30 consecutive successful
-legacy runs, with no unresolved security review or unexplained divergence.
+targets show reproducible parity across at least 30 consecutive relevant-path
+proof runs, with no unresolved security review or unexplained divergence.
 Promotion must keep event identity outside repository-local JSON and must never
 replace the legacy gate in the same pull request.
 

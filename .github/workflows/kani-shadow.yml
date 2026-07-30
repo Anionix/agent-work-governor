@@ -1,6 +1,6 @@
 # LLM-CONTRACT
-# id: agent-work-governor.kani-shadow
-# state: CANDIDATE_REVISION + PINNED_KANI -> PROVED_DECISION_CORE | SHADOW_FAILURE
+# id: agent-work-governor.proof-slow-kani
+# state: RELEVANT_CHANGE + PINNED_KANI -> BOUNDED_ASSURANCE | SHADOW_FAILURE
 # preconditions: this candidate-controlled workflow is never a required authority check
 # invariant: exact source and bundle digests precede every proof; the negative canary must fail
 # failure: setup, any positive harness, or canary rejection exits non-zero without granting authority
@@ -9,24 +9,43 @@
 # enforced_by: prove
 # test: bundle:rust/src/owner_scope.rs
 
-name: kani-shadow
+name: proof-slow-kani
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+    paths:
+      - ".github/workflows/kani-shadow.yml"
+      - "rust/**"
+      - "scripts/run_typed_ci.py"
+      - "scripts/toolchain_catalog.py"
+      - "scripts/validate_kani_assurance.py"
+      - "toolchain.lock.json"
   push:
     branches: [main]
+    paths:
+      - ".github/workflows/kani-shadow.yml"
+      - "rust/**"
+      - "scripts/run_typed_ci.py"
+      - "scripts/toolchain_catalog.py"
+      - "scripts/validate_kani_assurance.py"
+      - "toolchain.lock.json"
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+  schedule:
+    - cron: "37 3 * * *"
 
 permissions:
   contents: read
 
 concurrency:
-  group: kani-shadow-${{ github.ref }}
+  group: proof-slow-kani-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   prove:
-    name: kani / shadow
+    name: proof-slow / kani
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
@@ -38,8 +57,14 @@ jobs:
       - name: Install pinned Kani
         shell: bash
         run: |
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-kani \
+            --code KANI_SETUP_FAILED \
+            --infra-code KANI_SETUP_INFRA \
+            -- bash -euo pipefail <<'TYPED_COMMAND'
           # LLM contract: validated catalog + exact downloads -> PINNED_KANI or job failure.
           set -euo pipefail
+          echo "KANI_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
           python3 scripts/toolchain_catalog.py toolchain.lock.json --require kani
           version="$(
             python3 scripts/toolchain_catalog.py toolchain.lock.json --tool-version kani
@@ -75,10 +100,18 @@ jobs:
 
           source_archive="$RUNNER_TEMP/kani-verifier.crate"
           bundle_archive="$RUNNER_TEMP/kani-bundle.tar.gz"
-          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-            --output "$source_archive" "$source"
-          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-            --output "$bundle_archive" "$bundle"
+          if ! curl --fail --location --proto '=https' \
+            --proto-redir '=https' --tlsv1.2 \
+            --output "$source_archive" "$source"; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"KANI_SOURCE_TRANSPORT_FAILED","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
+          if ! curl --fail --location --proto '=https' \
+            --proto-redir '=https' --tlsv1.2 \
+            --output "$bundle_archive" "$bundle"; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"KANI_BUNDLE_TRANSPORT_FAILED","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
           printf '%s  %s\n' "${source_digest#sha256:}" "$source_archive" |
             sha256sum --check --strict
           printf '%s  %s\n' "${bundle_digest#sha256:}" "$bundle_archive" |
@@ -97,10 +130,16 @@ jobs:
             printf 'KANI_HOME=%s\n' "$KANI_HOME"
             printf 'KANI_VERSION=%s\n' "$version"
           } >> "$GITHUB_ENV"
+          TYPED_COMMAND
 
       - name: Prove owner-scope decision core
         shell: bash
         run: |
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-kani \
+            --code KANI_ASSURANCE_FAILED \
+            --infra-code KANI_ASSURANCE_INFRA \
+            -- bash -euo pipefail <<'TYPED_COMMAND'
           # LLM contract: manifest harness set -> ALL_PROVED + CANARY_REJECTED or failure.
           set -euo pipefail
           if sed -n '/#\[cfg(kani)\]/,$p' rust/src/owner_scope.rs |
@@ -151,4 +190,7 @@ jobs:
             --manifest rust/kani-assurance.toml \
             --log "$assurance_log" \
             --kani-version "$KANI_VERSION"
-          echo '{"authority":"none","negative_canary":"REJECTED","status":"PASS"}'
+          duration="$(($(date +%s) - KANI_STARTED_EPOCH))"
+          printf '{"authority":"none","cache_state":"disabled","duration_seconds":%s,"gate":"proof-slow-kani","negative_canary":"REJECTED","status":"PASS"}\n' \
+            "$duration"
+          TYPED_COMMAND

@@ -1,41 +1,174 @@
 # LLM-CONTRACT
-# id: agent-work-governor.required-check
-# state: CANDIDATE_REVISION -> GOVERNANCE_VALIDATED -> PASS | JOB_FAILURE
-# preconditions: the workflow receives the reviewed head and current base revisions
-# invariant: stale review evidence, forbidden artifacts, or failed Nix checks cannot pass
-# failure: the validate job exits non-zero and blocks merge
-# source: bundle:knowledge/policies/work-governor.md
+# id: agent-work-governor.proof-slow-nix
+# state: CHANGE_SET -> PROOF_REQUIRED -> LOCKED_NIX_PROOF -> REQUIRED_PASS | CODE_FAIL | INFRA_INCONCLUSIVE; CHANGE_SET -> NO_PROOF_CLAIM -> REQUIRED_PASS; PR_METADATA_EDIT -> PRIOR_SAME_HEAD_REQUIRED_CHECK -> PRESERVED_HEAD_PASS | FULL_PROOF | INFRA_INCONCLUSIVE
+# preconditions: change sets and reconciliation events are classified; edited without changes.base is metadata-only
+# invariant: non-documentation changes require Nix; a metadata edit that replaces pending proof inherits its proof obligation
+# failure: code faults exit 1; infrastructure exits 2; missing prior proof falls back to full proof; malformed readback fails closed
+# source: https://github.com/github/docs/blob/7e8499908e9935b0e437faea77e48dcf5284c222/content/actions/reference/workflows-and-actions/workflow-syntax.md
 # knowledge: bundle:knowledge/policies/work-governor.md
-# enforced_by: validate
+# enforced_by: required
 # test: bundle:tests/test_contracts.py
 
-name: governor
+name: proof-slow-nix
 
 on:
   pull_request:
-    # LLM contract: PR evidence change -> revalidation; stale evidence -> failure.
-    # Source: https://docs.github.com/actions/using-workflows/events-that-trigger-workflows#pull_request
     types: [opened, synchronize, reopened, edited]
   push:
     branches: [main]
+  merge_group:
+    types: [checks_requested]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
 
 permissions:
+  checks: read
   contents: read
 
+env:
+  PROOF_SKIP_PATTERN: '^(docs/|LICENSE$|NOTICE$|README\.md$)'
+
 concurrency:
-  group: governor-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: proof-slow-nix-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event.action != 'edited' || github.event.changes.base != null }}
 
 jobs:
-  validate:
-    name: governor / validate
-    runs-on: ubuntu-latest
+  select:
+    name: proof-slow / select
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    outputs:
+      preserved: ${{ steps.metadata-proof.outputs.preserved }}
+      required: ${{ steps.paths.outputs.required }}
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || github.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - name: Reconcile metadata-only proof
+        if: github.event.action == 'edited' && github.event.changes.base == null
+        id: metadata-proof
+        env:
+          GH_API_URL: ${{ github.api_url }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # LLM contract: metadata-only event + immutable head check history ->
+          # PRIOR_REQUIRED_SUCCESS | FULL_PROOF_FALLBACK | INFRA_INCONCLUSIVE.
+          # Source: https://docs.github.com/actions/how-tos/write-workflows/choose-what-workflows-do/use-github-cli
+          set -euo pipefail
+          [[ "$GH_API_URL" == "https://api.github.com" ]]
+          [[ "$GH_REPOSITORY" =~ ^[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}$ ]]
+          [[ "$PR_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          query="[
+            .total_count,
+            ([
+              .check_runs[] |
+              select(
+                .name == \"governor / validate\" and
+                .head_sha == \"$PR_HEAD_SHA\" and
+                .status == \"completed\" and
+                .conclusion == \"success\" and
+                .app.slug == \"github-actions\"
+              )
+            ] | length)
+          ] | @tsv"
+          readback() {
+            gh api --method GET \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/$GH_REPOSITORY/commits/$PR_HEAD_SHA/check-runs" \
+              -f "check_name=governor / validate" \
+              -f filter=all \
+              -F per_page=100 \
+              --jq "$query"
+          }
+          readback_exit=1
+          evidence=""
+          for _ in 1 2; do
+            set +e
+            evidence="$(readback)"
+            readback_exit="$?"
+            set -e
+            [[ "$readback_exit" -eq 0 ]] && break
+          done
+          if [[ "$readback_exit" -ne 0 ]]; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"PRIOR_REQUIRED_READBACK_FAILED","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
+          IFS=$'\t' read -r total prior_count extra <<<"$evidence"
+          if [[ -n "${extra:-}" || ! "$total" =~ ^[0-9]{1,3}$ ||
+            ! "$prior_count" =~ ^[0-9]{1,3}$ || "$total" -gt 100 ]]; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"PRIOR_REQUIRED_RESPONSE_INVALID","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
+          if [[ "$prior_count" -lt 1 ]]; then
+            echo "preserved=false" >> "$GITHUB_OUTPUT"
+            printf '{"classification":"CODE_OK","code":"PRIOR_REQUIRED_CHECK_MISSING_FALLBACK","head_sha":"%s","status":"PASS"}\n' \
+              "$PR_HEAD_SHA"
+            exit 0
+          fi
+          echo "preserved=true" >> "$GITHUB_OUTPUT"
+          printf '{"classification":"CODE_OK","code":"PRIOR_REQUIRED_CHECK_PRESERVED","head_sha":"%s","prior_successes":%s,"status":"PASS"}\n' \
+            "$PR_HEAD_SHA" "$prior_count"
+
+      - name: Check out the candidate revision
+        if: steps.metadata-proof.outputs.preserved != 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ env.HEAD_SHA }}
+
+      - name: Select relevant proof input
+        id: paths
+        env:
+          METADATA_PROOF_PRESERVED: ${{ steps.metadata-proof.outputs.preserved }}
+        shell: bash
+        run: |
+          # LLM contract: event identity + changed paths -> PROOF_REQUIRED | NO_PROOF_CLAIM.
+          set -euo pipefail
+          if [[ "${METADATA_PROOF_PRESERVED:-}" == "true" ]]; then
+            echo "required=false" >> "$GITHUB_OUTPUT"
+            echo '{"gate":"proof-slow-select","proof_required":false,"status":"PASS"}'
+            exit 0
+          fi
+          required=true
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ||
+            "$GITHUB_EVENT_NAME" == "push" ]]; then
+            if [[ "$BASE_SHA" =~ ^0{40}$ ]]; then
+              required=true
+            else
+              changed="$(
+                git diff --no-renames --name-only "$BASE_SHA...$HEAD_SHA"
+              )"
+              if [[ -n "$changed" ]] &&
+                grep -Evq "$PROOF_SKIP_PATTERN" <<<"$changed"; then
+                required=true
+              else
+                required=false
+              fi
+            fi
+          fi
+          echo "required=$required" >> "$GITHUB_OUTPUT"
+          printf '{"gate":"proof-slow-select","proof_required":%s,"status":"PASS"}\n' \
+            "$required"
+
+  nix:
+    name: proof-slow / nix
+    needs: select
+    if: needs.select.outputs.required == 'true'
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
-      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || github.sha }}
       EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
       PR_BODY: ${{ github.event.pull_request.body || '' }}
     steps:
+      - name: Record proof start
+        run: |
+          # LLM contract: selected proof job -> timestamp or job failure.
+          echo "PROOF_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
       # LLM contract: SHA-pinned workflow bootstrap -> REVIEWED_REVISION or job failure.
       # Preconditions: actions/checkout is intentionally outside toolchain.lock.json.
       # Invariant: this is the only action allowed before catalog validation.
@@ -76,7 +209,7 @@ jobs:
           mapfile -t action_pins < <(
             sed -nE \
               's|^[[:space:]]*uses:[[:space:]]+cachix/install-nix-action@([0-9a-f]{40})([[:space:]]*(#.*)?)$|\1|p' \
-              .github/workflows/governor.yml
+              .github/workflows/proof-slow.yml
           )
           if [[ "${#action_pins[@]}" -ne 1 ||
             "git:${action_pins[0]:-}" != "$action_digest" ]]; then
@@ -90,14 +223,20 @@ jobs:
           fi
           nix_digest="${nix_digest#sha256:}"
           nix_installer="$RUNNER_TEMP/nix-install"
-          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
-            --output "$nix_installer" "$nix_source"
+          if ! curl --fail --location --proto '=https' \
+            --proto-redir '=https' --tlsv1.2 \
+            --output "$nix_installer" "$nix_source"; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"NIX_INSTALLER_TRANSPORT_FAILED","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
           printf '%s  %s\n' "$nix_digest" "$nix_installer" |
             sha256sum --check --strict
 
       # LLM contract: pinned flake -> Nix environment or job failure.
       # Source: https://github.com/cachix/install-nix-action/releases/tag/v31.11.0
       - name: Install Nix
+        id: install-nix
+        continue-on-error: true
         uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31.11.0
         with:
           enable_kvm: false
@@ -105,9 +244,21 @@ jobs:
           # The preceding step verifies the catalog-bound installer bytes.
           install_url: file://${{ runner.temp }}/nix-install
 
+      - name: Classify Nix installation
+        if: steps.install-nix.outcome != 'success'
+        run: |
+          # LLM contract: failed pinned installer -> typed infrastructure closure.
+          echo '{"classification":"INFRA_INCONCLUSIVE","code":"NIX_INSTALL_FAILED","gate":"proof-slow-nix","status":"INCONCLUSIVE"}'
+          exit 2
+
       - name: Verify regenerated flake lock pair
         shell: bash
         run: |
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-nix \
+            --code FLAKE_LOCK_PAIR_FAILED \
+            --infra-code FLAKE_LOCK_PAIR_INFRA \
+            -- bash -euo pipefail <<'TYPED_COMMAND'
           # LLM contract: changed flake pair -> isolated regeneration ->
           # BYTE_EQUIVALENT or fail-closed mismatch/inconclusive evidence.
           # Primary source: https://github.com/NixOS/nix/blob/2c6d06e9387cf58167cb5a7ab91cee7333d8d17c/src/nix/flake-lock.md
@@ -119,8 +270,16 @@ jobs:
               "$EXPECTED_HEAD_SHA" "$actual_head"
             exit 2
           fi
-          python3 -B -m unittest \
-            tests.test_flake_lock_pair.FlakeLockPairNixIntegrationTests
+          integration_log="$RUNNER_TEMP/flake-lock-integration.log"
+          set +e
+          AWG_RUN_NIX_INTEGRATION=1 python3 -B -m unittest \
+            tests.test_flake_lock_pair.FlakeLockPairNixIntegrationTests \
+            2>&1 | tee "$integration_log"
+          integration_status="${PIPESTATUS[0]}"
+          set -e
+          if [[ "$integration_status" -ne 0 ]]; then
+            exit "$integration_status"
+          fi
           if git diff --quiet "$BASE_SHA...$EXPECTED_HEAD_SHA" -- \
             flake.nix flake.lock; then
             echo '{"code":"FLAKE_PAIR_UNCHANGED","status":"SKIP"}'
@@ -147,10 +306,16 @@ jobs:
             --regenerated-lock "$regenerated" \
             --head-sha "$EXPECTED_HEAD_SHA" \
             --nix-version "$(nix --version)"
+          TYPED_COMMAND
 
       - name: Assert installed Nix identity
         shell: bash
         run: |
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-nix \
+            --code NIX_IDENTITY_FAILED \
+            --infra-code NIX_IDENTITY_INFRA \
+            -- bash -euo pipefail <<'TYPED_COMMAND'
           # LLM contract: installed executable -> EXACT_NIX or job failure.
           set -euo pipefail
           expected="$(
@@ -163,40 +328,52 @@ jobs:
             echo "::error title=TOOLCHAIN_VERSION_MISMATCH::nix expected=$expected actual=$actual"
             exit 1
           fi
-
-      - name: Validate repository contract
-        shell: bash
-        run: |
-          # LLM contract: candidate tree -> CONTRACT_OK or non-zero exit.
-          set -euo pipefail
-          required=(AGENTS.md CONTRIBUTING.md SECURITY.md flake.nix flake.lock)
-          for path in "${required[@]}"; do
-            test -f "$path" || { echo "::error::missing $path"; exit 1; }
-          done
-          forbidden="$(git ls-files --cached --ignored --exclude-standard)"
-          test -z "$forbidden" || { echo "::error::tracked generated/runtime files"; echo "$forbidden"; exit 1; }
-          unpinned="$(grep -RhoE 'uses:[[:space:]]+[^[:space:]]+@[^[:space:]]+' .github/workflows | grep -Ev '@[0-9a-f]{40}$' || true)"
-          test -z "$unpinned" || { echo "::error::unpinned action"; echo "$unpinned"; exit 1; }
-          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
-            labels=('^Issue/spec:' '^State transition and fail-closed outcome:' '^- Primary sources:' '^- Reviewed commit:' '^- Code-review skill digest:' '^- Checks:')
-            for label in "${labels[@]}"; do
-              test "$(grep -Ec "$label" <<<"$PR_BODY")" -eq 1 || { echo "::error::PR evidence must occur once: $label"; exit 1; }
-            done
-            evidence=('^Issue/spec:[[:space:]]+[^[:space:]]' '^State transition and fail-closed outcome:[[:space:]]+[^[:space:]]' '^- Primary sources:[[:space:]]+[^[:space:]]' '^- Checks:[[:space:]]+[^[:space:]]')
-            for pattern in "${evidence[@]}"; do
-              grep -Eq "$pattern" <<<"$PR_BODY" || { echo "::error::missing PR evidence: $pattern"; exit 1; }
-            done
-            grep -Fqx -- "- Reviewed commit: $EXPECTED_HEAD_SHA" <<<"$PR_BODY" || { echo "::error::reviewed commit does not match PR head"; exit 1; }
-            grep -Fqx -- "- Code-review skill digest: 6a65cc61114f96db07ec41e3920e67c9c5bf70dd6e0901eb9460ebcb2bdc209f" <<<"$PR_BODY" || { echo "::error::unexpected code-review skill"; exit 1; }
-          fi
-          git diff --check "$BASE_SHA...HEAD"
+          TYPED_COMMAND
 
       - name: Check reproducible environment
-        run: nix flake check --no-update-lock-file --no-write-lock-file --print-build-logs
+        shell: bash
+        run: |
+          # LLM contract: locked proof run -> PASS | CODE_FAIL | INFRA_INCONCLUSIVE.
+          set -euo pipefail
+          started="$(date +%s)"
+          log="$RUNNER_TEMP/proof-slow-nix.log"
+          set +e
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-nix \
+            --code NIX_PROOF_FAILED \
+            --infra-code NIX_PROOF_INFRA \
+            -- nix flake check --no-update-lock-file --no-write-lock-file \
+              --print-build-logs 2>&1 | tee "$log"
+          status="${PIPESTATUS[0]}"
+          set -e
+          duration="$(($(date +%s) - started))"
+          cache_state="warm"
+          if grep -Eq '(^|[[:space:]])(building|copying path)[[:space:]]' "$log"; then
+            cache_state="cold"
+          fi
+          if [[ "$status" -eq 0 ]]; then
+            echo "PROOF_CACHE_STATE=$cache_state" >> "$GITHUB_ENV"
+            printf '{"cache_state":"%s","classification":"CODE_OK","duration_seconds":%s,"gate":"proof-slow-nix","status":"PASS"}\n' \
+              "$cache_state" "$duration"
+            exit 0
+          fi
+          if [[ "$status" -eq 2 ]]; then
+            printf '{"cache_state":"%s","classification":"INFRA_INCONCLUSIVE","duration_seconds":%s,"gate":"proof-slow-nix","status":"INCONCLUSIVE"}\n' \
+              "$cache_state" "$duration"
+            exit 2
+          fi
+          printf '{"cache_state":"%s","classification":"CODE_FAIL","duration_seconds":%s,"gate":"proof-slow-nix","status":"FAIL"}\n' \
+            "$cache_state" "$duration"
+          exit 1
 
       - name: Check shadow input byte stability
         shell: bash
         run: |
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-nix \
+            --code SHADOW_INPUT_STABILITY_FAILED \
+            --infra-code SHADOW_INPUT_INFRA \
+            -- bash -euo pipefail <<'TYPED_COMMAND'
           # LLM contract: canonical shadow inputs -> two local rebuilds ->
           # identical NAR digests, or this candidate fails before merge.
           # Primary sources:
@@ -228,10 +405,16 @@ jobs:
           git -c "safe.directory=$rust_inputs/advisory-db" \
             -C "$rust_inputs/advisory-db" rev-parse --verify 'HEAD^{commit}' \
             >/dev/null
+          TYPED_COMMAND
 
       - name: Check locked Rust dependency policy
         shell: bash
         run: |
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-nix \
+            --code RUST_POLICY_FAILED \
+            --infra-code RUST_POLICY_INFRA \
+            -- bash -euo pipefail <<'TYPED_COMMAND'
           # LLM contract: unified catalog + Cargo.lock -> EXACT_RUST_CHECKS -> PASS or failure.
           # Primary source: https://github.com/rust-lang/rust/blob/8bab26f4f68e0e26f0bb7960be334d5b520ea452/src/tools/build-manifest/src/main.rs
           # Release manifest: https://static.rust-lang.org/dist/2026-07-16/channel-rust-1.97.1.toml
@@ -278,6 +461,7 @@ jobs:
           nix develop --no-update-lock-file --no-write-lock-file --command \
             cargo deny --manifest-path rust/Cargo.toml --config rust/deny.toml \
             --locked --all-features check advisories bans licenses sources
+          TYPED_COMMAND
 
       - name: Check locked Python toolchain and dependencies
         shell: bash
@@ -287,6 +471,11 @@ jobs:
           UV_CACHE_DIR: ${{ runner.temp }}/uv-cache
           UV_TOOL_DIR: ${{ runner.temp }}/uv-tools
         run: |
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-nix \
+            --code PYTHON_POLICY_FAILED \
+            --infra-code PYTHON_POLICY_INFRA \
+            -- bash -euo pipefail <<'TYPED_COMMAND'
           # LLM contract: toolchain.lock + uv.lock -> EXACT_CHECKS -> PASS or non-zero exit.
           # Primary source: https://github.com/facebook/pyrefly/blob/b87de05834c401898c79fd9686b806c051dd3667/website/docs/installation.mdx
           set -euo pipefail
@@ -329,3 +518,62 @@ jobs:
             --output-file "$AUDIT_REQUIREMENTS"
           run_locked pip-audit --cache-dir "$PIP_AUDIT_CACHE" --disable-pip \
             --require-hashes --requirement "$AUDIT_REQUIREMENTS"
+          TYPED_COMMAND
+
+      - name: Report proof duration
+        run: |
+          # LLM contract: completed proof job -> comparable duration and cache evidence.
+          duration="$(($(date +%s) - PROOF_STARTED_EPOCH))"
+          printf '{"cache_state":"%s","classification":"CODE_OK","duration_seconds":%s,"gate":"proof-slow-nix-total","status":"PASS"}\n' \
+            "$PROOF_CACHE_STATE" "$duration"
+
+  required:
+    name: governor / validate
+    if: always()
+    needs: [select, nix]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    env:
+      HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      METADATA_ONLY: ${{ github.event.action == 'edited' && github.event.changes.base == null }}
+      METADATA_PROOF_PRESERVED: ${{ needs.select.outputs.preserved }}
+      PROOF_REQUIRED: ${{ needs.select.outputs.required }}
+      PROOF_RESULT: ${{ needs.nix.result }}
+      SELECT_RESULT: ${{ needs.select.result }}
+    steps:
+      - name: Preserve the legacy required check
+        run: |
+          # LLM contract: path decision + proof result -> REQUIRED_PASS | CLOSED_FAILURE.
+          set -euo pipefail
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"PROOF_HEAD_INVALID","gate":"governor-required","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
+          if [[ "$SELECT_RESULT" != "success" ]]; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"PROOF_SELECTION_INCONCLUSIVE","gate":"governor-required","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
+          if [[ "$METADATA_ONLY" == "true" &&
+            "$METADATA_PROOF_PRESERVED" == "true" ]]; then
+            printf '{"classification":"CODE_OK","gate":"governor-required","head_sha":"%s","proof_claim":"preserved-head","status":"PASS"}\n' \
+              "$HEAD_SHA"
+            exit 0
+          fi
+          if [[ "$METADATA_ONLY" == "true" &&
+            "$METADATA_PROOF_PRESERVED" != "false" ]]; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"PRIOR_REQUIRED_OUTPUT_INVALID","gate":"governor-required","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
+          if [[ "$PROOF_REQUIRED" == "false" &&
+            "$PROOF_RESULT" == "skipped" ]]; then
+            echo '{"classification":"CODE_OK","gate":"governor-required","proof_claim":"none","status":"PASS"}'
+            exit 0
+          fi
+          if [[ "$PROOF_REQUIRED" == "true" &&
+            "$PROOF_RESULT" == "success" ]]; then
+            echo '{"classification":"CODE_OK","gate":"governor-required","proof_claim":"full-nix","status":"PASS"}'
+            exit 0
+          fi
+          printf '{"classification":"CLOSED_FAILURE","code":"PROOF_REQUIRED_NOT_PASS","gate":"governor-required","proof_required":"%s","proof_result":"%s","status":"FAIL"}\n' \
+            "$PROOF_REQUIRED" "$PROOF_RESULT"
+          exit 1
