@@ -2,6 +2,7 @@
   "locked_at": "2026-07-30",
   "required": [
     "actionlint",
+    "bubblewrap",
     "cachix/install-nix-action",
     "cargo",
     "cargo-audit",
@@ -29,6 +30,7 @@
   "schema_version": "0.2",
   "tools": [
     {"id": "actionlint", "language": "nix", "version": "1.7.12", "source": "https://github.com/rhysd/actionlint/archive/refs/tags/v1.7.12.tar.gz", "source_digest": "sha256:9800926f7b1842d9228f3935d263e2da7772df36a4a275b58e553b0ff0d5f923"},
+    {"id": "bubblewrap", "language": "nix", "version": "0.11.2", "source": "https://github.com/containers/bubblewrap/archive/v0.11.2.tar.gz", "source_digest": "sha256:3148c932127c43db184321aa03bcdf32eb588cc4993661075ecd87dd637899b1"},
     {"id": "cachix/install-nix-action", "language": "github_actions", "version": "v31.11.0", "source": "https://github.com/cachix/install-nix-action/commit/630ae543ea3a38a9a4166f03376c02c50f408342", "source_digest": "git:630ae543ea3a38a9a4166f03376c02c50f408342"},
     {"id": "cargo", "language": "rust", "version": "1.97.1", "source": "https://github.com/rust-lang/cargo/commit/c980f4866141969fab6254a680546a277789d6f0", "source_digest": "git:c980f4866141969fab6254a680546a277789d6f0"},
     {"id": "cargo-audit", "language": "rust", "version": "0.22.2", "source": "https://static.crates.io/crates/cargo-audit/0.22.2/download", "source_digest": "sha256:86b9240d126f5ded9f96d5a3116d80d3fb8a5455aafbd3bec11a61b098d3d6d1"},

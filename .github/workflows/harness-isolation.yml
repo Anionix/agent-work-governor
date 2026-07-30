@@ -2,8 +2,8 @@
 # id: agent-work-governor.harness-isolation
 # state: PROTECTED_MAIN_REVISION -> PRIVILEGE_SEPARATION_TEST -> PASS | JOB_FAILURE
 # preconditions: only a merged main revision can trigger this disposable hosted runner
-# invariant: pull requests never execute candidate harness or test bytes as root
-# failure: UID isolation, sticky-root, or detached-overwrite regression fails the job
+# invariant: pull requests never execute candidate bytes as root; merged tests retain only pinned tools
+# failure: missing pinned isolation tools or any UID/write/network regression fails the job
 # source: https://github.com/github/docs/blob/ee27de73e024106c5cf1f3938cf00bb477252862/content/actions/reference/runners/github-hosted-runners.md
 # knowledge: bundle:knowledge/policies/work-governor.md
 # enforced_by: validate
@@ -26,7 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [ubuntu-24.04, macos-15]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]
     steps:
       - name: Check out the protected revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -50,4 +50,15 @@ jobs:
             nix develop --no-update-lock-file --no-write-lock-file --command \
               which python
           )"
-          sudo "$python" -B -m unittest tests.test_bounded_harness
+          trusted_path="$(dirname "$python"):/usr/bin:/bin:/usr/sbin:/sbin"
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            bwrap="$(
+              nix develop --no-update-lock-file --no-write-lock-file --command \
+                which bwrap
+            )"
+            trusted_path="$(dirname "$bwrap"):$trusted_path"
+          fi
+          sudo /usr/bin/env -i \
+            "HOME=$RUNNER_TEMP" \
+            "PATH=$trusted_path" \
+            "$python" -B -m unittest tests.test_bounded_harness

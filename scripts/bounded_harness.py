@@ -5,13 +5,21 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import errno
 import hashlib
+import ipaddress
 import json
 import os
+import platform
 import pwd
 import re
+import shutil
 import signal
+import socket
 import stat
+import struct
+import sys
+from contextlib import ExitStack
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -20,10 +28,10 @@ from typing import Any, cast
 
 # LLM-CONTRACT
 # id: agent-work-governor.bounded-harness
-# state: VALID_EXECUTION_PLAN + DISTINCT_UID -> WRITE_ISOLATED_RUN -> AGGREGATE_RUN_RECEIPT | HARNESS_FAULT
+# state: VALID_EXECUTION_PLAN + DISTINCT_UID -> OS_NETWORK_SANDBOX_VERIFIED -> WRITE_ISOLATED_RUN -> AGGREGATE_RUN_RECEIPT | HARNESS_FAULT
 # preconditions: a root harness binds one plan, repository, invocation, and dedicated identity
-# invariant: only plan argv executes; candidate checks cannot write receipt/evidence or PASS
-# failure: malformed, partial, unbounded, interrupted, or unsafe runs emit a typed sibling fault
+# invariant: only plan argv executes; candidates have no IP sockets and cannot write receipt/evidence or PASS
+# failure: malformed, partial, unbounded, interrupted, unsafe, or unverified isolation emits a typed sibling fault
 # source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/asyncio-subprocess.rst
 # knowledge: bundle:knowledge/policies/work-governor.md
 # enforced_by: execute
@@ -55,6 +63,25 @@ CHECK_FIELDS = {
     "timeout_seconds",
     "tool",
 }
+NETWORK_FAULTS = frozenset(
+    {
+        "HARNESS_NETWORK_SANDBOX_UNAVAILABLE",
+        "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+        "HARNESS_NETWORK_SANDBOX_BYPASS_DETECTED",
+        "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
+    }
+)
+NETWORK_BYPASS_EXIT = 81
+NETWORK_SETUP_EXIT = 82
+SANDBOX_READY = b"\x01"
+# LLM contract: OS_SANDBOX_ENTERED -> READY_BYTE -> CANDIDATE_EXEC;
+# missing readiness proves setup failure before candidate outcome evaluation.
+# Primary source: https://docs.python.org/3.14/library/os.html#os.execvpe
+CANDIDATE_EXEC = (
+    "import os,sys;"
+    "fd=int(sys.argv[1]);os.write(fd,b'\\x01');os.close(fd);"
+    "os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
+)
 
 
 class HarnessError(RuntimeError):
@@ -74,6 +101,11 @@ class CheckPhase(StrEnum):
     FAILED = "failed"
 
 
+class NetworkSandbox(StrEnum):
+    LINUX = "linux"
+    MACOS = "macos"
+
+
 @dataclass(frozen=True)
 class RunIdentity:
     """Unprivileged operating-system identity for candidate checks."""
@@ -90,6 +122,20 @@ class RuntimePaths:
     evidence: Path
     artifacts: Path
     temporary: Path
+
+
+def _sandbox_host_identity(identity: RunIdentity) -> RunIdentity:
+    # LLM contract: Linux root launcher + user namespace -> sandbox nobody is
+    # mapped to host root; macOS keeps the real nobody identity.
+    # Primary source: https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L970-L1003
+    return RunIdentity(0, 0) if sys.platform == "linux" else identity
+
+
+def _cargo_lock_paths(cargo_home: Path) -> tuple[Path, Path]:
+    return (
+        cargo_home / ".package-cache",
+        cargo_home / "advisory-dbs/db.lock",
+    )
 
 
 SAFE_ENVIRONMENT = frozenset(
@@ -375,13 +421,450 @@ def _candidate_environment(
     return environment
 
 
+def _trusted_executable(raw: str | None) -> Path:
+    try:
+        path = Path(raw or "").resolve(strict=True)
+        metadata = path.stat()
+    except OSError as error:
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_UNAVAILABLE") from error
+    _require(
+        path.is_file()
+        and metadata.st_uid == 0
+        and metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH) == 0,
+        "HARNESS_NETWORK_SANDBOX_UNAVAILABLE",
+    )
+    return path
+
+
+def _network_sandbox(identity: RunIdentity | None) -> NetworkSandbox | None:
+    if identity is None:
+        return None
+    if sys.platform == "linux":
+        executable = _trusted_executable(shutil.which("bwrap"))
+        try:
+            executable.relative_to(Path("/nix/store"))
+        except ValueError as error:
+            raise HarnessError("HARNESS_NETWORK_SANDBOX_UNAVAILABLE") from error
+        return NetworkSandbox.LINUX
+    if sys.platform == "darwin":
+        _trusted_executable("/usr/bin/sandbox-exec")
+        return NetworkSandbox.MACOS
+    raise HarnessError("HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED")
+
+
+def _macos_profile(
+    runtime: RuntimePaths,
+    cargo_home: Path | None,
+    cwd: Path,
+    *,
+    allow_loopback: bool = False,
+) -> str:
+    # LLM contract: TRUSTED_PREFLIGHT -> EXPLICIT_LOOPBACK_CAPABILITY;
+    # CANDIDATE -> NO_NETWORK_RULES. Host-shared loopback is never exposed to
+    # candidate bytes because an ambient localhost broker could relay egress.
+    # Primary sources: Apple-shipped sandbox-exec(1),
+    # /usr/share/sandbox/com.apple.CommCenter.sb (remote localhost filter), and
+    # /usr/share/sandbox/mds_stores.sb (file-read subpath filter).
+    # https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/security/mac_socket.c#L147-L164
+    readable = [
+        Path("/nix/store"),
+        Path("/System/Library"),
+        Path("/usr/lib"),
+        Path("/private/etc"),
+        Path("/private/var/db/timezone"),
+        cwd,
+        runtime.artifacts,
+        runtime.temporary,
+    ]
+    writable = [runtime.artifacts, runtime.temporary]
+    if cargo_home is not None:
+        readable.append(cargo_home)
+        writable.append(cargo_home)
+    _require(
+        all(path.is_absolute() and path != Path("/") for path in readable),
+        "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+    )
+    reads = "\n".join(
+        f"(allow file-read* (subpath {json.dumps(str(path))}))"
+        for path in dict.fromkeys(readable)
+    )
+    writes = "\n".join(
+        f"(allow file-write* (subpath {json.dumps(str(path))}))" for path in writable
+    )
+    loopback = ""
+    if allow_loopback:
+        loopback = """
+(allow network-bind (local ip "localhost:*"))
+(allow network-inbound (local ip "localhost:*"))
+(allow network-outbound (remote ip "localhost:*"))
+"""
+    # deny-default also blocks AF_UNIX, AppleEvents, LaunchServices, and
+    # unlisted Mach brokers that could proxy candidate network requests.
+    return f"""
+(version 1)
+(deny default)
+(allow process-exec process-fork)
+(allow process-info* (target same-sandbox))
+(allow signal (target same-sandbox))
+(allow mach-priv-task-port (target same-sandbox))
+{reads}
+(allow file-read* (literal "/dev/null") (literal "/dev/random") (literal "/dev/urandom"))
+{writes}
+(allow file-write-data file-ioctl (literal "/dev/null"))
+(allow sysctl-read user-preference-read ipc-posix-shm ipc-posix-sem)
+{loopback}
+"""
+
+
+def _linux_seccomp_program(
+    machine: str | None = None, *, allow_loopback: bool = False
+) -> bytes:
+    # LLM contract: PINNED_LINUX_ABI -> ARCH_BOUND_SOCKET_ALLOWLIST;
+    # unexpected ABI, x32, io_uring socket creation, or nonlocal socket domain
+    # transitions to policy denial before candidate-controlled network access.
+    # Primary sources:
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/seccomp.h
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/io_uring.h
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/arch/x86/entry/syscalls/syscall_64.tbl
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/asm-generic/unistd.h
+    specifications = {
+        "x86_64": (0xC000003E, 41, 53, 0x40000000),
+        "aarch64": (0xC00000B7, 198, 199, 0),
+        "arm64": (0xC00000B7, 198, 199, 0),
+    }
+    specification = specifications.get((machine or platform.machine()).lower())
+    _require(
+        specification is not None and sys.byteorder == "little",
+        "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
+    )
+    assert specification is not None
+    arch, socket_call, socketpair_call, x32_bit = specification
+    deny = 0x00050000 | errno.EPERM
+    instructions = [
+        (0x20, 0, 0, 4),  # seccomp_data.arch
+        (0x15, 1, 0, arch),
+        (0x06, 0, 0, 0x80000000),  # SECCOMP_RET_KILL_PROCESS
+        (0x20, 0, 0, 0),  # seccomp_data.nr
+    ]
+    if x32_bit:
+        instructions += [(0x45, 0, 1, x32_bit), (0x06, 0, 0, deny)]
+    domains = [int(socket.AF_UNIX)]
+    if allow_loopback:
+        domains += [int(socket.AF_INET), int(socket.AF_INET6)]
+    instructions += [
+        (0x15, 0, 1, 425),  # io_uring_setup
+        (0x06, 0, 0, deny),
+        (0x15, 2, 0, socket_call),
+        (0x15, 1, 0, socketpair_call),
+        (0x06, 0, 0, 0x7FFF0000),  # SECCOMP_RET_ALLOW
+        (0x20, 0, 0, 16),  # seccomp_data.args[0]
+        *[
+            (0x15, len(domains) - index, 0, domain)
+            for index, domain in enumerate(domains)
+        ],
+        (0x06, 0, 0, deny),
+        (0x06, 0, 0, 0x7FFF0000),
+    ]
+    return b"".join(struct.pack("=HBBI", *instruction) for instruction in instructions)
+
+
+def _linux_seccomp_fd(*, allow_loopback: bool = False) -> int:
+    # LLM contract: VERIFIED_FILTER_BYTES -> INHERITED_BWRAP_FD | SETUP_FAILED.
+    program = _linux_seccomp_program(allow_loopback=allow_loopback)
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError as error:
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
+    try:
+        _require(
+            os.write(write_fd, program) == len(program),
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+        )
+    except (HarnessError, OSError) as error:
+        os.close(read_fd)
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
+    finally:
+        os.close(write_fd)
+    return read_fd
+
+
+def _sandboxed_argv(
+    sandbox: NetworkSandbox,
+    identity: RunIdentity,
+    argv: list[str],
+    cwd: Path,
+    runtime: RuntimePaths,
+    cargo_home: Path | None,
+    *,
+    allow_loopback: bool = False,
+    seccomp_fd: int | None = None,
+) -> list[str]:
+    # LLM contract: verified OS sandbox + fixed identity -> one inherited
+    # network boundary; unsupported policy refuses before candidate execution.
+    # Primary sources:
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/sched.h
+    # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L2447-L2464
+    # https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/security/mac_socket.c#L147-L164
+    if sandbox == NetworkSandbox.MACOS:
+        _require(seccomp_fd is None, "HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
+        return [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            _macos_profile(
+                runtime,
+                cargo_home,
+                cwd,
+                allow_loopback=allow_loopback,
+            ),
+            *argv,
+        ]
+    _require(
+        isinstance(seccomp_fd, int) and seccomp_fd >= 3,
+        "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+    )
+    command = [
+        str(_trusted_executable(shutil.which("bwrap"))),
+        "--add-seccomp-fd",
+        str(seccomp_fd),
+        "--unshare-net",
+        "--unshare-user",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--die-with-parent",
+        "--new-session",
+        "--disable-userns",
+        "--cap-drop",
+        "ALL",
+        "--uid",
+        str(identity.uid),
+        "--gid",
+        str(identity.gid),
+        "--ro-bind",
+        "/nix/store",
+        "/nix/store",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--dir",
+        str(runtime.receipt.parent),
+        "--bind",
+        str(runtime.artifacts),
+        str(runtime.artifacts),
+        "--dir",
+        str(runtime.temporary.parent),
+        "--bind",
+        str(runtime.temporary),
+        str(runtime.temporary),
+    ]
+    if cargo_home is not None:
+        command += ["--ro-bind", str(cargo_home), str(cargo_home)]
+        for lock in _cargo_lock_paths(cargo_home):
+            command += ["--bind", str(lock), str(lock)]
+    if not cwd.is_relative_to(Path("/nix/store")) and not cwd.is_relative_to(
+        runtime.artifacts
+    ):
+        command += ["--ro-bind", str(cwd), str(cwd)]
+    return [*command, "--chdir", str(cwd), *argv]
+
+
+def _loopback_fixture(family: socket.AddressFamily, host: str) -> bool:
+    try:
+        with (
+            socket.socket(family, socket.SOCK_STREAM) as server,
+            socket.socket(family, socket.SOCK_STREAM) as client,
+        ):
+            server.settimeout(1)
+            client.settimeout(1)
+            server.bind((host, 0))
+            server.listen(1)
+            return client.connect_ex(server.getsockname()) == 0
+    except OSError:
+        return False
+
+
+def _native_ipv6_listener(stack: ExitStack) -> tuple[str, int, int]:
+    # LLM contract: HOST_NATIVE_IPV6_ROUTE -> REACHABLE_HOST_BOUND_CANARY;
+    # missing or unverified native routing -> POLICY_UNSUPPORTED. UDP connect
+    # selects a source route without sending; only the selected local address
+    # becomes a canary, and no missing-route sentinel may authorize execution.
+    # Primary source:
+    # https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/socket.rst
+    route = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+    try:
+        route.connect(("2001:db8::1", 9))
+    except OSError as error:
+        route.close()
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED") from error
+    stack.enter_context(route)
+    selected = route.getsockname()
+    address = ipaddress.ip_address(selected[0])
+    _require(
+        isinstance(address, ipaddress.IPv6Address)
+        and not address.is_loopback
+        and not address.is_unspecified
+        and address.ipv4_mapped is None,
+        "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
+    )
+    listener = stack.enter_context(socket.socket(socket.AF_INET6, socket.SOCK_STREAM))
+    listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    listener.bind((str(address), 0, 0, selected[3]))
+    listener.listen(8)
+    bound = listener.getsockname()
+    return str(bound[0]), int(bound[1]), int(bound[3])
+
+
+def _socket_domain_filter_enforced() -> bool:
+    # LLM contract: AF_VSOCK_PROBE -> POLICY_EPERM | UNPROVEN_BOUNDARY.
+    # Primary source: https://www.kernel.org/doc/html/v7.1/admin-guide/sysctl/net.html#vsock-sockets
+    family = getattr(socket, "AF_VSOCK", None)
+    if not isinstance(family, int):
+        return False
+    try:
+        probe = socket.socket(family, socket.SOCK_STREAM)
+    except OSError as error:
+        return error.errno == errno.EPERM
+    probe.close()
+    return False
+
+
+def _egress_blocked(
+    host: str,
+    tcp_port: int,
+    native_ipv6: tuple[str, int, int],
+    udp_port: int,
+    unix_path: str,
+) -> bool:
+    if sys.platform == "linux" and not _socket_domain_filter_enforced():
+        return False
+    targets: list[tuple[socket.AddressFamily, Any]] = [
+        (socket.AF_INET, (host, tcp_port)),
+        (socket.AF_INET6, (f"::ffff:{host}", tcp_port)),
+    ]
+    ipv6_host, ipv6_port, ipv6_scope = native_ipv6
+    targets.append((socket.AF_INET6, (ipv6_host, ipv6_port, 0, ipv6_scope)))
+    for family, target in targets:
+        try:
+            with socket.socket(family, socket.SOCK_STREAM) as client:
+                client.settimeout(1)
+                if client.connect_ex(target) == 0:
+                    return False
+        except OSError:
+            pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as datagram:
+            datagram.sendto(b"dns", (host, udp_port))
+    except OSError:
+        pass
+    else:
+        return False
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as local:
+            return local.connect_ex(unix_path) != 0
+    except OSError:
+        return True
+
+
+def _descendant_egress_blocked(
+    host: str,
+    tcp_port: int,
+    native_ipv6: tuple[str, int, int],
+    udp_port: int,
+    unix_path: str,
+) -> bool:
+    child = os.fork()
+    if child == 0:
+        grandchild = os.fork()
+        if grandchild == 0:
+            os._exit(
+                int(
+                    not _egress_blocked(
+                        host,
+                        tcp_port,
+                        native_ipv6,
+                        udp_port,
+                        unix_path,
+                    )
+                )
+            )
+        _, status = os.waitpid(grandchild, 0)
+        os._exit(int(not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0)))
+    _, status = os.waitpid(child, 0)
+    return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+def _network_probe(argv: list[str]) -> int:
+    try:
+        _require(len(argv) == 8 and all(atom for atom in argv))
+        (
+            host,
+            tcp_port,
+            ipv6_host,
+            ipv6_port,
+            ipv6_scope,
+            udp_port,
+            unix_path,
+            write_canary,
+        ) = (
+            argv[0],
+            int(argv[1]),
+            argv[2],
+            int(argv[3]),
+            int(argv[4]),
+            int(argv[5]),
+            argv[6],
+            Path(argv[7]),
+        )
+        ipv6_address = ipaddress.ip_address(ipv6_host)
+        _require(
+            isinstance(ipv6_address, ipaddress.IPv6Address)
+            and not ipv6_address.is_loopback
+            and not ipv6_address.is_unspecified
+            and ipv6_address.ipv4_mapped is None
+            and 0 < ipv6_port <= 65_535
+            and ipv6_scope >= 0
+        )
+        native_ipv6 = (ipv6_host, ipv6_port, ipv6_scope)
+        _require(
+            not ipaddress.ip_address(host).is_loopback
+            and 0 < tcp_port <= 65_535
+            and 0 < udp_port <= 65_535
+            and write_canary.is_absolute()
+        )
+        write_canary.write_bytes(b"network-sandbox-write-ok")
+        if not (
+            _loopback_fixture(socket.AF_INET, "127.0.0.1")
+            and _loopback_fixture(socket.AF_INET6, "::1")
+        ):
+            return NETWORK_SETUP_EXIT
+        if not (
+            _egress_blocked(host, tcp_port, native_ipv6, udp_port, unix_path)
+            and _descendant_egress_blocked(
+                host,
+                tcp_port,
+                native_ipv6,
+                udp_port,
+                unix_path,
+            )
+        ):
+            return NETWORK_BYPASS_EXIT
+        return 0
+    except (HarnessError, OSError, ValueError):
+        return NETWORK_SETUP_EXIT
+
+
 async def _spawn(
     argv: list[str],
     cwd: Path,
-    artifacts: Path,
-    temporary: Path,
+    runtime: RuntimePaths,
     cargo_home: Path | None,
     identity: RunIdentity | None,
+    sandbox: NetworkSandbox | None,
+    *,
+    allow_loopback: bool = False,
 ) -> asyncio.subprocess.Process:
     if identity is None:
         return await asyncio.create_subprocess_exec(
@@ -392,31 +875,197 @@ async def _spawn(
             stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
-    return await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=cwd,
-        env=_candidate_environment(artifacts, temporary, cargo_home),
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-        start_new_session=True,
-        extra_groups=(),
-        group=identity.gid,
-        user=identity.uid,
+    _require(sandbox is not None, "HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
+    assert sandbox is not None
+    seccomp_fd = (
+        _linux_seccomp_fd(allow_loopback=allow_loopback)
+        if sandbox == NetworkSandbox.LINUX
+        else None
     )
+    try:
+        ready_read, ready_write = os.pipe()
+    except OSError as error:
+        if seccomp_fd is not None:
+            os.close(seccomp_fd)
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
+    process: asyncio.subprocess.Process | None = None
+    try:
+        wrapped = [
+            sys.executable,
+            "-I",
+            "-B",
+            "-c",
+            CANDIDATE_EXEC,
+            str(ready_write),
+            *argv,
+        ]
+        command = _sandboxed_argv(
+            sandbox,
+            identity,
+            wrapped,
+            cwd,
+            runtime,
+            cargo_home,
+            allow_loopback=allow_loopback,
+            seccomp_fd=seccomp_fd,
+        )
+        macos = sandbox == NetworkSandbox.MACOS
+        inherited = (ready_write,) if seccomp_fd is None else (ready_write, seccomp_fd)
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            cwd=cwd if macos else "/",
+            env=_candidate_environment(
+                runtime.artifacts, runtime.temporary, cargo_home
+            ),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+            pass_fds=inherited,
+            extra_groups=() if macos else None,
+            group=identity.gid if macos else None,
+            user=identity.uid if macos else None,
+        )
+        os.close(ready_write)
+        ready_write = -1
+        ready = await asyncio.wait_for(asyncio.to_thread(os.read, ready_read, 1), 2)
+        _require(
+            ready == SANDBOX_READY,
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+        )
+        return process
+    except asyncio.CancelledError:
+        if process is not None and process.returncode is None:
+            _kill(process)
+            await process.wait()
+        raise
+    except (HarnessError, OSError, TimeoutError) as error:
+        if process is not None and process.returncode is None:
+            _kill(process)
+            await process.wait()
+        if isinstance(error, HarnessError):
+            raise
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
+    finally:
+        os.close(ready_read)
+        if ready_write >= 0:
+            os.close(ready_write)
+        if seccomp_fd is not None:
+            os.close(seccomp_fd)
+
+
+async def _verify_network_sandbox(
+    identity: RunIdentity | None,
+    runtime: RuntimePaths,
+) -> NetworkSandbox | None:
+    sandbox = _network_sandbox(identity)
+    if sandbox is None:
+        return None
+    process: asyncio.subprocess.Process | None = None
+    unix_path = runtime.receipt.parent / ".network-canary.sock"
+    unix_path.unlink(missing_ok=True)
+    try:
+        with ExitStack() as stack:
+            route = stack.enter_context(
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            )
+            route.connect(("192.0.2.1", 9))
+            host = route.getsockname()[0]
+            _require(
+                isinstance(ipaddress.ip_address(host), ipaddress.IPv4Address)
+                and not ipaddress.ip_address(host).is_loopback,
+                "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+            )
+            listener = stack.enter_context(
+                socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            )
+            datagram = stack.enter_context(
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            )
+            listener.bind((host, 0))
+            listener.listen(8)
+            datagram.bind((host, 0))
+            tcp_port = listener.getsockname()[1]
+            udp_port = datagram.getsockname()[1]
+            native_ipv6 = _native_ipv6_listener(stack)
+            unix_listener = stack.enter_context(
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            )
+            unix_listener.bind(str(unix_path))
+            stack.callback(unix_path.unlink, missing_ok=True)
+            unix_listener.listen(2)
+            write_canary = runtime.artifacts / ".network-write-canary"
+            write_canary.unlink(missing_ok=True)
+            stack.callback(write_canary.unlink, missing_ok=True)
+            reachable_targets: list[tuple[socket.AddressFamily, Any]] = [
+                (socket.AF_INET, (host, tcp_port)),
+                (socket.AF_INET6, (f"::ffff:{host}", tcp_port)),
+                (socket.AF_UNIX, str(unix_path)),
+            ]
+            ipv6_host, ipv6_port, ipv6_scope = native_ipv6
+            reachable_targets.append(
+                (socket.AF_INET6, (ipv6_host, ipv6_port, 0, ipv6_scope))
+            )
+            for family, target in reachable_targets:
+                with socket.socket(family, socket.SOCK_STREAM) as client:
+                    _require(
+                        client.connect_ex(target) == 0,
+                        "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
+                    )
+            harness = Path(__file__).resolve(strict=True)
+            process = await _spawn(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(harness),
+                    "--network-probe",
+                    host,
+                    str(tcp_port),
+                    native_ipv6[0],
+                    str(native_ipv6[1]),
+                    str(native_ipv6[2]),
+                    str(udp_port),
+                    str(unix_path),
+                    str(write_canary),
+                ],
+                harness.parent,
+                runtime,
+                None,
+                identity,
+                sandbox,
+                allow_loopback=True,
+            )
+            output, _ = await asyncio.wait_for(process.communicate(), 5)
+            _require(len(output) <= 4096, "HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
+            _require(
+                write_canary.read_bytes() == b"network-sandbox-write-ok",
+                "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+            )
+    except HarnessError:
+        raise
+    except (OSError, TimeoutError, ValueError) as error:
+        if process is not None and process.returncode is None:
+            _kill(process)
+            await process.wait()
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
+    if process.returncode == NETWORK_BYPASS_EXIT:
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_BYPASS_DETECTED")
+    if process.returncode != 0:
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
+    return sandbox
 
 
 async def _execute_check(
     check: dict[str, Any],
     repository: Path,
-    evidence_root: Path,
-    artifacts: Path,
-    temporary: Path,
+    runtime: RuntimePaths,
     events: dict[str, asyncio.Event],
     semaphore: asyncio.Semaphore,
     state: dict[str, CheckPhase],
     cargo_home: Path | None,
     identity: RunIdentity | None,
+    sandbox: NetworkSandbox | None,
 ) -> dict[str, object]:
     identifier = check["identifier"]
     await asyncio.gather(*(events[item].wait() for item in check["dependencies"]))
@@ -427,17 +1076,19 @@ async def _execute_check(
                 atom
                 if isinstance(atom, str)
                 else _artifact(
-                    atom["artifact"], set(check["input_artifacts"]), artifacts
+                    atom["artifact"],
+                    set(check["input_artifacts"]),
+                    runtime.artifacts,
                 )
                 for atom in check["argv"]
             ]
             process = await _spawn(
                 argv,
                 _inside(repository, check["path"]),
-                artifacts,
-                temporary,
+                runtime,
                 cargo_home,
                 identity,
+                sandbox,
             )
         except HarnessError as error:
             state[identifier] = CheckPhase.FAILED
@@ -481,7 +1132,7 @@ async def _execute_check(
         evidence = bytes(output)
         relative = f".governance/receipts/evidence/{identifier}.log"
         try:
-            _atomic(evidence_root / f"{identifier}.log", evidence)
+            _atomic(runtime.evidence / f"{identifier}.log", evidence)
         except OSError as error:
             state[identifier] = CheckPhase.FAILED
             raise HarnessError("HARNESS_EVIDENCE_WRITE_FAILED", identifier) from error
@@ -652,9 +1303,10 @@ def _prepare_rust_inputs(
         (advisory_root / "advisory-db-3157b0e258782691").symlink_to(
             source / "advisory-db"
         )
-        for lock in (cargo_home / ".package-cache", advisory_root / "db.lock"):
+        owner = _sandbox_host_identity(identity)
+        for lock in _cargo_lock_paths(cargo_home):
             lock.touch(mode=0o600)
-            os.chown(lock, identity.uid, identity.gid)
+            os.chown(lock, owner.uid, owner.gid)
         return cargo_home
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         raise HarnessError("HARNESS_RUST_INPUTS_UNTRUSTED") from error
@@ -679,6 +1331,7 @@ def _prepare_runtime(
             temporary = artifacts
         else:
             _validate_subject(repository, identity)
+            owner = _sandbox_host_identity(identity)
             _require(
                 runtime_root.is_absolute()
                 and receipt.is_absolute()
@@ -706,7 +1359,7 @@ def _prepare_runtime(
             evidence = _runtime_dir(runtime_root, "evidence")
             evidence.chmod(0o700)
             artifacts = _runtime_dir(runtime_root, "artifacts")
-            os.chown(artifacts, identity.uid, identity.gid)
+            os.chown(artifacts, owner.uid, owner.gid)
             artifacts.chmod(0o700)
             # LLM contract: protected 0711 runtime + root-owned readable anchor
             # -> candidate-only temporary workspace | typed preparation failure.
@@ -721,11 +1374,11 @@ def _prepare_runtime(
                 "HARNESS_RUNTIME_ROOT_UNSAFE",
             )
             temporary = _runtime_dir(temporary_anchor, "tmp")
-            os.chown(temporary, identity.uid, identity.gid)
+            os.chown(temporary, owner.uid, owner.gid)
             temporary.chmod(0o700)
             metadata = temporary.lstat()
             _require(
-                metadata.st_uid == identity.uid
+                metadata.st_uid == owner.uid
                 and stat.S_ISDIR(metadata.st_mode)
                 and stat.S_IMODE(metadata.st_mode) == 0o700,
                 "HARNESS_RUNTIME_ROOT_UNSAFE",
@@ -743,7 +1396,6 @@ async def execute(
     plan_sha256: str,
     coverage_sha256: str,
     repository: Path,
-    receipt: Path,
     invocation_sha256: str,
     workers: int,
     runtime: RuntimePaths,
@@ -755,9 +1407,7 @@ async def execute(
         "HARNESS_INVOCATION_INVALID",
     )
     receipt = runtime.receipt
-    evidence_root = runtime.evidence
-    artifacts = runtime.artifacts
-    temporary = runtime.temporary
+    sandbox = await _verify_network_sandbox(identity, runtime)
     order = [check["identifier"] for check in checks]
     state = dict.fromkeys(order, CheckPhase.NOT_STARTED)
     events = {identifier: asyncio.Event() for identifier in order}
@@ -767,14 +1417,13 @@ async def execute(
             _execute_check(
                 check,
                 repository,
-                evidence_root,
-                artifacts,
-                temporary,
+                runtime,
                 events,
                 semaphore,
                 state,
                 cargo_home,
                 identity,
+                sandbox,
             )
         )
         for check in checks
@@ -866,7 +1515,6 @@ def main(argv: list[str] | None = None) -> int:
                 plan_sha256,
                 coverage_sha256,
                 repository,
-                runtime.receipt,
                 args.invocation_sha256,
                 args.workers,
                 runtime,
@@ -884,6 +1532,8 @@ def main(argv: list[str] | None = None) -> int:
             _fault(runtime.receipt, error)
         if error.code == "HARNESS_INTERRUPTED":
             return 130
+        if error.code in NETWORK_FAULTS:
+            return 70
         return 2 if "PLAN" in error.code else 1
     print(
         _json(
@@ -894,4 +1544,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    arguments = sys.argv[1:]
+    if arguments and arguments[0] == "--network-probe":
+        raise SystemExit(_network_probe(arguments[1:]))
+    raise SystemExit(main(arguments))

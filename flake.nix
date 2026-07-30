@@ -455,6 +455,7 @@
           cargoCommit = gitCommit "rust" "cargo";
           python = pythonBase;
           actionlint = bindNixPackage "nix" "actionlint" "actionlint" pkgs.actionlint;
+          bubblewrap = bindNixPackage "nix" "bubblewrap" "bubblewrap" pkgs.bubblewrap;
           cargoAudit = bindNixPackage "rust" "cargo-audit" "cargo-audit" pkgs.cargo-audit;
           cargoDeny = bindNixPackage "rust" "cargo-deny" "cargo-deny" pkgs.cargo-deny;
           git = builtins.seq provenanceBindingSelfTest (
@@ -594,6 +595,9 @@
               toolchain.ruff
               toolchain.ty
               toolchain.uv
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              toolchain.bubblewrap
             ];
             preCheck = ''
               assert_locked_identity() {
@@ -710,6 +714,9 @@
               toolchain.ruff
               toolchain.ty
               toolchain.uv
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+              toolchain.bubblewrap
             ];
             shellHook = ''
               # LLM contract: inherited tool state -> REPO_LOCAL_CACHE, so host
