@@ -6,8 +6,8 @@ use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
 use agent_work_governor::{
-    CheckRequest, EvidenceArtifact, Governor, MAX_CHECK_OUTPUT_BYTES, MAX_RUN_RECEIPT_BYTES,
-    PlanBindings, PlanProject, Preset,
+    CheckRequest, EffectiveAuthority, EvidenceArtifact, Governor, MAX_CHECK_OUTPUT_BYTES,
+    MAX_RUN_RECEIPT_BYTES, OwnerScopeInput, PlanBindings, PlanProject, Preset,
 };
 use clap::error::ErrorKind;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -41,6 +41,9 @@ enum Command {
         /// Plugin source or installed bundle root.
         #[arg(long)]
         plugin_root: Option<PathBuf>,
+        /// Repository-external owner-scope evidence and caller grants.
+        #[command(flatten)]
+        owner_scope: CliOwnerScope,
     },
     /// Validate one policy TOML file.
     Policy {
@@ -145,6 +148,75 @@ struct CliPlanBindings {
     /// SHA-256 digest of the execution environment.
     #[arg(long = "environment-sha256")]
     environment: String,
+}
+
+#[derive(Debug, Args)]
+#[group(
+    id = "owner-scope",
+    multiple = true,
+    requires_all = [
+        "owner_receipt",
+        "owner_public_key",
+        "owner_trusted_key_sha256",
+        "owner_repository_id",
+        "owner_id",
+        "owner_repository_full_name",
+        "owner_issuer",
+        "owner_now_epoch_seconds",
+        "runtime_repository_write",
+        "runtime_external_side_effects"
+    ]
+)]
+struct CliOwnerScope {
+    /// Signed receipt stored outside the governed repository.
+    #[arg(long)]
+    owner_receipt: Option<PathBuf>,
+    /// Trusted raw Ed25519 public key stored outside the repository.
+    #[arg(long)]
+    owner_public_key: Option<PathBuf>,
+    /// Caller-pinned SHA-256 digest of the trusted public key.
+    #[arg(long)]
+    owner_trusted_key_sha256: Option<String>,
+    /// Immutable GitHub repository database ID.
+    #[arg(long)]
+    owner_repository_id: Option<u64>,
+    /// Immutable GitHub owner database ID.
+    #[arg(long)]
+    owner_id: Option<u64>,
+    /// Case-preserving GitHub owner/name.
+    #[arg(long)]
+    owner_repository_full_name: Option<String>,
+    /// Trusted receipt issuer.
+    #[arg(long)]
+    owner_issuer: Option<String>,
+    /// Caller-observed Unix time.
+    #[arg(long)]
+    owner_now_epoch_seconds: Option<u64>,
+    /// Caller runtime grant for repository writes.
+    #[arg(long)]
+    runtime_repository_write: Option<bool>,
+    /// Caller runtime grant for external side effects.
+    #[arg(long)]
+    runtime_external_side_effects: Option<bool>,
+}
+
+impl CliOwnerScope {
+    fn into_model(self) -> Option<OwnerScopeInput> {
+        Some(OwnerScopeInput {
+            receipt_path: self.owner_receipt?,
+            public_key_path: self.owner_public_key?,
+            trusted_key_sha256: self.owner_trusted_key_sha256?,
+            repository_id: self.owner_repository_id?,
+            owner_id: self.owner_id?,
+            repository_full_name: self.owner_repository_full_name?,
+            issuer: self.owner_issuer?,
+            now_epoch_seconds: self.owner_now_epoch_seconds?,
+            runtime_authority: EffectiveAuthority {
+                repository_write: self.runtime_repository_write?,
+                external_side_effects: self.runtime_external_side_effects?,
+            },
+        })
+    }
 }
 
 impl CliPlanBindings {
@@ -299,9 +371,17 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<ExitCode> {
     let request = match cli.command {
-        Command::Check { repo, plugin_root } => {
+        Command::Check {
+            repo,
+            plugin_root,
+            owner_scope,
+        } => {
             let plugin_root = plugin_root.unwrap_or_else(|| default_plugin_root(&repo));
-            CheckRequest::Repository { repo, plugin_root }
+            CheckRequest::Repository {
+                repo,
+                plugin_root,
+                owner_scope: owner_scope.into_model(),
+            }
         }
         Command::Policy { policy } => CheckRequest::Policy { path: policy },
         Command::Contract {
