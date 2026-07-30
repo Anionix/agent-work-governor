@@ -25,10 +25,12 @@ Repository required files, tracked ignored output, Action SHA pins, and diff
 validity share one validator that runs in both the early shadow lane and the
 required proof job on every new head; only expensive Nix remains path-selected.
 Metadata-only PR edits keep the same required name without rerunning Nix. They
-queue behind any proof already running, then use the GitHub Checks API to require
-an earlier successful `governor / validate` from GitHub Actions on the identical
-head SHA. Malformed or unreadable evidence fails closed; successful reconciliation
-emits `proof_claim: preserved-head`. If no prior success exists,
+queue behind any proof already running, then use the workflow-specific Actions
+API endpoint to require an earlier successful `proof-slow-nix` run from
+`.github/workflows/proof-slow.yml` on the identical head SHA. A same-named
+`governor / validate` check from another workflow is not evidence. Malformed or
+unreadable evidence fails closed; successful reconciliation emits
+`proof_claim: preserved-head`. If no prior success exists,
 the metadata run inherits the pending obligation and performs the normal
 path-selected proof instead; malformed or unreadable API evidence remains
 inconclusive.
@@ -69,3 +71,4 @@ Primary sources:
 - [GitHub path filters](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#onpushpull_requestpull_request_targetpathspaths-ignore)
 - [GitHub concurrency](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
 - [GitHub CLI in workflows](https://docs.github.com/en/actions/how-tos/write-workflows/choose-what-workflows-do/use-github-cli)
+- [GitHub workflow-runs REST endpoint](https://docs.github.com/en/rest/actions/workflow-runs#list-workflow-runs-for-a-workflow)

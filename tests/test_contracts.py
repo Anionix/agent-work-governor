@@ -121,6 +121,72 @@ def workflow_run_block(workflow: str, step_name: str) -> str:
     return "\n".join(body) + "\n"
 
 
+def run_metadata_proof_fixture(
+    payload: dict[str, object],
+) -> subprocess.CompletedProcess[str]:
+    """Run metadata reconciliation against one isolated Actions response."""
+
+    jq = shutil.which("jq")
+    bash = shutil.which("bash")
+    if jq is None or bash is None:
+        raise unittest.SkipTest("bash and jq are required")
+    workflow = (PLUGIN_ROOT / ".github/workflows/proof-slow.yml").read_text(
+        encoding="utf-8"
+    )
+    step = workflow_run_block(workflow, "Reconcile metadata-only proof")
+    head_sha = "a" * 40
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        fixture = root / "workflow-runs.json"
+        fixture.write_text(json.dumps(payload), encoding="utf-8")
+        output = root / "github-output"
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        fake_gh = fake_bin / "gh"
+        fake_gh.write_text(
+            (
+                f"#!{sys.executable}\n"
+                "import os, subprocess, sys\n"
+                "required = {\n"
+                "  'repos/Anionix/agent-work-governor/actions/workflows/"
+                "proof-slow.yml/runs',\n"
+                "  'head_sha=' + 'a' * 40,\n"
+                "  'event=pull_request', 'status=success', 'per_page=100',\n"
+                "}\n"
+                "if sys.argv[1] != 'api' or not required.issubset(set(sys.argv[2:])):\n"
+                "  raise SystemExit(64)\n"
+                "query = sys.argv[sys.argv.index('--jq') + 1]\n"
+                "result = subprocess.run(\n"
+                "  [os.environ['AWG_FIXTURE_JQ'], '-r', query,\n"
+                "   os.environ['AWG_FIXTURE_JSON']],\n"
+                "  check=False, capture_output=True, text=True,\n"
+                ")\n"
+                "sys.stdout.write(result.stdout)\n"
+                "sys.stderr.write(result.stderr)\n"
+                "raise SystemExit(result.returncode)\n"
+            ),
+            encoding="utf-8",
+        )
+        fake_gh.chmod(0o755)
+        return subprocess.run(
+            [bash, "-c", step],
+            cwd=root,
+            env={
+                "AWG_FIXTURE_JQ": jq,
+                "AWG_FIXTURE_JSON": str(fixture),
+                "GH_API_URL": "https://api.github.com",
+                "GH_REPOSITORY": "Anionix/agent-work-governor",
+                "GH_TOKEN": "fixture",
+                "GITHUB_OUTPUT": str(output),
+                "PATH": f"{fake_bin}:/usr/bin:/bin",
+                "PR_HEAD_SHA": head_sha,
+            },
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+
 def workflow_event_paths(workflow: str, event: str) -> tuple[str, ...]:
     """Extract one event's quoted path filters without a YAML dependency."""
 
@@ -1981,10 +2047,12 @@ class SourceHygieneTests(unittest.TestCase):
 
         for evidence in (
             "name: proof-slow-nix",
-            "PR_METADATA_EDIT -> PRIOR_SAME_HEAD_REQUIRED_CHECK",
+            "PR_METADATA_EDIT -> PRIOR_SAME_HEAD_PROOF_WORKFLOW",
+            "PROOF_WORKFLOW_IDENTITY_BOUND_SUCCESS",
             "a metadata edit that replaces pending proof inherits its proof obligation",
             "missing prior proof falls back to full proof",
             "malformed readback fails closed",
+            "permissions:\n  actions: read",
             "merge_group:",
             "workflow_dispatch:",
             "schedule:",
@@ -1997,9 +2065,12 @@ class SourceHygieneTests(unittest.TestCase):
             "Enforce required repository controls",
             "scripts/validate_repository_controls.sh",
             "Reconcile metadata-only proof",
-            "check_name=governor / validate",
-            "PRIOR_REQUIRED_CHECK_MISSING_FALLBACK",
-            "PRIOR_REQUIRED_READBACK_FAILED",
+            "actions/workflows/proof-slow.yml/runs",
+            ".workflow_runs[]",
+            '.name == \\"proof-slow-nix\\"',
+            "PRIOR_PROOF_WORKFLOW_MISSING_FALLBACK",
+            "PRIOR_PROOF_WORKFLOW_READBACK_FAILED",
+            "PRIOR_PROOF_WORKFLOW_IDENTITY_BOUND",
             "FULL_PROOF_FALLBACK",
             "for _ in 1 2",
             '"proof_claim":"none"',
@@ -2066,7 +2137,7 @@ class SourceHygieneTests(unittest.TestCase):
             shadow,
         )
         self.assertIn(
-            "permissions:\n  checks: read\n  contents: read\n\nenv:",
+            "permissions:\n  actions: read\n  checks: read\n  contents: read\n\nenv:",
             proof,
         )
         self.assertIn(
@@ -2101,6 +2172,8 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertNotIn("proof-slow / metadata-edit-select", proof)
         self.assertNotIn("proof-slow / metadata-edit-nix", proof)
         self.assertNotIn("proof-slow / metadata-edit-required", proof)
+        self.assertNotIn("commits/$PR_HEAD_SHA/check-runs", proof)
+        self.assertNotIn("check_name=governor / validate", proof)
         self.assertEqual(1, proof.count("name: governor / validate"))
 
         def proof_event_contract(
@@ -2194,6 +2267,84 @@ class SourceHygieneTests(unittest.TestCase):
             )
         self.assertEqual(len(job_names), len(set(job_names)))
         self.assertEqual(len(workflow_names), len(set(workflow_names)))
+
+    def test_metadata_proof_requires_workflow_run_identity(self) -> None:
+        head_sha = "a" * 40
+        proof_run: dict[str, object] = {
+            "id": 111,
+            "workflow_id": 222,
+            "run_attempt": 1,
+            "name": "proof-slow-nix",
+            "path": ".github/workflows/proof-slow.yml",
+            "head_sha": head_sha,
+            "event": "pull_request",
+            "status": "completed",
+            "conclusion": "success",
+            "repository": {"full_name": "Anionix/agent-work-governor"},
+        }
+        accepted = run_metadata_proof_fixture(
+            {"total_count": 1, "workflow_runs": [proof_run]}
+        )
+        self.assertEqual(0, accepted.returncode, accepted.stderr)
+        self.assertIn("PRIOR_PROOF_WORKFLOW_IDENTITY_BOUND", accepted.stdout)
+        same_workflow = {
+            **proof_run,
+            "id": 112,
+            "run_attempt": 2,
+        }
+        accepted_multiple = run_metadata_proof_fixture(
+            {"total_count": 2, "workflow_runs": [proof_run, same_workflow]}
+        )
+        self.assertEqual(0, accepted_multiple.returncode, accepted_multiple.stderr)
+
+        unrelated: dict[str, object] = dict(proof_run)
+        unrelated.update(
+            {
+                "name": "unrelated-workflow",
+                "path": ".github/workflows/unrelated.yml@main",
+                "jobs": [{"name": "governor / validate", "conclusion": "success"}],
+            }
+        )
+        rejected = run_metadata_proof_fixture(
+            {
+                "total_count": 0,
+                "workflow_runs": [],
+                "check_runs": [unrelated],
+            }
+        )
+        self.assertEqual(0, rejected.returncode, rejected.stderr)
+        self.assertIn("PRIOR_PROOF_WORKFLOW_MISSING_FALLBACK", rejected.stdout)
+        self.assertNotIn("IDENTITY_BOUND", rejected.stdout)
+
+        contradictory_cases: tuple[dict[str, object], ...] = (
+            {"total_count": 0, "workflow_runs": [proof_run]},
+            {"total_count": "1", "workflow_runs": [proof_run]},
+            {"total_count": 2, "workflow_runs": [proof_run, proof_run]},
+            {
+                "total_count": 2,
+                "workflow_runs": [
+                    proof_run,
+                    {**same_workflow, "workflow_id": 333},
+                ],
+            },
+            {"total_count": 1, "workflow_runs": []},
+            {
+                "total_count": 1,
+                "workflow_runs": [{**proof_run, "workflow_id": "222"}],
+            },
+        )
+        for contradictory in contradictory_cases:
+            with self.subTest(contradictory=contradictory):
+                invalid = run_metadata_proof_fixture(contradictory)
+                self.assertEqual(2, invalid.returncode)
+                self.assertIn(
+                    "PRIOR_PROOF_WORKFLOW_RESPONSE_INVALID",
+                    invalid.stdout,
+                )
+
+        malformed = run_metadata_proof_fixture({"total_count": 1})
+        self.assertEqual(2, malformed.returncode)
+        self.assertIn("PRIOR_PROOF_WORKFLOW_READBACK_FAILED", malformed.stdout)
 
     def test_required_repository_controls_fail_closed(self) -> None:
         for accepted in (
