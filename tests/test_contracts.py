@@ -271,6 +271,101 @@ def run_nix_bootstrap_fixture(
         )
 
 
+def run_repository_controls_fixture(
+    *,
+    action: str | None = None,
+    composite_action: str | None = None,
+    docker_action_image: str | None = None,
+    ignored_output: bool = False,
+    invalid_diff: bool = False,
+    missing_contract: bool = False,
+    template_action: str | None = None,
+    tracked_output: str | None = None,
+    uses_input: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run required repository controls against one isolated candidate tree."""
+
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        workflow = root / ".github/workflows/fixture.yml"
+        workflow.parent.mkdir(parents=True)
+        action = action or f"uses: owner/action@{'a' * 40}"
+        uses_input_block = (
+            "\n        with:\n          uses: ordinary-input" if uses_input else ""
+        )
+        workflow.write_text(
+            "name: fixture\non:\n  workflow_dispatch:\njobs:\n"
+            "  fixture:\n    runs-on: ubuntu-24.04\n    steps:\n"
+            f"      - {action}{uses_input_block}\n",
+            encoding="utf-8",
+        )
+        if composite_action or docker_action_image:
+            manifest = root / ".github/actions/local/action.yml"
+            manifest.parent.mkdir(parents=True)
+            manifest_source = (
+                "name: fixture\ndescription: fixture\nruns:\n"
+                "  using: composite\n  steps:\n"
+                f"    - uses: {composite_action}\n"
+                if composite_action
+                else "name: fixture\ndescription: fixture\nruns:\n"
+                f"  using: docker\n  image: {docker_action_image}\n"
+            )
+            manifest.write_text(manifest_source, encoding="utf-8")
+        if template_action:
+            template = root / "assets/repository/.github/workflows/template.yml"
+            template.parent.mkdir(parents=True)
+            template.write_text(
+                "name: template\non:\n  workflow_dispatch:\njobs:\n"
+                "  fixture:\n    runs-on: ubuntu-24.04\n    steps:\n"
+                f"      - uses: {template_action}\n",
+                encoding="utf-8",
+            )
+        required = "AGENTS.md CONTRIBUTING.md SECURITY.md flake.nix flake.lock"
+        for name in required.split():
+            if not (missing_contract and name == "SECURITY.md"):
+                (root / name).write_text("", encoding="utf-8")
+        (root / ".gitignore").write_text("runtime/\n", encoding="utf-8")
+        output_path = "runtime/cache" if ignored_output else tracked_output
+        if output_path:
+            output = root / output_path
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text("runtime\n", encoding="utf-8")
+
+        def git(*arguments: str) -> str:
+            return subprocess.check_output(
+                ["git", *arguments], cwd=root, text=True
+            ).strip()
+
+        git("init", "-q")
+        git("config", "user.name", "Fixture")
+        git("config", "user.email", "fixture@example.invalid")
+        git("config", "commit.gpgsign", "false")
+        git("add", ".")
+        if ignored_output:
+            git("add", "-f", "runtime/cache")
+        git("commit", "-qm", "fixture")
+        base = git("rev-parse", "HEAD")
+        if invalid_diff:
+            invalid = root / "docs/invalid.md"
+            invalid.parent.mkdir()
+            invalid.write_text("trailing whitespace  \n", encoding="utf-8")
+            git("add", "docs/invalid.md")
+            git("commit", "-qm", "invalid diff")
+        head = git("rev-parse", "HEAD")
+        return subprocess.run(
+            [
+                shutil.which("bash") or "bash",
+                str(PLUGIN_ROOT / "scripts/validate_repository_controls.sh"),
+                base,
+                head,
+            ],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+
 class PolicyTests(unittest.TestCase):
     def test_safe_and_owner_presets_validate(self) -> None:
         policies = (
@@ -1872,6 +1967,7 @@ class SourceHygieneTests(unittest.TestCase):
             '"classification":"CODE_FAIL"',
             '"classification":"INFRA_INCONCLUSIVE"',
             '"duration_seconds":%s',
+            "scripts/validate_repository_controls.sh",
         ):
             self.assertIn(evidence, shadow)
         for forbidden in (
@@ -1898,6 +1994,8 @@ class SourceHygieneTests(unittest.TestCase):
             "nix flake check",
             "AWG_RUN_NIX_INTEGRATION=1",
             "scripts/run_typed_ci.py",
+            "Enforce required repository controls",
+            "scripts/validate_repository_controls.sh",
             "Reconcile metadata-only proof",
             "check_name=governor / validate",
             "PRIOR_REQUIRED_CHECK_MISSING_FALLBACK",
@@ -2073,6 +2171,16 @@ class SourceHygieneTests(unittest.TestCase):
             ),
         )
         self.assertEqual(1, kani.count("cancel-in-progress: true"))
+        self.assertEqual(
+            2,
+            (shadow + proof).count("scripts/validate_repository_controls.sh"),
+        )
+        self.assertIn(
+            "if: needs.select.result == 'success' && "
+            "needs.select.outputs.preserved != 'true'",
+            proof,
+        )
+        self.assertIn('"$PROOF_RESULT" == "success"', proof)
 
         job_names: list[str] = []
         workflow_names: list[str] = []
@@ -2086,6 +2194,100 @@ class SourceHygieneTests(unittest.TestCase):
             )
         self.assertEqual(len(job_names), len(set(job_names)))
         self.assertEqual(len(workflow_names), len(set(workflow_names)))
+
+    def test_required_repository_controls_fail_closed(self) -> None:
+        for accepted in (
+            run_repository_controls_fixture(),
+            run_repository_controls_fixture(
+                action=f"uses: docker://alpine@sha256:{'a' * 64}"
+            ),
+            run_repository_controls_fixture(
+                docker_action_image=f"docker://alpine@sha256:{'a' * 64}"
+            ),
+            run_repository_controls_fixture(docker_action_image="Dockerfile"),
+            run_repository_controls_fixture(template_action=f"owner/action@{'a' * 40}"),
+            run_repository_controls_fixture(uses_input=True),
+        ):
+            self.assertEqual(0, accepted.returncode, accepted.stderr)
+        cases = (
+            (
+                run_repository_controls_fixture(missing_contract=True),
+                "REPOSITORY_CONTRACT_MISSING",
+            ),
+            (
+                run_repository_controls_fixture(tracked_output="bin/tool"),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (
+                run_repository_controls_fixture(tracked_output="build/artifact"),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (
+                run_repository_controls_fixture(tracked_output="dist/package.whl"),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (
+                run_repository_controls_fixture(tracked_output=".tox/py/pyvenv.cfg"),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (
+                run_repository_controls_fixture(tracked_output=".nox/lint/pyvenv.cfg"),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (
+                run_repository_controls_fixture(tracked_output="env/pyvenv.cfg"),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (
+                run_repository_controls_fixture(
+                    tracked_output="env/lib/python3.14/site-packages/pkg.py"
+                ),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (
+                run_repository_controls_fixture(
+                    tracked_output="env/Scripts/python.exe"
+                ),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (
+                run_repository_controls_fixture(tracked_output="extension.pyd"),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (
+                run_repository_controls_fixture(ignored_output=True),
+                "TRACKED_RUNTIME_OUTPUT",
+            ),
+            (run_repository_controls_fixture(invalid_diff=True), "DIFF_INVALID"),
+            (
+                run_repository_controls_fixture(composite_action="owner/action@v1"),
+                "UNPINNED_ACTION",
+            ),
+            (
+                run_repository_controls_fixture(
+                    docker_action_image="docker://alpine:latest"
+                ),
+                "UNPINNED_ACTION",
+            ),
+            (
+                run_repository_controls_fixture(template_action="owner/action@v1"),
+                "UNPINNED_ACTION",
+            ),
+        )
+        for rejected, code in cases:
+            with self.subTest(code=code):
+                self.assertEqual(1, rejected.returncode)
+                self.assertIn(code, rejected.stdout)
+        for action in (
+            "uses: owner/action@v1",
+            '"uses" : "owner/action@v1"',
+            "{uses: owner/action@v1}",
+            "uses: docker://alpine:latest",
+        ):
+            rejected = run_repository_controls_fixture(action=action)
+            with self.subTest(action=action):
+                self.assertEqual(1, rejected.returncode)
+                self.assertIn("UNPINNED_ACTION", rejected.stdout)
 
     def test_shadow_fast_exports_pinned_tools_to_clean_path(self) -> None:
         shadow = (PLUGIN_ROOT / ".github/workflows/shadow-fast.yml").read_text(
