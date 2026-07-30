@@ -129,6 +129,21 @@ pub(crate) fn validate_policy(path: &Path) -> Result<PolicyReceipt, GovernorErro
     })
 }
 
+pub(crate) fn validated_authority(bytes: &[u8]) -> Option<(String, bool, bool)> {
+    let Value::Table(document) = parse_document(bytes).ok()? else {
+        return None;
+    };
+    if !validate_document(&document).is_empty() {
+        return None;
+    }
+    let authority = document.get("authority")?.as_table()?;
+    Some((
+        sha256_bytes(bytes),
+        authority.get("repository_write")?.as_bool()?,
+        authority.get("external_side_effects")?.as_bool()?,
+    ))
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_document(document: &toml::Table) -> Vec<Finding> {
     let mut findings = Vec::new();
