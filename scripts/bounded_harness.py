@@ -75,13 +75,13 @@ NETWORK_BYPASS_EXIT = 81
 NETWORK_SETUP_EXIT = 82
 FAULT_SCHEMA_VERSION = "0.2"
 SANDBOX_READY = b"\x01"
-# LLM contract: OS_SANDBOX_ENTERED -> READY_BYTE -> CANDIDATE_EXEC;
+# LLM contract: OS_SANDBOX_ENTERED -> STDOUT_READY_BYTE -> CANDIDATE_EXEC;
+# the fixed prefix crosses each launcher on its existing output channel, while
 # missing readiness proves setup failure before candidate outcome evaluation.
-# Primary source: https://docs.python.org/3.14/library/os.html#os.execvpe
+# Primary sources: https://docs.python.org/3.14/library/os.html#os.execvpe and
+# https://docs.python.org/3.14/library/asyncio-subprocess.html#asyncio.subprocess.Process.stdout
 CANDIDATE_EXEC = (
-    "import os,sys;"
-    "fd=int(sys.argv[1]);os.write(fd,b'\\x01');os.close(fd);"
-    "os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
+    "import os,sys;os.write(1,b'\\x01');os.execvpe(sys.argv[1],sys.argv[1:],os.environ)"
 )
 
 
@@ -968,12 +968,6 @@ async def _spawn(
         if sandbox == NetworkSandbox.LINUX
         else None
     )
-    try:
-        ready_read, ready_write = os.pipe()
-    except OSError as error:
-        if seccomp_fd is not None:
-            os.close(seccomp_fd)
-        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
     process: asyncio.subprocess.Process | None = None
     try:
         wrapped = [
@@ -982,7 +976,6 @@ async def _spawn(
             "-B",
             "-c",
             CANDIDATE_EXEC,
-            str(ready_write),
             *argv,
         ]
         command = _sandboxed_argv(
@@ -996,7 +989,7 @@ async def _spawn(
             seccomp_fd=seccomp_fd,
         )
         macos = sandbox == NetworkSandbox.MACOS
-        inherited = (ready_write,) if seccomp_fd is None else (ready_write, seccomp_fd)
+        inherited = () if seccomp_fd is None else (seccomp_fd,)
         process = await asyncio.create_subprocess_exec(
             *command,
             cwd=cwd if macos else "/",
@@ -1012,9 +1005,8 @@ async def _spawn(
             group=identity.gid if macos else None,
             user=identity.uid if macos else None,
         )
-        os.close(ready_write)
-        ready_write = -1
-        ready = await asyncio.wait_for(asyncio.to_thread(os.read, ready_read, 1), 2)
+        assert process.stdout is not None
+        ready = await asyncio.wait_for(process.stdout.read(1), 2)
         if ready != SANDBOX_READY:
             raise HarnessError(
                 "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
@@ -1039,9 +1031,6 @@ async def _spawn(
             stage=startup_failure,
         ) from error
     finally:
-        os.close(ready_read)
-        if ready_write >= 0:
-            os.close(ready_write)
         if seccomp_fd is not None:
             os.close(seccomp_fd)
 
