@@ -40,13 +40,14 @@ system/toolchain, repository, and runtime paths plus IPv4/IPv6 loopback.
 Candidate checks use the same bounded file/process surface with no network
 allow rules, so a host-local HTTP, SOCKS, or browser debug broker cannot relay
 egress. A readiness pipe proves that Bubblewrap or Seatbelt entered the sandbox
-before any check exit code can be evaluated. The trusted self-test requires loopback
-success and denies host-interface TCP, native and IPv4-mapped IPv6, UDP/DNS
-transport, and a host Unix socket from both the probe and its descendants. It
-also verifies the platform-specific writable UID mapping; Linux exposes Cargo
-home read-only except for its two required lock files. A missing mechanism,
-unsupported policy, setup fault, or observed bypass returns a stable
-network-sandbox fault
+before any check exit code can be evaluated. The trusted self-test requires
+loopback success and denies host-interface TCP, IPv4-mapped IPv6, UDP/DNS
+transport, and a host Unix socket from both the probe and its descendants.
+When the host has routable native IPv6, it adds a reachable native canary;
+route absence is never accepted as isolation proof. It also verifies the
+platform-specific writable UID mapping; Linux exposes Cargo home read-only
+except for its two required lock files. A missing mechanism, unsupported
+policy, setup fault, or observed bypass returns a stable network-sandbox fault
 with exit 70; the shadow workflow classifies it as inconclusive before
 candidate execution.
 

@@ -686,11 +686,10 @@ def _loopback_fixture(family: socket.AddressFamily, host: str) -> bool:
         return False
 
 
-def _native_ipv6_listener(stack: ExitStack) -> tuple[str, int, int]:
-    # LLM contract: HOST_NATIVE_IPV6_ROUTE -> REACHABLE_HOST_BOUND_CANARY;
-    # missing or unverified native routing -> POLICY_UNSUPPORTED. UDP connect
-    # selects a source route without sending; only the selected local address
-    # becomes a canary, and no missing-route sentinel may authorize execution.
+def _native_ipv6_listener(stack: ExitStack) -> tuple[str, int, int] | None:
+    # LLM contract: HOST_NATIVE_IPV6_ROUTE -> REACHABLE_HOST_BOUND_CANARY |
+    # CAPABILITY_ABSENT. Absence never proves sandbox policy; the independent
+    # candidate-profile probe remains mandatory before candidate execution.
     # Primary source:
     # https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/socket.rst
     route = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
@@ -698,17 +697,28 @@ def _native_ipv6_listener(stack: ExitStack) -> tuple[str, int, int]:
         route.connect(("2001:db8::1", 9))
     except OSError as error:
         route.close()
-        raise HarnessError("HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED") from error
+        if error.errno in {
+            errno.EACCES,
+            errno.EADDRNOTAVAIL,
+            errno.EAFNOSUPPORT,
+            errno.EHOSTUNREACH,
+            errno.ENETUNREACH,
+            errno.ENODEV,
+            errno.EPERM,
+            errno.EPROTONOSUPPORT,
+        }:
+            return None
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
     stack.enter_context(route)
     selected = route.getsockname()
     address = ipaddress.ip_address(selected[0])
-    _require(
+    if not (
         isinstance(address, ipaddress.IPv6Address)
         and not address.is_loopback
         and not address.is_unspecified
-        and address.ipv4_mapped is None,
-        "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
-    )
+        and address.ipv4_mapped is None
+    ):
+        return None
     listener = stack.enter_context(socket.socket(socket.AF_INET6, socket.SOCK_STREAM))
     listener.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
     listener.bind((str(address), 0, 0, selected[3]))
@@ -731,10 +741,61 @@ def _socket_domain_filter_enforced() -> bool:
     return False
 
 
+def _candidate_ip_policy_once() -> int:
+    # LLM contract: CANDIDATE_PROFILE + IP_FAMILY -> EPERM | UNPROVEN_POLICY.
+    # Route errors are host evidence, not sandbox evidence; only EPERM proves
+    # that the OS policy intercepted both IPv4 and IPv6 socket use.
+    # Primary sources:
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/seccomp.h
+    # https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/security/mac_socket.c#L147-L179
+    # https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/security/mac_socket.c#L230-L247
+    targets: tuple[tuple[socket.AddressFamily, Any], ...] = (
+        (socket.AF_INET, ("127.0.0.1", 9)),
+        (socket.AF_INET6, ("::1", 9)),
+    )
+    for family, target in targets:
+        for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+            try:
+                client = socket.socket(family, kind)
+            except OSError as error:
+                if error.errno == errno.EPERM:
+                    continue
+                return NETWORK_SETUP_EXIT
+            try:
+                with client:
+                    if kind == socket.SOCK_DGRAM:
+                        client.sendto(b"x", target)
+                        return NETWORK_BYPASS_EXIT
+                    result = client.connect_ex(target)
+            except OSError as error:
+                if error.errno == errno.EPERM:
+                    continue
+                return NETWORK_SETUP_EXIT
+            if result == errno.EPERM:
+                continue
+            if result in {0, errno.ECONNREFUSED}:
+                return NETWORK_BYPASS_EXIT
+            return NETWORK_SETUP_EXIT
+    return 0
+
+
+def _candidate_ip_policy_probe() -> int:
+    direct = _candidate_ip_policy_once()
+    if direct != 0:
+        return direct
+    child = os.fork()
+    if child == 0:
+        os._exit(_candidate_ip_policy_once())
+    _, status = os.waitpid(child, 0)
+    if not os.WIFEXITED(status):
+        return NETWORK_SETUP_EXIT
+    return os.WEXITSTATUS(status)
+
+
 def _egress_blocked(
     host: str,
     tcp_port: int,
-    native_ipv6: tuple[str, int, int],
+    native_ipv6: tuple[str, int, int] | None,
     udp_port: int,
     unix_path: str,
 ) -> bool:
@@ -744,8 +805,9 @@ def _egress_blocked(
         (socket.AF_INET, (host, tcp_port)),
         (socket.AF_INET6, (f"::ffff:{host}", tcp_port)),
     ]
-    ipv6_host, ipv6_port, ipv6_scope = native_ipv6
-    targets.append((socket.AF_INET6, (ipv6_host, ipv6_port, 0, ipv6_scope)))
+    if native_ipv6 is not None:
+        ipv6_host, ipv6_port, ipv6_scope = native_ipv6
+        targets.append((socket.AF_INET6, (ipv6_host, ipv6_port, 0, ipv6_scope)))
     for family, target in targets:
         try:
             with socket.socket(family, socket.SOCK_STREAM) as client:
@@ -771,7 +833,7 @@ def _egress_blocked(
 def _descendant_egress_blocked(
     host: str,
     tcp_port: int,
-    native_ipv6: tuple[str, int, int],
+    native_ipv6: tuple[str, int, int] | None,
     udp_port: int,
     unix_path: str,
 ) -> bool:
@@ -818,16 +880,20 @@ def _network_probe(argv: list[str]) -> int:
             argv[6],
             Path(argv[7]),
         )
-        ipv6_address = ipaddress.ip_address(ipv6_host)
-        _require(
-            isinstance(ipv6_address, ipaddress.IPv6Address)
-            and not ipv6_address.is_loopback
-            and not ipv6_address.is_unspecified
-            and ipv6_address.ipv4_mapped is None
-            and 0 < ipv6_port <= 65_535
-            and ipv6_scope >= 0
-        )
-        native_ipv6 = (ipv6_host, ipv6_port, ipv6_scope)
+        native_ipv6 = None
+        if ipv6_host == "-":
+            _require(ipv6_port == 0 and ipv6_scope == 0)
+        else:
+            ipv6_address = ipaddress.ip_address(ipv6_host)
+            _require(
+                isinstance(ipv6_address, ipaddress.IPv6Address)
+                and not ipv6_address.is_loopback
+                and not ipv6_address.is_unspecified
+                and ipv6_address.ipv4_mapped is None
+                and 0 < ipv6_port <= 65_535
+                and ipv6_scope >= 0
+            )
+            native_ipv6 = (ipv6_host, ipv6_port, ipv6_scope)
         _require(
             not ipaddress.ip_address(host).is_loopback
             and 0 < tcp_port <= 65_535
@@ -958,6 +1024,9 @@ async def _verify_network_sandbox(
     identity: RunIdentity | None,
     runtime: RuntimePaths,
 ) -> NetworkSandbox | None:
+    # LLM contract: HOST_CAPABILITY_PROBED -> CANDIDATE_POLICY_PROVED ->
+    # TRUSTED_LOOPBACK_PROVED | TYPED_NETWORK_FAULT. An unavailable native
+    # IPv6 route only removes that host canary; it never authorizes candidates.
     sandbox = _network_sandbox(identity)
     if sandbox is None:
         return None
@@ -1002,10 +1071,11 @@ async def _verify_network_sandbox(
                 (socket.AF_INET6, (f"::ffff:{host}", tcp_port)),
                 (socket.AF_UNIX, str(unix_path)),
             ]
-            ipv6_host, ipv6_port, ipv6_scope = native_ipv6
-            reachable_targets.append(
-                (socket.AF_INET6, (ipv6_host, ipv6_port, 0, ipv6_scope))
-            )
+            if native_ipv6 is not None:
+                ipv6_host, ipv6_port, ipv6_scope = native_ipv6
+                reachable_targets.append(
+                    (socket.AF_INET6, (ipv6_host, ipv6_port, 0, ipv6_scope))
+                )
             for family, target in reachable_targets:
                 with socket.socket(family, socket.SOCK_STREAM) as client:
                     _require(
@@ -1019,12 +1089,35 @@ async def _verify_network_sandbox(
                     "-I",
                     "-B",
                     str(harness),
+                    "--candidate-ip-policy-probe",
+                ],
+                harness.parent,
+                runtime,
+                None,
+                identity,
+                sandbox,
+            )
+            output, _ = await asyncio.wait_for(process.communicate(), 5)
+            _require(len(output) <= 4096, "HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
+            if process.returncode == NETWORK_BYPASS_EXIT:
+                raise HarnessError("HARNESS_NETWORK_SANDBOX_BYPASS_DETECTED")
+            if process.returncode != 0:
+                raise HarnessError("HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED")
+            native_arguments = (
+                [native_ipv6[0], str(native_ipv6[1]), str(native_ipv6[2])]
+                if native_ipv6 is not None
+                else ["-", "0", "0"]
+            )
+            process = await _spawn(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(harness),
                     "--network-probe",
                     host,
                     str(tcp_port),
-                    native_ipv6[0],
-                    str(native_ipv6[1]),
-                    str(native_ipv6[2]),
+                    *native_arguments,
                     str(udp_port),
                     str(unix_path),
                     str(write_canary),
@@ -1547,4 +1640,6 @@ if __name__ == "__main__":
     arguments = sys.argv[1:]
     if arguments and arguments[0] == "--network-probe":
         raise SystemExit(_network_probe(arguments[1:]))
+    if arguments == ["--candidate-ip-policy-probe"]:
+        raise SystemExit(_candidate_ip_policy_probe())
     raise SystemExit(main(arguments))
