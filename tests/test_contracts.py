@@ -1985,8 +1985,13 @@ class SourceHygieneTests(unittest.TestCase):
             "permissions:\n  contents: read",
             "persist-credentials: false",
             "ref: ${{ github.sha }}",
-            "runner: [ubuntu-24.04, macos-15]",
-            'sudo "$python" -B -m unittest tests.test_bounded_harness',
+            "runner: [ubuntu-24.04, ubuntu-24.04-arm, macos-15]",
+            'bwrap="$(',
+            "which bwrap",
+            'trusted_path="$(dirname "$bwrap"):$trusted_path"',
+            "sudo /usr/bin/env -i",
+            '"PATH=$trusted_path"',
+            '"$python" -B -m unittest tests.test_bounded_harness',
             'test "$(git rev-parse HEAD)" = "$GITHUB_SHA"',
         ):
             self.assertIn(evidence, workflow)

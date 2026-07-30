@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import hashlib
 import io
 import json
 import os
 import pwd
 import shutil
+import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
 import uuid
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -28,7 +31,7 @@ import bounded_harness as harness
 # id: agent-work-governor.bounded-harness-tests
 # state: PLAN_FIXTURE + TEST_IDENTITY -> BOUNDED_EXECUTION -> RECEIPT_OR_TYPED_FAULT | TEST_FAILURE
 # preconditions: fixtures use temporary roots; the root-only test drops to the system nobody user
-# invariant: tests cover argv, bounds, timeout, path and UID isolation, and atomic replacement
+# invariant: tests cover argv, bounds, timeout, path, UID/network isolation, and atomic replacement
 # failure: unittest exposes the violated fail-closed transition
 # source: https://github.com/python/cpython/blob/c63aec69bd59c55314c06c23f4c22c03de76fe45/Doc/library/unittest.rst
 # knowledge: bundle:knowledge/policies/work-governor.md
@@ -41,6 +44,31 @@ NOBODY = pwd.getpwnam("nobody")
 
 def encoded(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def seccomp_verdict(program: bytes, arch: int, syscall: int, argument: int = 0) -> int:
+    """Evaluate the small cBPF subset emitted by the harness."""
+    data = bytearray(64)
+    struct.pack_into("=IIQ", data, 0, syscall & 0xFFFFFFFF, arch, 0)
+    struct.pack_into("=Q", data, 16, argument)
+    instructions = [
+        struct.unpack_from("=HBBI", program, offset)
+        for offset in range(0, len(program), 8)
+    ]
+    accumulator = position = 0
+    while True:
+        code, jump_true, jump_false, constant = instructions[position]
+        if code == 0x20:
+            accumulator = struct.unpack_from("=I", data, constant)[0]
+            position += 1
+        elif code == 0x15:
+            position += 1 + (jump_true if accumulator == constant else jump_false)
+        elif code == 0x45:
+            position += 1 + (jump_true if accumulator & constant else jump_false)
+        elif code == 0x06:
+            return constant
+        else:
+            raise AssertionError(f"unsupported test instruction: {code:#x}")
 
 
 class BoundedHarnessTests(unittest.TestCase):
@@ -406,6 +434,382 @@ class BoundedHarnessTests(unittest.TestCase):
         finally:
             outside.rmdir()
 
+    def test_network_sandbox_faults_are_inconclusive_before_candidate(self) -> None:
+        marker = self.root / "candidate-ran"
+        digest = self.plan(
+            [
+                self.check(
+                    "python.network",
+                    f"from pathlib import Path;Path({str(marker)!r}).touch()",
+                )
+            ]
+        )
+        codes = (
+            "HARNESS_NETWORK_SANDBOX_UNAVAILABLE",
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+            "HARNESS_NETWORK_SANDBOX_BYPASS_DETECTED",
+            "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
+        )
+        for code in codes:
+            with (
+                self.subTest(code=code),
+                mock.patch.object(
+                    harness,
+                    "_verify_network_sandbox",
+                    side_effect=harness.HarnessError(code),
+                ),
+                mock.patch.object(harness.asyncio, "create_subprocess_exec") as spawn,
+            ):
+                self.assertEqual(70, self.invoke(digest, workers=1))
+                fault = json.loads(
+                    self.receipt.with_name("run.json.fault.json").read_text()
+                )
+                self.assertEqual(code, fault["code"])
+                self.assertFalse(marker.exists())
+                spawn.assert_not_called()
+
+    def test_network_probe_rejects_parent_or_descendant_egress(self) -> None:
+        arguments = [
+            "10.0.0.1",
+            "1234",
+            "fd00::1",
+            "4321",
+            "0",
+            "1235",
+            "/tmp/canary.sock",
+            str(self.root / "write-canary"),
+        ]
+        with (
+            mock.patch.object(harness, "_loopback_fixture", return_value=True),
+            mock.patch.object(harness, "_egress_blocked", return_value=True) as parent,
+            mock.patch.object(
+                harness, "_descendant_egress_blocked", return_value=True
+            ) as descendant,
+        ):
+            self.assertEqual(0, harness._network_probe(arguments))
+        native_ipv6 = ("fd00::1", 4321, 0)
+        parent.assert_called_once_with(
+            "10.0.0.1", 1234, native_ipv6, 1235, "/tmp/canary.sock"
+        )
+        descendant.assert_called_once_with(
+            "10.0.0.1", 1234, native_ipv6, 1235, "/tmp/canary.sock"
+        )
+        for parent, descendant in ((False, True), (True, False)):
+            with (
+                self.subTest(parent=parent, descendant=descendant),
+                mock.patch.object(harness, "_loopback_fixture", return_value=True),
+                mock.patch.object(harness, "_egress_blocked", return_value=parent),
+                mock.patch.object(
+                    harness,
+                    "_descendant_egress_blocked",
+                    return_value=descendant,
+                ),
+            ):
+                self.assertEqual(
+                    harness.NETWORK_BYPASS_EXIT,
+                    harness._network_probe(arguments),
+                )
+
+    def test_egress_probe_rejects_reachable_native_ipv6_canary(self) -> None:
+        targets: list[tuple[str, int]] = []
+
+        class ProbeSocket:
+            def __enter__(self) -> Self:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def settimeout(self, _: int) -> None:
+                return None
+
+            def connect_ex(self, target: tuple[Any, ...]) -> int:
+                pair = (str(target[0]), int(target[1]))
+                targets.append(pair)
+                return int(pair != ("fd00::1", 4321))
+
+        with (
+            mock.patch.object(
+                harness,
+                "_socket_domain_filter_enforced",
+                return_value=True,
+            ),
+            mock.patch.object(harness.socket, "socket", return_value=ProbeSocket()),
+        ):
+            self.assertFalse(
+                harness._egress_blocked(
+                    "192.0.2.1",
+                    9,
+                    ("fd00::1", 4321, 0),
+                    9,
+                    "/tmp/missing-network-canary.sock",
+                )
+            )
+        self.assertIn(("fd00::1", 4321), targets)
+
+    def test_vsock_canary_requires_policy_eperm(self) -> None:
+        with (
+            mock.patch.object(harness.socket, "AF_VSOCK", 40, create=True),
+            mock.patch.object(
+                harness.socket,
+                "socket",
+                side_effect=OSError(errno.EPERM, "policy"),
+            ),
+        ):
+            self.assertTrue(harness._socket_domain_filter_enforced())
+        with (
+            mock.patch.object(harness.socket, "AF_VSOCK", 40, create=True),
+            mock.patch.object(
+                harness.socket,
+                "socket",
+                side_effect=OSError(errno.EAFNOSUPPORT, "host"),
+            ),
+        ):
+            self.assertFalse(harness._socket_domain_filter_enforced())
+        available = mock.Mock()
+        with (
+            mock.patch.object(harness.socket, "AF_VSOCK", 40, create=True),
+            mock.patch.object(harness.socket, "socket", return_value=available),
+        ):
+            self.assertFalse(harness._socket_domain_filter_enforced())
+        available.close.assert_called_once_with()
+
+    def test_linux_seccomp_denies_nonlocal_socket_paths(self) -> None:
+        denied = 0x00050000 | errno.EPERM
+        allowed = 0x7FFF0000
+        killed = 0x80000000
+        for machine, arch, socket_call, socketpair_call in (
+            ("x86_64", 0xC000003E, 41, 53),
+            ("aarch64", 0xC00000B7, 198, 199),
+        ):
+            with self.subTest(machine=machine):
+                candidate = harness._linux_seccomp_program(machine)
+                probe = harness._linux_seccomp_program(machine, allow_loopback=True)
+                self.assertEqual(0, len(candidate) % 8)
+                self.assertEqual(killed, seccomp_verdict(candidate, 0, socket_call, 2))
+                self.assertEqual(allowed, seccomp_verdict(candidate, arch, 1))
+                self.assertEqual(denied, seccomp_verdict(candidate, arch, 425))
+                for family in (socket.AF_INET, socket.AF_INET6):
+                    for call in (socket_call, socketpair_call):
+                        self.assertEqual(
+                            denied,
+                            seccomp_verdict(candidate, arch, call, family),
+                        )
+                        self.assertEqual(
+                            allowed,
+                            seccomp_verdict(probe, arch, call, family),
+                        )
+                for call in (socket_call, socketpair_call):
+                    self.assertEqual(
+                        allowed,
+                        seccomp_verdict(candidate, arch, call, socket.AF_UNIX),
+                    )
+                for call in (socket_call, socketpair_call):
+                    for family in (40, 17):  # AF_VSOCK, AF_PACKET
+                        self.assertEqual(
+                            denied,
+                            seccomp_verdict(candidate, arch, call, family),
+                        )
+        program = harness._linux_seccomp_program("x86_64")
+        self.assertEqual(
+            denied,
+            seccomp_verdict(program, 0xC000003E, 0x40000000 | 41, socket.AF_INET),
+        )
+        with self.assertRaises(harness.HarnessError) as raised:
+            harness._linux_seccomp_program("riscv64")
+        self.assertEqual(
+            "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
+            raised.exception.code,
+        )
+
+    def test_missing_native_ipv6_route_fails_closed(self) -> None:
+        class NoRouteSocket:
+            def connect(self, _: tuple[str, int]) -> None:
+                raise OSError(errno.ENETUNREACH, "no route")
+
+            def close(self) -> None:
+                return None
+
+        with (
+            ExitStack() as stack,
+            mock.patch.object(
+                harness.socket,
+                "socket",
+                return_value=NoRouteSocket(),
+            ),
+            self.assertRaises(harness.HarnessError) as raised,
+        ):
+            harness._native_ipv6_listener(stack)
+        self.assertEqual(
+            "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
+            raised.exception.code,
+        )
+
+    def test_macos_candidate_profile_denies_loopback_brokers(self) -> None:
+        runtime = harness.RuntimePaths(
+            self.root / "run.json",
+            self.root / "evidence",
+            self.root / "artifacts",
+            self.root / "tmp",
+        )
+        identity = harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid)
+        candidate = harness._sandboxed_argv(
+            harness.NetworkSandbox.MACOS,
+            identity,
+            ["/nix/store/python", "-c", "pass"],
+            self.root,
+            runtime,
+            None,
+        )
+        probe = harness._sandboxed_argv(
+            harness.NetworkSandbox.MACOS,
+            identity,
+            ["/nix/store/python", "-c", "pass"],
+            self.root,
+            runtime,
+            None,
+            allow_loopback=True,
+        )
+        self.assertNotIn("(allow network-", candidate[2])
+        self.assertNotIn("\n(allow file-read*)\n", candidate[2])
+        self.assertIn(f'(subpath "{self.root}")', candidate[2])
+        self.assertIn('(subpath "/nix/store")', candidate[2])
+        self.assertIn('(allow network-outbound (remote ip "localhost:*"))', probe[2])
+
+    def test_linux_probe_mounts_source_inside_a_non_nestable_user_namespace(
+        self,
+    ) -> None:
+        script = self.root / "trusted-source/scripts/bounded_harness.py"
+        runtime = harness.RuntimePaths(
+            self.root / "run.json",
+            self.root / "evidence",
+            self.root / "artifacts",
+            self.root / "tmp",
+        )
+        cargo_home = self.root / "cargo-home"
+        identity = harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid)
+        with mock.patch.object(harness.sys, "platform", "linux"):
+            self.assertEqual(
+                harness.RunIdentity(0, 0),
+                harness._sandbox_host_identity(identity),
+            )
+        with mock.patch.object(
+            harness,
+            "_trusted_executable",
+            return_value=Path("/nix/store/pinned-bwrap"),
+        ):
+            command = harness._sandboxed_argv(
+                harness.NetworkSandbox.LINUX,
+                identity,
+                [str(script), "--network-probe"],
+                script.parent,
+                runtime,
+                cargo_home,
+                seccomp_fd=9,
+            )
+        self.assertIn("--unshare-user", command)
+        self.assertIn("--disable-userns", command)
+        self.assertIn(
+            ["--add-seccomp-fd", "9"],
+            [command[index : index + 2] for index in range(len(command))],
+        )
+        anchor = command.index(str(script.parent))
+        self.assertEqual(
+            ["--ro-bind", str(script.parent), str(script.parent)],
+            command[anchor - 1 : anchor + 2],
+        )
+        cargo_anchor = command.index(str(cargo_home))
+        self.assertEqual(
+            ["--ro-bind", str(cargo_home), str(cargo_home)],
+            command[cargo_anchor - 1 : cargo_anchor + 2],
+        )
+        for lock in harness._cargo_lock_paths(cargo_home):
+            lock_anchor = command.index(str(lock))
+            self.assertEqual(
+                ["--bind", str(lock), str(lock)],
+                command[lock_anchor - 1 : lock_anchor + 2],
+            )
+
+    def test_linux_spawn_passes_then_closes_seccomp_fd(self) -> None:
+        runtime = harness.RuntimePaths(
+            self.root / "run.json",
+            self.root / "evidence",
+            self.root / "artifacts",
+            self.root / "tmp",
+        )
+        process = mock.sentinel.process
+        with (
+            mock.patch.object(harness, "_linux_seccomp_fd", return_value=9),
+            mock.patch.object(harness.os, "pipe", return_value=(8, 10)),
+            mock.patch.object(harness, "_sandboxed_argv", return_value=["bwrap"]),
+            mock.patch.object(
+                harness.asyncio,
+                "create_subprocess_exec",
+                return_value=process,
+            ) as spawn,
+            mock.patch.object(
+                harness.asyncio,
+                "to_thread",
+                new=mock.AsyncMock(return_value=harness.SANDBOX_READY),
+            ),
+            mock.patch.object(harness.os, "close") as close,
+        ):
+            result = asyncio.run(
+                harness._spawn(
+                    ["candidate"],
+                    self.root,
+                    runtime,
+                    None,
+                    harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
+                    harness.NetworkSandbox.LINUX,
+                )
+            )
+        self.assertIs(process, result)
+        await_args = spawn.await_args
+        assert await_args is not None
+        self.assertEqual((10, 9), await_args.kwargs["pass_fds"])
+        close.assert_has_calls([mock.call(10), mock.call(8), mock.call(9)])
+
+    def test_sandbox_setup_without_readiness_is_typed(self) -> None:
+        runtime = harness.RuntimePaths(
+            self.root / "run.json",
+            self.root / "evidence",
+            self.root / "artifacts",
+            self.root / "tmp",
+        )
+        process = SimpleNamespace(returncode=1)
+        with (
+            mock.patch.object(harness, "_linux_seccomp_fd", return_value=9),
+            mock.patch.object(harness.os, "pipe", return_value=(8, 10)),
+            mock.patch.object(harness, "_sandboxed_argv", return_value=["bwrap"]),
+            mock.patch.object(
+                harness.asyncio,
+                "create_subprocess_exec",
+                return_value=process,
+            ),
+            mock.patch.object(
+                harness.asyncio,
+                "to_thread",
+                new=mock.AsyncMock(return_value=b""),
+            ),
+            mock.patch.object(harness.os, "close"),
+            self.assertRaises(harness.HarnessError) as raised,
+        ):
+            asyncio.run(
+                harness._spawn(
+                    ["candidate"],
+                    self.root,
+                    runtime,
+                    None,
+                    harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
+                    harness.NetworkSandbox.LINUX,
+                )
+            )
+        self.assertEqual(
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+            raised.exception.code,
+        )
+
     def test_output_overflow_is_an_explicit_partial_fault(self) -> None:
         self.receipt.parent.mkdir(parents=True)
         self.receipt.write_bytes(b"old")
@@ -443,7 +847,6 @@ class BoundedHarnessTests(unittest.TestCase):
                     plan_sha,
                     coverage,
                     repository,
-                    runtime.receipt,
                     SHA,
                     1,
                     runtime,
@@ -486,6 +889,7 @@ class BoundedHarnessTests(unittest.TestCase):
             / f"agent-work-governor-temp-{uuid.uuid4().hex}"
         )
         temporary_anchor = runtime_root.with_name(f"{runtime_root.name}-candidate")
+        receipt = runtime_root / "run.json"
         self.addCleanup(shutil.rmtree, runtime_root, True)
         self.addCleanup(shutil.rmtree, temporary_anchor, True)
         code = """
@@ -495,11 +899,11 @@ import tempfile
 from pathlib import Path
 
 try:
-    os.listdir(Path(sys.argv[1]))
-except PermissionError:
+    Path(sys.argv[1]).read_bytes()
+except (FileNotFoundError, PermissionError):
     pass
 else:
-    raise SystemExit("protected runtime became readable")
+    raise SystemExit("protected receipt became readable")
 temporary = Path(tempfile.mkdtemp())
 descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
 try:
@@ -514,8 +918,7 @@ try:
 finally:
     os.close(descriptor)
 """
-        digest = self.plan([self.check("python.temp-walk", code, str(runtime_root))])
-        receipt = runtime_root / "run.json"
+        digest = self.plan([self.check("python.temp-walk", code, str(receipt))])
         with redirect_stdout(io.StringIO()):
             result = harness.main(
                 [
@@ -543,7 +946,10 @@ finally:
         identity = harness._isolation_identity()
         self.assertEqual(0o711, stat.S_IMODE(runtime_root.stat().st_mode))
         self.assertEqual(0o755, stat.S_IMODE(temporary_anchor.stat().st_mode))
-        self.assertEqual(identity.uid, (temporary_anchor / "tmp").stat().st_uid)
+        self.assertEqual(
+            harness._sandbox_host_identity(identity).uid,
+            (temporary_anchor / "tmp").stat().st_uid,
+        )
         self.assertEqual(
             0o700,
             stat.S_IMODE((temporary_anchor / "tmp").stat().st_mode),
