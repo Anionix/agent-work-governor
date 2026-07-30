@@ -665,8 +665,9 @@
               ruff check .
               pyrefly check
               ty check
-              actionlint .github/workflows/governor.yml \
+              actionlint .github/workflows/shadow-fast.yml \
                 .github/workflows/governor-authority.yml \
+                .github/workflows/proof-slow.yml \
                 .github/workflows/harness-isolation.yml \
                 .github/workflows/governor-shadow.yml \
                 .github/workflows/kani-shadow.yml \

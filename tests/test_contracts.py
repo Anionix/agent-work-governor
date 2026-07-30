@@ -121,6 +121,32 @@ def workflow_run_block(workflow: str, step_name: str) -> str:
     return "\n".join(body) + "\n"
 
 
+def workflow_event_paths(workflow: str, event: str) -> tuple[str, ...]:
+    """Extract one event's quoted path filters without a YAML dependency."""
+
+    lines = workflow.splitlines()
+    event_index = lines.index(f"  {event}:")
+    event_end = next(
+        (
+            index
+            for index in range(event_index + 1, len(lines))
+            if lines[index].startswith("  ") and not lines[index].startswith("    ")
+        ),
+        len(lines),
+    )
+    try:
+        paths_index = lines.index("    paths:", event_index, event_end)
+    except ValueError:
+        return ()
+    paths: list[str] = []
+    for line in lines[paths_index + 1 :]:
+        if line.startswith('      - "') and line.endswith('"'):
+            paths.append(line[9:-1])
+        elif line.startswith("  ") and not line.startswith("    "):
+            break
+    return tuple(paths)
+
+
 def run_nix_bootstrap_fixture(
     *,
     downloaded_installer: bytes | None = None,
@@ -136,7 +162,7 @@ def run_nix_bootstrap_fixture(
     workflow_source = PLUGIN_ROOT / (
         "assets/repository/.github/workflows/agent-work-governor.yml"
         if repository_template
-        else ".github/workflows/governor.yml"
+        else ".github/workflows/proof-slow.yml"
     )
     workflow = workflow_source.read_text(encoding="utf-8")
     catalog = json.loads(
@@ -159,7 +185,7 @@ def run_nix_bootstrap_fixture(
         workflow_relative = Path(
             ".github/workflows/agent-work-governor.yml"
             if repository_template
-            else ".github/workflows/governor.yml"
+            else ".github/workflows/proof-slow.yml"
         )
         query_relative = Path(
             ".agent-work-governor/toolchain_catalog.py"
@@ -1731,7 +1757,7 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertIn("--all-packages", argv)
         self.assertIn("--locked", argv)
 
-        workflow = (PLUGIN_ROOT / ".github/workflows/governor.yml").read_text(
+        workflow = (PLUGIN_ROOT / ".github/workflows/proof-slow.yml").read_text(
             encoding="utf-8"
         )
         python_checks = workflow_run_block(
@@ -1810,6 +1836,368 @@ class SourceHygieneTests(unittest.TestCase):
             with self.subTest(evidence=evidence):
                 self.assertNotEqual(0, rejected.returncode)
                 self.assertIn(evidence, rejected.stdout + rejected.stderr)
+
+    def test_ci_lanes_are_disjoint_and_path_bounded(self) -> None:
+        workflows = PLUGIN_ROOT / ".github/workflows"
+        authority = (workflows / "governor-authority.yml").read_text(encoding="utf-8")
+        shadow = (workflows / "shadow-fast.yml").read_text(encoding="utf-8")
+        proof = (workflows / "proof-slow.yml").read_text(encoding="utf-8")
+        kani = (workflows / "kani-shadow.yml").read_text(encoding="utf-8")
+
+        for evidence in (
+            "name: authority-fast",
+            "pull_request_target:",
+            "name: governor / authority",
+            "cancel-in-progress: false",
+            "python3 -B scripts/validate_pr_authority.py",
+            '"classification":"CODE_FAIL"',
+            '"classification":"INFRA_INCONCLUSIVE"',
+        ):
+            self.assertIn(evidence, authority)
+        for forbidden in ("actions/checkout@", "nix ", "pull_request.head"):
+            self.assertNotIn(forbidden, authority)
+
+        for evidence in (
+            "name: shadow-fast",
+            "pull_request:",
+            "merge_group:",
+            "name: shadow-fast / validate",
+            "cancel-in-progress: true",
+            'ruff" format --check',
+            'pyrefly" check',
+            'ty" check',
+            '"uv==$(locked_version uv)"',
+            "-m unittest discover -s tests",
+            '"authority":"none"',
+            '"classification":"CODE_FAIL"',
+            '"classification":"INFRA_INCONCLUSIVE"',
+            '"duration_seconds":%s',
+        ):
+            self.assertIn(evidence, shadow)
+        for forbidden in (
+            "cachix/install-nix-action@",
+            "nix flake check",
+            "cargo kani",
+            "AWG_AUTHORITY_APP_ID",
+            "publish_app_authority.py",
+        ):
+            self.assertNotIn(forbidden, shadow)
+
+        for evidence in (
+            "name: proof-slow-nix",
+            "PR_METADATA_EDIT -> PRIOR_SAME_HEAD_REQUIRED_CHECK",
+            "a metadata edit that replaces pending proof inherits its proof obligation",
+            "missing prior proof falls back to full proof",
+            "malformed readback fails closed",
+            "merge_group:",
+            "workflow_dispatch:",
+            "schedule:",
+            "name: proof-slow / select",
+            "name: proof-slow / nix",
+            "name: governor / validate",
+            "nix flake check",
+            "AWG_RUN_NIX_INTEGRATION=1",
+            "scripts/run_typed_ci.py",
+            "Reconcile metadata-only proof",
+            "check_name=governor / validate",
+            "PRIOR_REQUIRED_CHECK_MISSING_FALLBACK",
+            "PRIOR_REQUIRED_READBACK_FAILED",
+            "FULL_PROOF_FALLBACK",
+            "for _ in 1 2",
+            '"proof_claim":"none"',
+            '"proof_claim":"full-nix"',
+            '"proof_claim":"preserved-head"',
+            '"cache_state":"%s"',
+            '"classification":"CODE_FAIL"',
+            '"classification":"INFRA_INCONCLUSIVE"',
+        ):
+            self.assertIn(evidence, proof)
+        for evidence in (
+            "name: proof-slow-kani",
+            "merge_group:",
+            "workflow_dispatch:",
+            "schedule:",
+            "name: proof-slow / kani",
+            "cargo kani",
+            '"cache_state":"disabled"',
+        ):
+            self.assertIn(evidence, kani)
+
+        proof_skip_pattern = r"^(docs/|LICENSE$|NOTICE$|README\.md$)"
+        self.assertIn(
+            f"PROOF_SKIP_PATTERN: '{proof_skip_pattern}'",
+            proof,
+        )
+        expected_kani_paths = {
+            ".github/workflows/kani-shadow.yml",
+            "rust/**",
+            "scripts/run_typed_ci.py",
+            "scripts/toolchain_catalog.py",
+            "scripts/validate_kani_assurance.py",
+            "toolchain.lock.json",
+        }
+        for event in ("pull_request", "push"):
+            self.assertEqual((), workflow_event_paths(proof, event))
+            self.assertEqual(
+                expected_kani_paths,
+                set(workflow_event_paths(kani, event)),
+            )
+
+        def kani_selected(path: str, patterns: set[str]) -> bool:
+            return path in patterns or any(
+                pattern.endswith("/**")
+                and path.startswith(f"{pattern.removesuffix('/**')}/")
+                for pattern in patterns
+            )
+
+        for docs_only in ("README.md", "docs/agents/ci.md"):
+            self.assertIsNotNone(re.search(proof_skip_pattern, docs_only))
+            self.assertFalse(kani_selected(docs_only, expected_kani_paths))
+        for proof_input in (
+            ".agent-work-governor/policy.toml",
+            "adapters/codex/adapter.json",
+            "references/canonical-runtime.lock.json",
+            "rust/src/owner_scope.rs",
+            "vendor/pyyaml-6.0.3.zip",
+        ):
+            self.assertIsNone(re.search(proof_skip_pattern, proof_input))
+        self.assertTrue(kani_selected("rust/src/owner_scope.rs", expected_kani_paths))
+
+        self.assertIn(
+            "permissions:\n  contents: read\n\nconcurrency:",
+            shadow,
+        )
+        self.assertIn(
+            "permissions:\n  checks: read\n  contents: read\n\nenv:",
+            proof,
+        )
+        self.assertIn(
+            "permissions:\n  contents: read\n\nconcurrency:",
+            kani,
+        )
+        self.assertIn(
+            "permissions:\n  contents: read\n  issues: read\n"
+            "  pull-requests: read\n\nconcurrency:",
+            authority,
+        )
+        self.assertIn("push:\n    branches: [main]", shadow)
+        self.assertIn("push:\n    branches: [main]", proof)
+        self.assertIn("push:\n    branches: [main]", kani)
+        self.assertIn(
+            "pull_request:\n    types: [opened, synchronize, reopened, edited]",
+            shadow,
+        )
+        self.assertIn(
+            "pull_request:\n    types: [opened, synchronize, reopened, edited]",
+            proof,
+        )
+        body_only_edit = (
+            "github.event.action == 'edited' && github.event.changes.base == null"
+        )
+        proof_admission = (
+            "github.event.action != 'edited' || github.event.changes.base != null"
+        )
+        self.assertNotIn(f"{body_only_edit} && github.run_id || 'proof'", proof)
+        self.assertEqual(2, proof.count(body_only_edit))
+        self.assertEqual(1, proof.count(proof_admission))
+        self.assertNotIn("proof-slow / metadata-edit-select", proof)
+        self.assertNotIn("proof-slow / metadata-edit-nix", proof)
+        self.assertNotIn("proof-slow / metadata-edit-required", proof)
+        self.assertEqual(1, proof.count("name: governor / validate"))
+
+        def proof_event_contract(
+            action: str,
+            *,
+            base_changed: bool,
+            prior_success: bool = False,
+        ) -> tuple[bool, bool, str]:
+            body_only = action == "edited" and not base_changed
+            if body_only:
+                return (
+                    False,
+                    not prior_success,
+                    "preserved-head" if prior_success else "full-proof-fallback",
+                )
+            return (
+                True,
+                True,
+                "required",
+            )
+
+        self.assertEqual(
+            (False, False, "preserved-head"),
+            proof_event_contract(
+                "edited",
+                base_changed=False,
+                prior_success=True,
+            ),
+        )
+        self.assertEqual(
+            (False, True, "full-proof-fallback"),
+            proof_event_contract("edited", base_changed=False),
+        )
+        self.assertEqual(
+            (True, True, "required"),
+            proof_event_contract("edited", base_changed=True),
+        )
+        self.assertEqual(
+            (True, True, "required"),
+            proof_event_contract("synchronize", base_changed=False),
+        )
+        self.assertNotIn("pull_request_target:", shadow + proof + kani)
+        self.assertNotIn("\n  push:", authority)
+        self.assertNotIn("\n  merge_group:", authority)
+        self.assertIn(
+            "group: governor-authority-${{ github.event.pull_request.number }}",
+            authority,
+        )
+        self.assertIn(
+            "group: shadow-fast-${{ github.event.pull_request.number || github.ref }}",
+            shadow,
+        )
+        self.assertIn(
+            "group: proof-slow-nix-${{ github.event.pull_request.number || github.ref }}",
+            proof,
+        )
+        self.assertIn(
+            "group: proof-slow-kani-${{ github.event.pull_request.number || github.ref }}",
+            kani,
+        )
+        self.assertEqual(1, authority.count("cancel-in-progress: false"))
+        self.assertEqual(1, shadow.count("cancel-in-progress: true"))
+        self.assertEqual(
+            1,
+            proof.count(
+                "cancel-in-progress: ${{ github.event.action != 'edited' || "
+                "github.event.changes.base != null }}"
+            ),
+        )
+        self.assertEqual(1, kani.count("cancel-in-progress: true"))
+
+        job_names: list[str] = []
+        workflow_names: list[str] = []
+        for path in workflows.glob("*.yml"):
+            source = path.read_text()
+            job_names.extend(
+                re.findall(r"^    name: (.+)$", source, flags=re.MULTILINE)
+            )
+            workflow_names.extend(
+                re.findall(r"^name: (.+)$", source, flags=re.MULTILINE)
+            )
+        self.assertEqual(len(job_names), len(set(job_names)))
+        self.assertEqual(len(workflow_names), len(set(workflow_names)))
+
+    def test_shadow_fast_exports_pinned_tools_to_clean_path(self) -> None:
+        shadow = (PLUGIN_ROOT / ".github/workflows/shadow-fast.yml").read_text(
+            encoding="utf-8"
+        )
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        assert bash is not None
+        export_line = next(
+            line.strip() for line in shadow.splitlines() if '>> "$GITHUB_PATH"' in line
+        )
+        self.assertEqual(
+            'echo "$shadow_venv/bin" >> "$GITHUB_PATH"',
+            export_line,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            venv_bin = root / "venv" / "bin"
+            venv_bin.mkdir(parents=True)
+            uv = venv_bin / "uv"
+            uv.write_text(
+                f"#!{sys.executable}\nprint('uv-visible')\n",
+                encoding="utf-8",
+            )
+            uv.chmod(0o755)
+            github_path = root / "github-path"
+            environment = {
+                "GITHUB_PATH": str(github_path),
+                "PATH": "/usr/bin:/bin",
+                "shadow_venv": str(root / "venv"),
+            }
+            subprocess.run(
+                [bash, "-c", export_line],
+                check=True,
+                env=environment,
+            )
+            exported = github_path.read_text(encoding="utf-8").strip()
+            self.assertEqual(str(venv_bin), exported)
+            completed = subprocess.run(
+                ["uv"],
+                check=True,
+                capture_output=True,
+                env={"PATH": f"{exported}:/usr/bin:/bin"},
+                text=True,
+            )
+            self.assertEqual("uv-visible", completed.stdout.strip())
+
+    def test_proof_selector_requires_core_to_docs_rename(self) -> None:
+        workflow = (PLUGIN_ROOT / ".github/workflows/proof-slow.yml").read_text(
+            encoding="utf-8"
+        )
+        selector = workflow_run_block(workflow, "Select relevant proof input")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def git(*arguments: str) -> str:
+                completed = subprocess.run(
+                    ["git", "-c", "commit.gpgsign=false", *arguments],
+                    cwd=root,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                return completed.stdout.strip()
+
+            git("init", "--quiet")
+            git("config", "user.email", "ci@example.invalid")
+            git("config", "user.name", "CI")
+            source = root / "rust/src/owner_scope.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("fn decide() {}\n", encoding="utf-8")
+            git("add", ".")
+            git("commit", "--quiet", "-m", "core")
+            base = git("rev-parse", "HEAD")
+            (root / "docs").mkdir()
+            git("mv", str(source.relative_to(root)), "docs/owner_scope.rs")
+            git("commit", "--quiet", "-m", "rename")
+            head = git("rev-parse", "HEAD")
+
+            output = root / "github-output"
+            environment = dict(os.environ)
+            environment.update(
+                {
+                    "BASE_SHA": base,
+                    "GITHUB_EVENT_NAME": "pull_request",
+                    "GITHUB_OUTPUT": str(output),
+                    "HEAD_SHA": head,
+                    "PROOF_SKIP_PATTERN": (r"^(docs/|LICENSE$|NOTICE$|README\.md$)"),
+                }
+            )
+            completed = subprocess.run(
+                ["bash", "-c", selector],
+                cwd=root,
+                env=environment,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertEqual("required=true\n", output.read_text(encoding="utf-8"))
+
+    def test_proof_slow_types_infrastructure_and_code_failures(self) -> None:
+        workflow = (PLUGIN_ROOT / ".github/workflows/proof-slow.yml").read_text(
+            encoding="utf-8"
+        )
+        check = workflow_run_block(workflow, "Check reproducible environment")
+        self.assertIn("python3 scripts/run_typed_ci.py", check)
+        self.assertIn("--code NIX_PROOF_FAILED", check)
+        self.assertIn("--infra-code NIX_PROOF_INFRA", check)
+        self.assertIn('if [[ "$status" -eq 2 ]]', check)
+        self.assertNotIn("grep -Eqi", check)
 
     def test_unified_toolchain_matches_project_and_environment_inputs(self) -> None:
         catalog_path = PLUGIN_ROOT / "toolchain.lock.json"
@@ -1903,8 +2291,9 @@ class SourceHygieneTests(unittest.TestCase):
         workflow = "\n".join(
             path.read_text(encoding="utf-8")
             for path in (
-                PLUGIN_ROOT / ".github/workflows/governor.yml",
+                PLUGIN_ROOT / ".github/workflows/shadow-fast.yml",
                 PLUGIN_ROOT / ".github/workflows/governor-authority.yml",
+                PLUGIN_ROOT / ".github/workflows/proof-slow.yml",
             )
         )
         workflow_actions = dict(
@@ -2040,9 +2429,11 @@ class SourceHygieneTests(unittest.TestCase):
         )
         for evidence in (
             "workflow_run:",
-            "workflows: [governor]",
-            "permissions:\n  contents: read",
+            "workflows: [proof-slow-nix]",
+            "permissions:\n  actions: read\n  contents: read",
             "github.event.workflow_run.event == 'pull_request'",
+            'job["name"] == "proof-slow / nix"',
+            "needs.select.outputs.run == 'true'",
             "path: control",
             "persist-credentials: false",
             "github.event.workflow_run.head_sha",

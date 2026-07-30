@@ -1,0 +1,157 @@
+# LLM-CONTRACT
+# id: agent-work-governor.shadow-fast
+# state: CANDIDATE_REVISION -> FOCUSED_CHECKS -> PASS | CODE_FAIL | INFRA_INCONCLUSIVE
+# preconditions: the workflow receives the reviewed head and current base revisions
+# invariant: this candidate-controlled legacy check cannot emit the reserved external App identity
+# failure: code faults exit 1; shadow-tool transport faults emit INFRA_INCONCLUSIVE and exit 2
+# source: https://github.com/github/docs/blob/7e8499908e9935b0e437faea77e48dcf5284c222/content/actions/reference/workflows-and-actions/workflow-syntax.md
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: validate
+# test: bundle:tests/test_contracts.py
+
+name: shadow-fast
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shadow-fast-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: shadow-fast / validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before || github.sha }}
+      EXPECTED_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      PR_BODY: ${{ github.event.pull_request.body || '' }}
+    steps:
+      - name: Record shadow start
+        run: |
+          # LLM contract: admitted shadow job -> timestamp or job failure.
+          echo "SHADOW_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
+      # actions/checkout is intentionally outside toolchain.lock.json.
+      - name: Check out the reviewed revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ env.EXPECTED_HEAD_SHA }}
+
+      - name: Validate candidate contract
+        shell: bash
+        run: |
+          # LLM contract: candidate bytes + PR evidence -> SHADOW_INPUT_VALID or CODE_FAIL.
+          set -euo pipefail
+          code_fail() {
+            printf '{"classification":"CODE_FAIL","code":"%s","status":"FAIL"}\n' "$1"
+            exit 1
+          }
+          python3 scripts/toolchain_catalog.py toolchain.lock.json ||
+            code_fail TOOLCHAIN_CATALOG
+          python3 scripts/project_toolchain_digest.py --check ||
+            code_fail TOOLCHAIN_PROJECTION
+          required=(AGENTS.md CONTRIBUTING.md SECURITY.md flake.nix flake.lock)
+          for path in "${required[@]}"; do
+            test -f "$path" || {
+              echo '{"classification":"CODE_FAIL","code":"REPOSITORY_CONTRACT_MISSING","status":"FAIL"}'
+              exit 1
+            }
+          done
+          forbidden="$(git ls-files --cached --ignored --exclude-standard)"
+          test -z "$forbidden" || {
+            echo '{"classification":"CODE_FAIL","code":"TRACKED_RUNTIME_OUTPUT","status":"FAIL"}'
+            echo "$forbidden"
+            exit 1
+          }
+          unpinned="$(
+            grep -RhoE 'uses:[[:space:]]+[^[:space:]]+@[^[:space:]]+' \
+              .github/workflows |
+              grep -Ev '@[0-9a-f]{40}$' || true
+          )"
+          test -z "$unpinned" || {
+            echo '{"classification":"CODE_FAIL","code":"UNPINNED_ACTION","status":"FAIL"}'
+            echo "$unpinned"
+            exit 1
+          }
+          if [[ "$GITHUB_EVENT_NAME" == "pull_request" ]]; then
+            labels=('^Issue/spec:' '^State transition and fail-closed outcome:' '^- Primary sources:' '^- Reviewed commit:' '^- Code-review skill digest:' '^- Checks:')
+            for label in "${labels[@]}"; do
+              test "$(grep -Ec "$label" <<<"$PR_BODY")" -eq 1 || {
+                echo '{"classification":"CODE_FAIL","code":"PR_EVIDENCE_CARDINALITY","status":"FAIL"}'
+                exit 1
+              }
+            done
+            evidence=('^Issue/spec:[[:space:]]+[^[:space:]]' '^State transition and fail-closed outcome:[[:space:]]+[^[:space:]]' '^- Primary sources:[[:space:]]+[^[:space:]]' '^- Checks:[[:space:]]+[^[:space:]]')
+            for pattern in "${evidence[@]}"; do
+              grep -Eq "$pattern" <<<"$PR_BODY" || {
+                echo '{"classification":"CODE_FAIL","code":"PR_EVIDENCE_MISSING","status":"FAIL"}'
+                exit 1
+              }
+            done
+            grep -Fqx -- "- Reviewed commit: $EXPECTED_HEAD_SHA" <<<"$PR_BODY" ||
+              code_fail REVIEWED_COMMIT_MISMATCH
+            grep -Fqx -- \
+              "- Code-review skill digest: 6a65cc61114f96db07ec41e3920e67c9c5bf70dd6e0901eb9460ebcb2bdc209f" \
+              <<<"$PR_BODY" || code_fail REVIEW_SKILL_MISMATCH
+          fi
+          git diff --check "$BASE_SHA...HEAD" || code_fail DIFF_INVALID
+
+      - name: Install pinned shadow tools
+        shell: bash
+        run: |
+          # LLM contract: catalog pins + advisory transport -> SHADOW_TOOLS or INFRA_INCONCLUSIVE.
+          set -euo pipefail
+          locked_version() {
+            python3 scripts/toolchain_catalog.py \
+              toolchain.lock.json --tool-version "$1"
+          }
+          shadow_venv="$RUNNER_TEMP/shadow-fast"
+          echo "SHADOW_VENV=$shadow_venv" >> "$GITHUB_ENV"
+          if ! python3 -m venv "$shadow_venv"; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"SHADOW_VENV_FAILED","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
+          if ! "$shadow_venv/bin/python" -m pip install \
+            --disable-pip-version-check --no-deps --only-binary=:all: \
+            "ruff==$(locked_version ruff)" \
+            "pyrefly==$(locked_version pyrefly)" \
+            "ty==$(locked_version ty)" \
+            "uv==$(locked_version uv)"; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"SHADOW_TOOL_TRANSPORT_FAILED","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
+          echo "$shadow_venv/bin" >> "$GITHUB_PATH"
+
+      - name: Run focused advisory checks
+        shell: bash
+        run: |
+          # LLM contract: candidate source + shadow tools -> FOCUSED_PASS or CODE_FAIL.
+          set -euo pipefail
+          code_check() {
+            local code="$1"
+            shift
+            if ! "$@"; then
+              printf '{"classification":"CODE_FAIL","code":"%s","status":"FAIL"}\n' "$code"
+              exit 1
+            fi
+          }
+          code_check RUFF_FORMAT "$SHADOW_VENV/bin/ruff" format --check .
+          code_check RUFF_LINT "$SHADOW_VENV/bin/ruff" check .
+          code_check PYREFLY "$SHADOW_VENV/bin/pyrefly" check
+          code_check TY "$SHADOW_VENV/bin/ty" check
+          code_check PYTHON_UNIT \
+            "$SHADOW_VENV/bin/python" -B -m unittest discover -s tests
+          duration="$(($(date +%s) - SHADOW_STARTED_EPOCH))"
+          printf '{"authority":"none","cache_state":"disabled","classification":"CODE_OK","duration_seconds":%s,"gate":"shadow-fast","status":"PASS"}\n' \
+            "$duration"

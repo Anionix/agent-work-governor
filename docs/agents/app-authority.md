@@ -46,9 +46,9 @@ back and require byte-for-byte equivalent values before considering cutover
 complete.
 
 Keep the current GitHub Actions checks required until that readback succeeds.
-After cutover, rename candidate `governor / validate` to
-`governor / shadow`; it remains advisory evidence and is never consumed by the
-App validator.
+After cutover, remove the legacy `governor / validate` proof aggregator from
+branch protection and give it a proof-only name. `shadow-fast / validate`
+remains advisory evidence and is never consumed by the App validator.
 
 ## Closed failures
 

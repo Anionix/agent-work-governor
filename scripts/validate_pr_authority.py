@@ -6,8 +6,11 @@ from __future__ import annotations
 import json
 import os
 import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, replace
+from html import unescape
+from html.parser import HTMLParser
 from http.client import HTTPException, HTTPMessage, IncompleteRead
 from pathlib import Path
 from typing import IO, Literal, cast
@@ -40,6 +43,48 @@ REPOSITORY_RE = re.compile(r"(?=.{3,201}\Z)[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 ISSUE_TRAILER_RE = re.compile(r"Issue-Spec: #(?P<number>[1-9][0-9]{0,9})")
 BODY_ISSUE_RE = re.compile(r"Issue/spec:[ \t]+#(?P<number>[1-9][0-9]{0,9})[ \t]*")
+REVIEW_SKILL_DIGEST = "6a65cc61114f96db07ec41e3920e67c9c5bf70dd6e0901eb9460ebcb2bdc209f"
+BODY_REVIEW_MARKERS = (
+    "State transition and fail-closed outcome:",
+    "- Primary sources:",
+    "- Reviewed commit:",
+    "- Code-review skill digest:",
+    "- Checks:",
+)
+HTTPS_HOST_RE = re.compile(
+    r"(?=.{1,253}\Z)"
+    r"(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+)
+HTTPS_PATH_RE = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@%/-]*")
+HTTPS_QUERY_FRAGMENT_RE = re.compile(r"[A-Za-z0-9._~!$&'()*+,;=:@%/?-]*")
+GFM_BACKSLASH_ESCAPE_RE = re.compile(r"\\([!\"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~])")
+GFM_TASK_LIST_RE = re.compile(
+    r"(?m)^(?P<leader>[ \t]{0,3}(?:>[ \t]*)*)"
+    r"(?:[-+*]|[0-9]{1,9}[.)])[ \t]+\[[ xX]\][ \t]+"
+)
+BIDI_CONTROLS = frozenset(
+    {
+        0x061C,
+        0x200E,
+        0x200F,
+        0x202A,
+        0x202B,
+        0x202C,
+        0x202D,
+        0x202E,
+        0x2066,
+        0x2067,
+        0x2068,
+        0x2069,
+        0x206A,
+        0x206B,
+        0x206C,
+        0x206D,
+        0x206E,
+        0x206F,
+    }
+)
 LINK_RE = re.compile(r'\s*<(?P<url>[^<>\s]+)>;\s*rel="(?P<rel>[a-z]+)"\s*')
 HTML_RAW_END_RE = re.compile(r"</(?:script|pre|style)>", re.IGNORECASE)
 HTML_BLOCK_TAG_RE = re.compile(
@@ -497,32 +542,114 @@ def _commit_issue_number(
     return number
 
 
-def _body_issue_number(body: str) -> int:
-    # LLM-CONTRACT
-    # id: agent-work-governor.visible-body-issue
-    # state: LIVE_BODY -> GFM_BLOCK_CLASSIFIED -> ONE_VISIBLE_FIELD
-    # preconditions: body is the bounded live PR body from both stable snapshots
-    # invariant: hidden, mixed, or structurally incomplete Issue/spec evidence never authorizes
-    # failure: reject hidden markers, unclosed contexts, or non-canonical visible fields
-    # source: https://github.com/github/cmark-gfm/blob/499789b49373bfa045d0e7547e5ee63444c77bca/test/spec.txt
-    # knowledge: bundle:knowledge/policies/work-governor.md
-    # enforced_by: validate_pr_authority
-    # test: bundle:tests/test_pr_authority.py
+class _MarkerHtmlText(HTMLParser):
+    """Discard inline tags while retaining data and hidden comments for rejection."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.hidden_parts: list[str] = []
+        self.element_seen = False
+
+    def handle_data(self, data: str) -> None:
+        self.parts.append(data)
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        del tag, attrs
+        self.element_seen = True
+
+    def handle_endtag(self, tag: str) -> None:
+        del tag
+        self.element_seen = True
+
+    def handle_startendtag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        del tag, attrs
+        self.element_seen = True
+
+    def handle_comment(self, data: str) -> None:
+        self.hidden_parts.append(data)
+
+    def handle_decl(self, decl: str) -> None:
+        self.hidden_parts.append(decl)
+        self.element_seen = True
+
+    def handle_pi(self, data: str) -> None:
+        self.hidden_parts.append(data)
+        self.element_seen = True
+
+    def unknown_decl(self, data: str) -> None:
+        self.hidden_parts.append(data)
+        self.element_seen = True
+
+
+def _marker_view(value: str) -> str:
+    # LLM contract: raw GFM line -> conservative reader-visible marker view;
+    # ambiguous inline syntax can add rejection evidence but never remove it.
+    normalized = unicodedata.normalize("NFKC", unescape(value))
+    if any(ord(character) in BIDI_CONTROLS for character in normalized):
+        raise ValueError("bidi controls are not authority evidence")
+    normalized = GFM_TASK_LIST_RE.sub(r"\g<leader>- ", normalized)
+    if "[" in normalized or "]" in normalized:
+        raise ValueError("Markdown links are not authority evidence")
+    parser = _MarkerHtmlText()
+    try:
+        parser.feed(normalized)
+        parser.close()
+    except (AssertionError, ValueError) as error:
+        raise ValueError("invalid inline markup") from error
+    if parser.element_seen:
+        raise ValueError("raw HTML elements are not authority evidence")
+    views: list[str] = []
+    for text in ("".join(parser.parts), "\n".join(parser.hidden_parts)):
+        text = GFM_BACKSLASH_ESCAPE_RE.sub(r"\1", text)
+        text = text.replace("*", "").replace("_", "").replace("`", "").replace("~", "")
+        views.append(
+            "".join(
+                character
+                for character in text
+                if unicodedata.category(character)[:1] not in {"C", "M"}
+                and ord(character) not in {0x115F, 0x1160, 0x3164, 0xFFA0}
+            ).casefold()
+        )
+    return "\n".join(views)
+
+
+def _body_marker_lines(
+    body: str,
+    markers: tuple[str, ...],
+    rejection_code: str,
+) -> list[str]:
+    """Return reader-visible marker lines or reject ambiguous GFM contexts."""
     lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-    authority_lines: list[str] = []
+    marker_lines: list[str] = []
     fence_character: str | None = None
     fence_length = 0
     in_comment = False
     html_block_end: HtmlBlockEnd | None = None
     hidden_marker = False
+    folded_markers = tuple(marker.casefold() for marker in markers)
+
+    def contains_marker(value: str) -> bool:
+        try:
+            folded = _marker_view(value)
+        except ValueError as error:
+            raise _Reject(rejection_code) from error
+        return any(marker in folded for marker in folded_markers)
 
     for line in lines:
-        folded = line.casefold()
         content = line.lstrip(" ")
         indentation = len(line) - len(content)
 
         if fence_character is not None:
-            hidden_marker |= "issue/spec:" in folded
+            hidden_marker |= contains_marker(line)
             run_length = len(content) - len(content.lstrip(fence_character))
             if (
                 indentation <= 3
@@ -537,7 +664,7 @@ def _body_issue_number(body: str) -> int:
             if html_block_end == "blank" and _gfm_blank(line):
                 html_block_end = None
                 continue
-            hidden_marker |= "issue/spec:" in folded
+            hidden_marker |= contains_marker(line)
             if _html_block_ends(html_block_end, line):
                 html_block_end = None
             continue
@@ -547,7 +674,7 @@ def _body_issue_number(body: str) -> int:
             run_length = len(content) - len(content.lstrip(candidate))
             info = content[run_length:]
             if run_length >= 3 and (candidate == "~" or "`" not in info):
-                hidden_marker |= "issue/spec:" in folded
+                hidden_marker |= contains_marker(line)
                 fence_character = candidate
                 fence_length = run_length
                 continue
@@ -555,21 +682,20 @@ def _body_issue_number(body: str) -> int:
         if not in_comment and indentation <= 3:
             html_block_end = _html_block_start(content)
             if html_block_end is not None:
-                hidden_marker |= "issue/spec:" in folded
+                hidden_marker |= contains_marker(line)
                 if _html_block_ends(html_block_end, line):
                     html_block_end = None
                 continue
 
-        starts_visible = not in_comment
         position = 0
         while position < len(line):
             if in_comment:
                 end = line.find("-->", position)
                 nested = line.find("<!--", position)
                 boundary = len(line) if end < 0 else end
-                hidden_marker |= "issue/spec:" in line[position:boundary].casefold()
+                hidden_marker |= contains_marker(line[position:boundary])
                 if nested >= 0 and (end < 0 or nested < end):
-                    raise _Reject("AUTHORITY_BODY_ISSUE_INVALID")
+                    raise _Reject(rejection_code)
                 if end < 0:
                     break
                 in_comment = False
@@ -581,16 +707,42 @@ def _body_issue_number(body: str) -> int:
             in_comment = True
             position = start + 4
 
-        if starts_visible and line.lstrip().casefold().startswith("issue/spec:"):
-            authority_lines.append(line)
+        if contains_marker(line):
+            marker_lines.append(line)
 
+    try:
+        body_view = _marker_view(body)
+    except ValueError as error:
+        raise _Reject(rejection_code) from error
+    body_occurrences = sum(body_view.count(marker) for marker in folded_markers)
     if (
         in_comment
         or fence_character is not None
         or html_block_end not in {None, "blank"}
         or hidden_marker
-        or len(authority_lines) != 1
+        or body_occurrences != len(marker_lines)
     ):
+        raise _Reject(rejection_code)
+    return marker_lines
+
+
+def _body_issue_number(body: str) -> int:
+    # LLM-CONTRACT
+    # id: agent-work-governor.visible-body-issue
+    # state: LIVE_BODY -> GFM_BLOCK_CLASSIFIED -> ONE_VISIBLE_FIELD
+    # preconditions: body is the bounded live PR body from both stable snapshots
+    # invariant: hidden, mixed, or structurally incomplete Issue/spec evidence never authorizes
+    # failure: reject hidden markers, unclosed contexts, or non-canonical visible fields
+    # source: https://github.com/github/cmark-gfm/blob/499789b49373bfa045d0e7547e5ee63444c77bca/test/spec.txt
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: validate_pr_authority
+    # test: bundle:tests/test_pr_authority.py
+    authority_lines = _body_marker_lines(
+        body,
+        ("Issue/spec:",),
+        "AUTHORITY_BODY_ISSUE_INVALID",
+    )
+    if len(authority_lines) != 1:
         raise _Reject("AUTHORITY_BODY_ISSUE_INVALID")
     match = BODY_ISSUE_RE.fullmatch(authority_lines[0])
     if match is None:
@@ -599,6 +751,91 @@ def _body_issue_number(body: str) -> int:
     if number > MAX_PR_NUMBER:
         raise _Reject("AUTHORITY_BODY_ISSUE_INVALID")
     return number
+
+
+def _require_body_review_evidence(body: str, head_sha: str) -> None:
+    # LLM-CONTRACT
+    # id: agent-work-governor.visible-review-evidence
+    # state: STABLE_BODY + LIVE_HEAD -> UNIQUE_VISIBLE_FIELDS -> HEAD_BOUND_REVIEW
+    # preconditions: the protected validator already stabilized the live PR body
+    # invariant: candidate workflows cannot authorize missing, hidden, duplicate, or stale review evidence
+    # failure: any malformed field is deterministic FAIL=1
+    # source: https://github.com/github/cmark-gfm/blob/499789b49373bfa045d0e7547e5ee63444c77bca/test/spec.txt
+    # knowledge: bundle:knowledge/policies/work-governor.md
+    # enforced_by: validate_pr_authority
+    # test: bundle:tests/test_pr_authority.py
+    lines = _body_marker_lines(
+        body,
+        BODY_REVIEW_MARKERS,
+        "AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID",
+    )
+    evidence: dict[str, str] = {}
+    for line in lines:
+        try:
+            folded = _marker_view(line)
+        except ValueError as error:
+            raise _Reject("AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID") from error
+        occurrences = sum(
+            folded.count(marker.casefold()) for marker in BODY_REVIEW_MARKERS
+        )
+        matches = [marker for marker in BODY_REVIEW_MARKERS if line.startswith(marker)]
+        if occurrences != 1 or len(matches) != 1 or matches[0] in evidence:
+            raise _Reject("AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID")
+        marker = matches[0]
+        value = line.removeprefix(marker)
+        value = value.strip() if value.startswith(" ") else ""
+        if (
+            re.fullmatch(r"[A-Za-z0-9][^\r\n<]*", value) is None
+            or "<!--" in value
+            or "-->" in value
+        ):
+            raise _Reject("AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID")
+        evidence[marker] = value
+    if set(evidence) != set(BODY_REVIEW_MARKERS):
+        raise _Reject("AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID")
+    if evidence["- Reviewed commit:"] != head_sha:
+        raise _Reject("AUTHORITY_REVIEWED_COMMIT_MISMATCH")
+    if evidence["- Code-review skill digest:"] != REVIEW_SKILL_DIGEST:
+        raise _Reject("AUTHORITY_REVIEW_SKILL_MISMATCH")
+    transition = evidence["State transition and fail-closed outcome:"]
+    if " -> " not in transition or " | " not in transition:
+        raise _Reject("AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID")
+    sources = evidence["- Primary sources:"].split(" ; ")
+    for source in sources:
+        if (
+            not source.isascii()
+            or "\\" in source
+            or re.search(r"%(?![0-9A-Fa-f]{2})", source) is not None
+            or any(ord(character) < 32 or ord(character) == 127 for character in source)
+        ):
+            raise _Reject("AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID")
+        try:
+            target = urlsplit(source)
+            hostname = target.hostname
+            port = target.port
+            canonical_netloc = (
+                None
+                if hostname is None
+                else hostname
+                if port is None
+                else f"{hostname}:{port}"
+            )
+        except ValueError as error:
+            raise _Reject("AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID") from error
+        if (
+            target.scheme != "https"
+            or not hostname
+            or target.netloc.casefold() != canonical_netloc
+            or HTTPS_HOST_RE.fullmatch(hostname) is None
+            or port not in {None, 443}
+            or target.username is not None
+            or target.password is not None
+            or HTTPS_PATH_RE.fullmatch(target.path) is None
+            or HTTPS_QUERY_FRAGMENT_RE.fullmatch(target.query) is None
+            or HTTPS_QUERY_FRAGMENT_RE.fullmatch(target.fragment) is None
+            or any(character.isspace() for character in source)
+        ):
+            raise _Reject("AUTHORITY_BODY_REVIEW_EVIDENCE_INVALID")
 
 
 # LLM contract: GFM_BLOCK_START -> MATCHING_END | EOF_BLANK_BLOCK; ambiguous
@@ -714,6 +951,8 @@ def validate_pr_authority(
             raise _Reject("AUTHORITY_STATE_CHANGED")
         if require_body and _body_issue_number(second.body) != issue_number:
             raise _Reject("AUTHORITY_BODY_ISSUE_MISMATCH")
+        if require_body:
+            _require_body_review_evidence(second.body, second.head_sha)
         _require_repository_issue(
             identity.repository,
             issue_number,

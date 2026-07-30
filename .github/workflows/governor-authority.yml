@@ -1,15 +1,15 @@
 # LLM-CONTRACT
-# id: agent-work-governor.live-pr-authority-workflow
-# state: PR_EVENT -> TRUSTED_SHA_FETCH -> LEGACY_BODY_AUTHORITY -> OPTIONAL_APP_INSTALLATION_TOKEN -> APP_BOUND_CHECK | JOB_FAILURE
+# id: agent-work-governor.authority-fast
+# state: PR_EVENT -> PROTECTED_VALIDATOR -> PASS | CODE_FAIL | INFRA_INCONCLUSIVE
 # preconditions: pull_request_target resolves workflow code from the protected default branch
-# invariant: candidate code never executes, legacy body authority always gates the job, and only the configured App id emits the reserved shadow check
-# failure: partial App configuration, identity drift, or incomplete API evidence blocks both job and App check
+# invariant: candidate code never executes, Issue and review evidence always gate the job, and only the configured App id emits the reserved shadow check
+# failure: policy rejection exits 1; incomplete infrastructure evidence exits 2; neither grants authority
 # source: https://github.com/github/docs/blob/7e8499908e9935b0e437faea77e48dcf5284c222/content/actions/reference/security/securely-using-pull_request_target.md
 # knowledge: bundle:knowledge/policies/work-governor.md
 # enforced_by: authority
 # test: bundle:tests/test_pr_authority.py
 
-name: governor-authority
+name: authority-fast
 
 on:
   pull_request_target:
@@ -31,6 +31,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      - name: Record authority start
+        run: |
+          # LLM contract: admitted authority job -> timestamp or job failure.
+          echo "AUTHORITY_STARTED_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+
       # LLM contract: exact default-branch SHA -> TRUSTED_VALIDATOR or job failure.
       # The public fetch is unauthenticated; candidate refs and artifacts are absent.
       # Source: https://github.com/github/docs/blob/7e8499908e9935b0e437faea77e48dcf5284c222/content/actions/reference/workflows-and-actions/events-that-trigger-workflows.md
@@ -44,7 +49,11 @@ jobs:
           [[ "$TRUSTED_SHA" =~ ^[0-9a-f]{40}$ ]]
           git init --quiet .
           git remote add origin "https://github.com/${TRUSTED_REPOSITORY}.git"
-          git -c protocol.version=2 fetch --quiet --no-tags --depth=1 origin "$TRUSTED_SHA"
+          if ! git -c protocol.version=2 fetch \
+            --quiet --no-tags --depth=1 origin "$TRUSTED_SHA"; then
+            echo '{"classification":"INFRA_INCONCLUSIVE","code":"TRUSTED_FETCH_FAILED","gate":"authority-fast","status":"INCONCLUSIVE"}'
+            exit 2
+          fi
           git checkout --quiet --detach FETCH_HEAD
           [[ "$(git rev-parse HEAD)" == "$TRUSTED_SHA" ]]
 
@@ -99,9 +108,34 @@ jobs:
           permission-pull-requests: read
 
       - name: Validate live pull request authority
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 -B scripts/validate_pr_authority.py
+        run: |
+          # LLM contract: protected inputs -> CODE_OK | CODE_FAIL | INFRA_INCONCLUSIVE.
+          set -euo pipefail
+          set +e
+          python3 -B scripts/validate_pr_authority.py |
+            tee "$RUNNER_TEMP/authority-fast.json"
+          status="${PIPESTATUS[0]}"
+          set -e
+          case "$status" in
+            0)
+              echo '{"classification":"CODE_OK","gate":"authority-fast","status":"PASS"}'
+              ;;
+            1)
+              echo '{"classification":"CODE_FAIL","gate":"authority-fast","status":"FAIL"}'
+              exit 1
+              ;;
+            2)
+              echo '{"classification":"INFRA_INCONCLUSIVE","gate":"authority-fast","status":"INCONCLUSIVE"}'
+              exit 2
+              ;;
+            *)
+              echo '{"classification":"INFRA_INCONCLUSIVE","code":"AUTHORITY_EXIT_UNKNOWN","gate":"authority-fast","status":"INCONCLUSIVE"}'
+              exit 2
+              ;;
+          esac
 
       - name: Publish immutable App authority
         if: steps.app-config.outputs.configured == 'true'
@@ -109,3 +143,10 @@ jobs:
           AWG_AUTHORITY_APP_ID: ${{ vars.AWG_AUTHORITY_APP_ID }}
           AWG_AUTHORITY_TOKEN: ${{ steps.app-token.outputs.token }}
         run: python3 -B scripts/publish_app_authority.py
+
+      - name: Report authority duration
+        run: |
+          # LLM contract: successful authority job -> comparable duration evidence.
+          duration="$(($(date +%s) - AUTHORITY_STARTED_EPOCH))"
+          printf '{"cache_state":"not-applicable","classification":"CODE_OK","duration_seconds":%s,"gate":"authority-fast","status":"PASS"}\n' \
+            "$duration"
