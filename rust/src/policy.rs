@@ -8,7 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use toml::Value;
 
-use crate::{Finding, GovernorError};
+use crate::{Finding, GovernorError, ValidatedPolicyAuthority};
 
 const SCHEMA_VERSION: &str = "0.1";
 const ASK_MATT_SHA256: &str = "b1a134ada29cbfded84bc9a7f93356ab7a3d7f800edf1f541a2a964118ad45a7";
@@ -65,11 +65,21 @@ pub struct PolicyReceipt {
 
 /// Validate one policy without mutating the repository.
 pub(crate) fn validate_policy(path: &Path) -> Result<PolicyReceipt, GovernorError> {
+    evaluate_policy(path).map(|(receipt, _)| receipt)
+}
+
+pub(crate) fn evaluate_policy(
+    path: &Path,
+) -> Result<(PolicyReceipt, Option<ValidatedPolicyAuthority>), GovernorError> {
     let resolved = absolute_path(path)?;
     let source = match fs::read(&resolved) {
         Ok(bytes) => PolicySource::Bytes(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => PolicySource::Missing,
         Err(error) => PolicySource::Unreadable(error.to_string()),
+    };
+    let authority = match &source {
+        PolicySource::Bytes(bytes) => ValidatedPolicyAuthority::from_bytes(bytes).ok(),
+        PolicySource::Missing | PolicySource::Unreadable(_) => None,
     };
 
     let policy_sha256 = match &source {
@@ -118,15 +128,18 @@ pub(crate) fn validate_policy(path: &Path) -> Result<PolicyReceipt, GovernorErro
     };
     sort_findings(&mut findings);
 
-    Ok(PolicyReceipt {
-        policy_path: resolved.display().to_string(),
-        policy_sha256,
-        validator_sha256: sha256_bytes(include_bytes!("policy.rs")),
-        schema_version: SCHEMA_VERSION.to_owned(),
-        valid: findings.is_empty(),
-        findings,
-        repository_scope,
-    })
+    Ok((
+        PolicyReceipt {
+            policy_path: resolved.display().to_string(),
+            policy_sha256,
+            validator_sha256: sha256_bytes(include_bytes!("policy.rs")),
+            schema_version: SCHEMA_VERSION.to_owned(),
+            valid: findings.is_empty(),
+            findings,
+            repository_scope,
+        },
+        authority,
+    ))
 }
 
 pub(crate) fn validated_authority(bytes: &[u8]) -> Option<(String, bool, bool)> {

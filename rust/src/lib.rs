@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 pub use bootstrap::PlanAction;
 pub use governance_ir::execution_plan::CanonicalExecutionPlan;
-pub use model::{CheckReport, CheckRequest, Finding, Preset, RepositoryReport, Status};
+pub use model::{
+    CheckReport, CheckRequest, Finding, OwnerScopeVerification, Preset, RepositoryReport, Status,
+};
 pub use okf::OkfStatus;
 pub use owner_scope::{
     EffectiveAuthority, OwnerScopeFailure, OwnerScopeInput, ValidatedPolicyAuthority,
@@ -92,9 +94,15 @@ impl Governor {
                 preset,
                 allow_non_git,
             )?)),
-            CheckRequest::Repository { repo, plugin_root } => Ok(CheckReport::Repository(
-                check_repository(&repo, &plugin_root)?,
-            )),
+            CheckRequest::Repository {
+                repo,
+                plugin_root,
+                owner_scope,
+            } => Ok(CheckReport::Repository(check_repository(
+                &repo,
+                &plugin_root,
+                owner_scope.as_ref(),
+            )?)),
             CheckRequest::Plan { bindings, project } => {
                 Ok(CheckReport::Plan(planning::build_plan(bindings, project)?))
             }
@@ -117,13 +125,17 @@ impl Governor {
     }
 }
 
-fn check_repository(repo: &Path, plugin_root: &Path) -> Result<RepositoryReport, GovernorError> {
+fn check_repository(
+    repo: &Path,
+    plugin_root: &Path,
+    owner_scope_input: Option<&OwnerScopeInput>,
+) -> Result<RepositoryReport, GovernorError> {
     let canonical_repo = repo.canonicalize().map_err(|source| GovernorError::Read {
         path: repo.to_path_buf(),
         source,
     })?;
     let policy_path = canonical_repo.join(".agent-work-governor/policy.toml");
-    let policy = policy::validate_policy(&policy_path)?;
+    let (policy, policy_authority) = policy::evaluate_policy(&policy_path)?;
     let okf = okf::validate_bundle(&plugin_root.join("knowledge"))?;
     let mut findings = policy.findings;
 
@@ -137,6 +149,43 @@ fn check_repository(repo: &Path, plugin_root: &Path) -> Result<RepositoryReport,
 
     let owner_scope = policy.repository_scope.as_deref() == Some("owner_original");
     let unresolved_scope = policy.repository_scope.as_deref() == Some("unknown");
+    let misplaced_owner_scope = !owner_scope && owner_scope_input.is_some();
+    let mut owner_scope_verification = OwnerScopeVerification::NotApplicable;
+    let mut effective_authority = EffectiveAuthority::default();
+    if owner_scope {
+        match (owner_scope_input, policy_authority.as_ref()) {
+            (None, _) => {
+                owner_scope_verification = OwnerScopeVerification::Required;
+                findings.push(Finding::path(
+                    "OWNER_SCOPE_RECEIPT_REQUIRED",
+                    &canonical_repo,
+                    "owner-original authority requires repository-external receipt evidence",
+                ));
+            }
+            (Some(input), Some(authority)) => {
+                match verify_owner_scope(&canonical_repo, input, authority) {
+                    Ok(verified) => {
+                        owner_scope_verification = OwnerScopeVerification::Verified;
+                        effective_authority = verified;
+                    }
+                    Err(error) => {
+                        owner_scope_verification = OwnerScopeVerification::Rejected;
+                        findings.push(Finding::path(error.code, &canonical_repo, error.message));
+                    }
+                }
+            }
+            (Some(_), None) => {
+                owner_scope_verification = OwnerScopeVerification::Rejected;
+            }
+        }
+    } else if owner_scope_input.is_some() {
+        owner_scope_verification = OwnerScopeVerification::Rejected;
+        findings.push(Finding::path(
+            "OWNER_SCOPE_NOT_APPLICABLE",
+            &canonical_repo,
+            "external owner-scope evidence requires an owner-original policy",
+        ));
+    }
     let blocker = if !policy.valid {
         Some("POLICY_INVALID".to_owned())
     } else if okf.okf_core.status != OkfStatus::Valid
@@ -150,6 +199,8 @@ fn check_repository(repo: &Path, plugin_root: &Path) -> Result<RepositoryReport,
             "declare repository_scope before enabling CI",
         ));
         Some("SCOPE_UNRESOLVED".to_owned())
+    } else if misplaced_owner_scope {
+        Some("OWNER_SCOPE_NOT_APPLICABLE".to_owned())
     } else if owner_scope {
         findings.push(Finding::path(
             "LLM_CONTRACT_AST_ATTESTATION_REQUIRED",
@@ -176,6 +227,8 @@ fn check_repository(repo: &Path, plugin_root: &Path) -> Result<RepositoryReport,
         status,
         findings,
         blocker,
+        owner_scope_verification,
+        effective_authority,
         mutation_count: 0,
     })
 }

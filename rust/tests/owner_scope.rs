@@ -4,8 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use agent_work_governor::{
-    EffectiveAuthority, OwnerScopeFailure, OwnerScopeInput, ValidatedPolicyAuthority,
-    verify_owner_scope,
+    CheckReport, CheckRequest, EffectiveAuthority, Governor, OwnerScopeFailure, OwnerScopeInput,
+    OwnerScopeVerification, Status, ValidatedPolicyAuthority, verify_owner_scope,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use sha2::{Digest, Sha256};
@@ -145,6 +145,60 @@ fn signed_policy_digest_cannot_be_combined_with_different_authority()
     let fixture = Fixture::with_policy(NOW + 60, None, false)?;
     let authority = fixture.check(&fixture.input())?;
     assert!(!authority.repository_write);
+    Ok(())
+}
+
+#[test]
+fn repository_report_preserves_blockers_and_closes_verifier_failures()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = Fixture::new(NOW + 60, None)?;
+    let CheckReport::Repository(verified) = Governor.check(CheckRequest::Repository {
+        repo: fixture.repo.clone(),
+        plugin_root: Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or("missing plugin root")?
+            .to_path_buf(),
+        owner_scope: Some(fixture.input()),
+    })?
+    else {
+        return Err("unexpected report variant".into());
+    };
+    assert_eq!(Status::Fail, verified.status);
+    assert_eq!(
+        OwnerScopeVerification::Verified,
+        verified.owner_scope_verification
+    );
+    assert!(verified.effective_authority.repository_write);
+    assert!(!verified.effective_authority.external_side_effects);
+    assert_eq!(
+        Some("LLM_CONTRACT_AST_ATTESTATION_REQUIRED"),
+        verified.blocker.as_deref()
+    );
+
+    let mut invalid = fixture.input();
+    invalid.issuer = "wrong-root".to_owned();
+    let CheckReport::Repository(rejected) = Governor.check(CheckRequest::Repository {
+        repo: fixture.repo.clone(),
+        plugin_root: Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .ok_or("missing plugin root")?
+            .to_path_buf(),
+        owner_scope: Some(invalid),
+    })?
+    else {
+        return Err("unexpected report variant".into());
+    };
+    assert_eq!(
+        OwnerScopeVerification::Rejected,
+        rejected.owner_scope_verification
+    );
+    assert_eq!(EffectiveAuthority::default(), rejected.effective_authority);
+    assert!(
+        rejected
+            .findings
+            .iter()
+            .any(|finding| finding.code == "OWNER_SCOPE_BINDING_MISMATCH")
+    );
     Ok(())
 }
 

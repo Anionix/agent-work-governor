@@ -5,8 +5,8 @@ use std::os::unix::fs::symlink;
 use std::process::Command;
 
 use agent_work_governor::{
-    CheckReport, CheckRequest, EvidenceArtifact, Governor, MAX_CHECK_OUTPUT_BYTES, PlanAction,
-    PlanBindings, PlanProject, Preset, Status,
+    CheckReport, CheckRequest, EvidenceArtifact, Governor, MAX_CHECK_OUTPUT_BYTES,
+    OwnerScopeVerification, PlanAction, PlanBindings, PlanProject, Preset, Status,
 };
 use tempfile::tempdir;
 
@@ -38,6 +38,22 @@ fn informational_help_and_version_exit_successfully() -> Result<(), Box<dyn std:
             .output()?;
         assert!(output.status.success(), "{argument}");
         assert!(!output.stdout.is_empty(), "{argument}");
+    }
+    Ok(())
+}
+
+#[test]
+fn partial_owner_scope_cli_inputs_are_usage_errors() -> Result<(), Box<dyn std::error::Error>> {
+    for arguments in [
+        ["--owner-receipt", "/external/receipt.json"],
+        ["--runtime-repository-write", "true"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_agent-work-governor"))
+            .arg("check")
+            .args(arguments)
+            .output()?;
+        assert_eq!(Some(64), output.status.code());
+        assert!(String::from_utf8(output.stderr)?.contains("required"));
     }
     Ok(())
 }
@@ -142,6 +158,7 @@ fn owner_repository_stays_fail_closed_without_external_attesters()
     let report = Governor.check(CheckRequest::Repository {
         repo: temporary.path().to_path_buf(),
         plugin_root: plugin_root(),
+        owner_scope: None,
     })?;
     let CheckReport::Repository(report) = report else {
         return Err("unexpected report variant".into());
@@ -150,6 +167,18 @@ fn owner_repository_stays_fail_closed_without_external_attesters()
     assert_eq!(
         Some("LLM_CONTRACT_AST_ATTESTATION_REQUIRED"),
         report.blocker.as_deref()
+    );
+    assert_eq!(
+        OwnerScopeVerification::Required,
+        report.owner_scope_verification
+    );
+    assert!(!report.effective_authority.repository_write);
+    assert!(!report.effective_authority.external_side_effects);
+    assert!(
+        report
+            .findings
+            .iter()
+            .any(|finding| finding.code == "OWNER_SCOPE_RECEIPT_REQUIRED")
     );
     assert_eq!(0, report.mutation_count);
     Ok(())
@@ -167,12 +196,17 @@ fn unknown_repository_scope_never_passes() -> Result<(), Box<dyn std::error::Err
     let report = Governor.check(CheckRequest::Repository {
         repo: temporary.path().to_path_buf(),
         plugin_root: plugin_root(),
+        owner_scope: None,
     })?;
     let CheckReport::Repository(report) = report else {
         return Err("unexpected report variant".into());
     };
     assert_eq!(Status::Fail, report.status);
     assert_eq!(Some("SCOPE_UNRESOLVED"), report.blocker.as_deref());
+    assert_eq!(
+        OwnerScopeVerification::NotApplicable,
+        report.owner_scope_verification
+    );
     assert!(
         report
             .findings

@@ -52,6 +52,8 @@ pub enum CheckRequest {
         repo: PathBuf,
         /// Installed or source plugin root.
         plugin_root: PathBuf,
+        /// Repository-external evidence supplied by the protected caller.
+        owner_scope: Option<crate::OwnerScopeInput>,
     },
     /// Produce one digest-bound execution plan from confirmed project facts.
     Plan {
@@ -102,6 +104,20 @@ pub enum Status {
     Conflict,
     /// A canonical execution plan was produced without granting PASS authority.
     Planned,
+}
+
+/// Result of evaluating external owner-scope evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum OwnerScopeVerification {
+    /// The policy does not declare an owner-original repository.
+    NotApplicable,
+    /// An owner-original policy has no external receipt input.
+    Required,
+    /// Every external binding and signature check passed.
+    Verified,
+    /// Supplied evidence or its policy binding failed closed.
+    Rejected,
 }
 
 /// A deterministic finding emitted by a check.
@@ -198,6 +214,10 @@ pub struct RepositoryReport {
     pub findings: Vec<Finding>,
     /// Primary reason preventing readiness.
     pub blocker: Option<String>,
+    /// Result of external owner-scope receipt verification.
+    pub owner_scope_verification: OwnerScopeVerification,
+    /// Policy, receipt, and runtime authority intersection; zero unless verified.
+    pub effective_authority: crate::EffectiveAuthority,
     /// Number of mutations performed; always zero in this crate.
     pub mutation_count: u64,
 }
