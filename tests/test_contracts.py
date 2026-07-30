@@ -29,6 +29,7 @@ import contract_blocks
 import doctor
 import package_canonical_runtime
 import package_runtime
+import project_toolchain_digest
 import rust_dispatch
 import toolchain_catalog
 import validate_canonical
@@ -181,6 +182,16 @@ def run_nix_bootstrap_fixture(
             json.dumps(catalog),
             encoding="utf-8",
         )
+        if not repository_template:
+            shutil.copy2(
+                PLUGIN_ROOT / "scripts/project_toolchain_digest.py",
+                root / "scripts/project_toolchain_digest.py",
+            )
+            for relative in project_toolchain_digest.PROJECTIONS:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(PLUGIN_ROOT / relative, target)
+            project_toolchain_digest.synchronize(root, write=True)
         runner_temp = root / "runner"
         runner_temp.mkdir()
         fake_bin = root / "bin"
@@ -1916,6 +1927,7 @@ class SourceHygieneTests(unittest.TestCase):
         }
         self.assertEqual(catalog_actions, workflow_actions)
         self.assertIn("scripts/toolchain_catalog.py", workflow)
+        self.assertIn("scripts/project_toolchain_digest.py --check", workflow)
         self.assertIn("--tool-source nix", workflow)
         self.assertIn("--tool-source cachix/install-nix-action", workflow)
         self.assertIn("TOOLCHAIN_ACTION_IDENTITY_MISMATCH", workflow)

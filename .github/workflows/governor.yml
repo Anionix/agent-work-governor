@@ -49,10 +49,12 @@ jobs:
       - name: Validate unified toolchain catalog
         shell: bash
         run: |
-          # LLM contract: catalog bytes -> VALIDATED_UNIFIED_LOCK or stable rejection.
+          # LLM contract: catalog bytes + declared projections ->
+          # VALIDATED_UNIFIED_LOCK or stable rejection.
           # Primary source: https://github.com/Anionix/agent-work-governor/issues/3
           set -euo pipefail
           python3 scripts/toolchain_catalog.py toolchain.lock.json
+          python3 scripts/project_toolchain_digest.py --check
           nix_version="$(
             python3 scripts/toolchain_catalog.py toolchain.lock.json --tool-version nix
           )"
