@@ -2268,6 +2268,30 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertEqual(len(job_names), len(set(job_names)))
         self.assertEqual(len(workflow_names), len(set(workflow_names)))
 
+    def test_kani_shadow_checkout_does_not_persist_credentials(self) -> None:
+        workflow = (PLUGIN_ROOT / ".github/workflows/kani-shadow.yml").read_text(
+            encoding="utf-8"
+        )
+        marker = "      - name: Check out the candidate revision"
+        self.assertEqual(1, workflow.count(marker))
+        checkout = workflow.split(marker, 1)[1].split("\n      - name:", 1)[0]
+        lines = checkout.splitlines()
+        self.assertEqual(
+            1,
+            lines.count(
+                "        uses: actions/checkout@"
+                "3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1"
+            ),
+        )
+        self.assertEqual(1, lines.count("          persist-credentials: false"))
+        self.assertNotIn("persist-credentials: true", checkout)
+        self.assertEqual(
+            1,
+            lines.count(
+                "          ref: ${{ github.event.pull_request.head.sha || github.sha }}"
+            ),
+        )
+
     def test_metadata_proof_requires_workflow_run_identity(self) -> None:
         head_sha = "a" * 40
         proof_run: dict[str, object] = {

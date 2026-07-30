@@ -2,8 +2,8 @@
 # id: agent-work-governor.proof-slow-kani
 # state: RELEVANT_CHANGE + PINNED_KANI -> BOUNDED_ASSURANCE | SHADOW_FAILURE
 # preconditions: this candidate-controlled workflow is never a required authority check
-# invariant: exact source and bundle digests precede every proof; the negative canary must fail
-# failure: setup, any positive harness, or canary rejection exits non-zero without granting authority
+# invariant: candidate checkout retains no credentials; exact digests precede proof; the negative canary must fail
+# failure: repository checks reject persisted credentials; proof failures grant no authority
 # source: https://github.com/model-checking/kani/blob/4feaaad1d6a2378a6ff6caa3b4fc5d6999c7bb5d/src/setup.rs
 # knowledge: bundle:knowledge/policies/work-governor.md
 # enforced_by: prove
@@ -52,6 +52,7 @@ jobs:
       - name: Check out the candidate revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
       - name: Install pinned Kani
