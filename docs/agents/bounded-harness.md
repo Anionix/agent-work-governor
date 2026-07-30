@@ -39,9 +39,9 @@ trusted preflight uses a deny-default Seatbelt profile that permits only pinned
 system/toolchain, repository, and runtime paths plus IPv4/IPv6 loopback.
 Candidate checks use the same bounded file/process surface with no network
 allow rules, so a host-local HTTP, SOCKS, or browser debug broker cannot relay
-egress. A readiness pipe proves that Bubblewrap or Seatbelt entered the sandbox
-before any check exit code can be evaluated. The trusted self-test requires
-loopback success and denies host-interface TCP, IPv4-mapped IPv6, UDP/DNS
+egress. A fixed stdout prefix proves that Bubblewrap or Seatbelt entered the
+sandbox before any check exit code can be evaluated. The trusted self-test
+requires loopback success and denies host-interface TCP, IPv4-mapped IPv6, UDP/DNS
 transport, and a host Unix socket from both the probe and its descendants.
 When the host has routable native IPv6, it adds a reachable native canary;
 route absence is never accepted as isolation proof. It also verifies the
@@ -54,8 +54,9 @@ candidate execution.
 Fault schema `0.2` keeps check identifiers in `failed` and reports network
 preflight position separately in nullable `stage`. Network stage values are
 fixed by the harness: `network-sandbox-select`, `network-host-canaries`,
-`network-candidate-start`, `network-candidate-result`, `network-trusted-start`,
-or `network-trusted-result`. Schema `0.1` faults did not contain `stage`.
+`network-candidate-{start,create,ready-eof,ready-output,ready-timeout,result}`,
+or `network-trusted-{start,create,ready-eof,ready-output,ready-timeout,result}`.
+Schema `0.1` faults did not contain `stage`.
 
 Example, with a trusted harness checkout:
 
