@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 # LLM-CONTRACT
 # id: agent-work-governor.bounded-harness
@@ -120,9 +120,29 @@ class NetworkStage(StrEnum):
     SANDBOX_SELECT = "network-sandbox-select"
     HOST_CANARIES = "network-host-canaries"
     CANDIDATE_START = "network-candidate-start"
+    CANDIDATE_CREATE = "network-candidate-create"
+    CANDIDATE_READY_EOF = "network-candidate-ready-eof"
+    CANDIDATE_READY_OUTPUT = "network-candidate-ready-output"
+    CANDIDATE_READY_TIMEOUT = "network-candidate-ready-timeout"
     CANDIDATE_RESULT = "network-candidate-result"
     TRUSTED_START = "network-trusted-start"
+    TRUSTED_CREATE = "network-trusted-create"
+    TRUSTED_READY_EOF = "network-trusted-ready-eof"
+    TRUSTED_READY_OUTPUT = "network-trusted-ready-output"
+    TRUSTED_READY_TIMEOUT = "network-trusted-ready-timeout"
     TRUSTED_RESULT = "network-trusted-result"
+
+
+def _startup_stage(
+    stage: NetworkStage | None,
+    reason: Literal["create", "ready-eof", "ready-output", "ready-timeout"],
+) -> NetworkStage | None:
+    # LLM contract: fixed start phase + trusted observation -> fixed stage;
+    # launcher output is never copied into evidence or allowed to select a token.
+    # Primary source: https://docs.python.org/3.14/library/asyncio-subprocess.html
+    if stage not in {NetworkStage.CANDIDATE_START, NetworkStage.TRUSTED_START}:
+        return stage
+    return NetworkStage(f"{stage.value.removesuffix('-start')}-{reason}")
 
 
 @dataclass(frozen=True)
@@ -990,27 +1010,42 @@ async def _spawn(
         )
         macos = sandbox == NetworkSandbox.MACOS
         inherited = () if seccomp_fd is None else (seccomp_fd,)
-        process = await asyncio.create_subprocess_exec(
-            *command,
-            cwd=cwd if macos else "/",
-            env=_candidate_environment(
-                runtime.artifacts, runtime.temporary, cargo_home
-            ),
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            start_new_session=True,
-            pass_fds=inherited,
-            extra_groups=() if macos else None,
-            group=identity.gid if macos else None,
-            user=identity.uid if macos else None,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=cwd if macos else "/",
+                env=_candidate_environment(
+                    runtime.artifacts, runtime.temporary, cargo_home
+                ),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+                pass_fds=inherited,
+                extra_groups=() if macos else None,
+                group=identity.gid if macos else None,
+                user=identity.uid if macos else None,
+            )
+        except OSError as error:
+            raise HarnessError(
+                "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+                stage=_startup_stage(startup_failure, "create"),
+            ) from error
         assert process.stdout is not None
-        ready = await asyncio.wait_for(process.stdout.read(1), 2)
+        try:
+            ready = await asyncio.wait_for(process.stdout.read(1), 2)
+        except TimeoutError as error:
+            raise HarnessError(
+                "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+                stage=_startup_stage(startup_failure, "ready-timeout"),
+            ) from error
         if ready != SANDBOX_READY:
             raise HarnessError(
                 "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
-                stage=startup_failure,
+                stage=_startup_stage(
+                    startup_failure,
+                    "ready-eof" if ready == b"" else "ready-output",
+                ),
             )
         return process
     except asyncio.CancelledError:

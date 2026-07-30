@@ -337,8 +337,16 @@ jobs:
                   "network-sandbox-select",
                   "network-host-canaries",
                   "network-candidate-start",
+                  "network-candidate-create",
+                  "network-candidate-ready-eof",
+                  "network-candidate-ready-output",
+                  "network-candidate-ready-timeout",
                   "network-candidate-result",
                   "network-trusted-start",
+                  "network-trusted-create",
+                  "network-trusted-ready-eof",
+                  "network-trusted-ready-output",
+                  "network-trusted-ready-timeout",
                   "network-trusted-result",
               }
               fields = {

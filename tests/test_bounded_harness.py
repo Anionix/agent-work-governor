@@ -861,44 +861,69 @@ class BoundedHarnessTests(unittest.TestCase):
             result.stdout,
         )
 
-    def test_sandbox_setup_without_readiness_is_typed(self) -> None:
+    def test_sandbox_startup_failure_is_typed(self) -> None:
         runtime = harness.RuntimePaths(
             self.root / "run.json",
             self.root / "evidence",
             self.root / "artifacts",
             self.root / "tmp",
         )
-        stdout = mock.AsyncMock()
-        stdout.read.return_value = b""
-        process = SimpleNamespace(returncode=1, stdout=stdout)
-        with (
-            mock.patch.object(harness, "_linux_seccomp_fd", return_value=9),
-            mock.patch.object(harness, "_sandboxed_argv", return_value=["bwrap"]),
-            mock.patch.object(
-                harness.asyncio,
-                "create_subprocess_exec",
-                return_value=process,
+        cases = (
+            ("create", OSError(), harness.NetworkStage.CANDIDATE_CREATE),
+            ("ready-eof", b"", harness.NetworkStage.CANDIDATE_READY_EOF),
+            ("ready-output", b"x", harness.NetworkStage.CANDIDATE_READY_OUTPUT),
+            (
+                "ready-timeout",
+                TimeoutError(),
+                harness.NetworkStage.CANDIDATE_READY_TIMEOUT,
             ),
-            mock.patch.object(harness.os, "close"),
-            self.assertRaises(harness.HarnessError) as raised,
-        ):
-            asyncio.run(
-                harness._spawn(
-                    ["candidate"],
-                    self.root,
-                    runtime,
-                    None,
-                    harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
-                    harness.NetworkSandbox.LINUX,
-                    startup_failure=harness.NetworkStage.CANDIDATE_START,
-                )
-            )
-        self.assertEqual(
-            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
-            raised.exception.code,
         )
-        self.assertEqual(harness.NetworkStage.CANDIDATE_START, raised.exception.stage)
-        self.assertEqual([], raised.exception.failed)
+        for name, observed, expected in cases:
+            with self.subTest(name=name):
+                stdout = mock.AsyncMock()
+                process = SimpleNamespace(returncode=1, stdout=stdout)
+                spawn = mock.AsyncMock()
+                if name == "create":
+                    spawn.side_effect = observed
+                else:
+                    spawn.return_value = process
+                    if isinstance(observed, bytes):
+                        stdout.read.return_value = observed
+                    else:
+                        stdout.read.side_effect = observed
+                with (
+                    mock.patch.object(harness, "_linux_seccomp_fd", return_value=9),
+                    mock.patch.object(
+                        harness, "_sandboxed_argv", return_value=["bwrap"]
+                    ),
+                    mock.patch.object(
+                        harness.asyncio, "create_subprocess_exec", new=spawn
+                    ),
+                    mock.patch.object(harness.os, "close"),
+                    self.assertRaises(harness.HarnessError) as raised,
+                ):
+                    asyncio.run(
+                        harness._spawn(
+                            ["candidate"],
+                            self.root,
+                            runtime,
+                            None,
+                            harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
+                            harness.NetworkSandbox.LINUX,
+                            startup_failure=harness.NetworkStage.CANDIDATE_START,
+                        )
+                    )
+                self.assertEqual(
+                    "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+                    raised.exception.code,
+                )
+                self.assertEqual(expected, raised.exception.stage)
+                self.assertEqual([], raised.exception.failed)
+
+        self.assertEqual(
+            harness.NetworkStage.TRUSTED_READY_EOF,
+            harness._startup_stage(harness.NetworkStage.TRUSTED_START, "ready-eof"),
+        )
 
     def test_network_fault_names_the_preflight_stage(self) -> None:
         runtime = harness.RuntimePaths(

@@ -2041,6 +2041,7 @@ class SourceHygieneTests(unittest.TestCase):
             '"reason_codes"',
             '"network_preflight_stage"',
             '"network-candidate-start"',
+            '"network-candidate-ready-eof"',
             'value.get("schema_version") != "0.2"',
             '"observed_check_outcomes"',
             '"rust_failure_diagnostics"',
