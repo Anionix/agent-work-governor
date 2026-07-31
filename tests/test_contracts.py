@@ -2451,6 +2451,7 @@ class SourceHygieneTests(unittest.TestCase):
             ".gradle/init.d/cache/generated.gradle",
             ".gradle/init.d/gradle8/cache-settings.init.gradle.kts",
             ".gradle/caches/foo/.gradle/gradle.properties",
+            "buck-out/v2/gen/output",
         ):
             rejected = run_repository_controls_fixture(tracked_output=tracked_output)
             with self.subTest(tracked_output=tracked_output):
@@ -2654,6 +2655,20 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertLessEqual(set(catalog["required"]), set(pins))
         self.assertIn("python", {pin["language"] for pin in pins.values()})
         self.assertIn("rust", {pin["language"] for pin in pins.values()})
+        self.assertEqual(
+            "https://github.com/facebook/buck2/releases/download/2026-07-15/buck2",
+            pins["buck2"]["source"],
+        )
+        self.assertEqual("2026.07.15", pins["buck2"]["version"])
+        self.assertNotIn("buck2", catalog["required"])
+        self.assertEqual(
+            {"aarch64-darwin", "aarch64-linux", "x86_64-linux"},
+            set(pins["buck2"]["artifacts"]),
+        )
+        self.assertIn(
+            '"authority":"none"',
+            (PLUGIN_ROOT / "scripts/buck2_shadow_probe.sh").read_text(encoding="utf-8"),
+        )
 
         project = tomllib.loads(
             (PLUGIN_ROOT / "pyproject.toml").read_text(encoding="utf-8")
