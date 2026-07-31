@@ -650,8 +650,12 @@ class BoundedHarnessTests(unittest.TestCase):
             denied.append(family)
             raise OSError(errno.EPERM, "policy")
 
-        with mock.patch.object(harness.socket, "socket", side_effect=deny):
+        with (
+            mock.patch.object(harness.socket, "socket", side_effect=deny),
+            mock.patch.object(harness.os, "fork") as fork,
+        ):
             self.assertEqual(0, harness._candidate_ip_policy_probe())
+        fork.assert_not_called()
         self.assertEqual(
             [
                 socket.AF_INET,

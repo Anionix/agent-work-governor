@@ -921,16 +921,11 @@ def _candidate_ip_policy_once() -> int:
 
 
 def _candidate_ip_policy_probe() -> int:
-    direct = _candidate_ip_policy_once()
-    if direct != 0:
-        return direct
-    child = os.fork()
-    if child == 0:
-        os._exit(_candidate_ip_policy_once())
-    _, status = os.waitpid(child, 0)
-    if not os.WIFEXITED(status):
-        return NETWORK_SETUP_EXIT
-    return os.WEXITSTATUS(status)
+    # LLM contract: FIXED_NOBODY_CANDIDATE -> DIRECT_POLICY_PROOF |
+    # TYPED_NETWORK_EXIT. Descendant egress is proved independently by the
+    # trusted preflight; this proof never requires the isolated identity to
+    # create another process.
+    return _candidate_ip_policy_once()
 
 
 def _egress_blocked(
