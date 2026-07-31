@@ -58,28 +58,11 @@ jobs:
             [[ "$bwrap" =~ ^/nix/store/[0-9a-z]{32}-bubblewrap-[^/]+/bin/bwrap$ ]]
             [[ -x "$bwrap" ]]
             trusted_path="$(dirname "$bwrap"):$trusted_path"
-            restriction="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || printf 0)"
-            [[ "$restriction" == 0 || "$restriction" == 1 ]]
-            if [[ "$restriction" == 1 ]]; then
-              # LLM contract: LOCKED_BWRAP_PATH + ACTIVE_RESTRICTION ->
-              # EXACT_USERNS_PROFILE -> TEST -> PROFILE_REMOVED | JOB_FAILURE.
-              # Primary source: https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions
-              apparmor_profile="$(mktemp "$RUNNER_TEMP/agent-work-governor-bwrap.XXXXXX")"
-              printf 'abi <abi/4.0>,\ninclude <tunables/global>\n%s flags=(unconfined) {\n  userns,\n}\n' \
-                "$bwrap" > "$apparmor_profile"
-              sudo /usr/sbin/apparmor_parser -r "$apparmor_profile"
-              trap 'sudo /usr/sbin/apparmor_parser -R "$apparmor_profile"' EXIT
-            fi
           fi
           sudo /usr/bin/env -i \
             "HOME=$RUNNER_TEMP" \
             "PATH=$trusted_path" \
             "$python" -B -m unittest tests.test_bounded_harness
-          if [[ -n "${apparmor_profile:-}" ]]; then
-            sudo /usr/sbin/apparmor_parser -R "$apparmor_profile"
-            apparmor_profile=
-            trap - EXIT
-          fi
 
   ubuntu-arm-shadow:
     name: harness / isolation / ubuntu-24.04-arm / shadow

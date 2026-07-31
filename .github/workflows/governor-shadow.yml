@@ -293,18 +293,6 @@ jobs:
               bwrap="$(readlink -f "$(command -v bwrap)")"
               [[ "$bwrap" =~ ^/nix/store/[0-9a-z]{32}-bubblewrap-[^/]+/bin/bwrap$ ]]
               [[ -x "$bwrap" ]]
-              restriction="$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || printf 0)"
-              [[ "$restriction" == 0 || "$restriction" == 1 ]]
-              if [[ "$restriction" == 1 ]]; then
-                # LLM contract: TRUSTED_CONTROL_BWRAP + ACTIVE_RESTRICTION ->
-                # EXACT_USERNS_PROFILE -> SHADOW_RUN -> PROFILE_REMOVED | FAILURE.
-                # Primary source: https://documentation.ubuntu.com/release-notes/24.04/#unprivileged-user-namespace-restrictions
-                apparmor_profile="$(mktemp "$RUNNER_TEMP/agent-work-governor-bwrap.XXXXXX")"
-                printf 'abi <abi/4.0>,\ninclude <tunables/global>\n%s flags=(unconfined) {\n  userns,\n}\n' \
-                  "$bwrap" > "$apparmor_profile"
-                sudo /usr/sbin/apparmor_parser -r "$apparmor_profile"
-                trap 'sudo /usr/sbin/apparmor_parser -R "$apparmor_profile"' EXIT
-              fi
             fi
             harness_exit=0
             sudo /usr/bin/env -i "${root_environment[@]}" "$python" -B \
@@ -318,11 +306,6 @@ jobs:
               --trusted-rust-inputs "$rust_inputs" \
               > "$output/harness.json" 2> "$output/harness.stderr" \
               || harness_exit=$?
-            if [[ -n "${apparmor_profile:-}" ]]; then
-              sudo /usr/sbin/apparmor_parser -R "$apparmor_profile"
-              apparmor_profile=
-              trap - EXIT
-            fi
           fi
           if (( plan_exit == 0 && harness_exit == 0 )); then
             evidence=()

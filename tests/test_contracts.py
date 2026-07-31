@@ -2935,11 +2935,6 @@ class SourceHygieneTests(unittest.TestCase):
             "steps: *harness-isolation-steps",
             'bwrap="$(',
             "which bwrap",
-            "apparmor_restrict_unprivileged_userns",
-            "flags=(unconfined)",
-            "userns,",
-            'apparmor_parser -r "$apparmor_profile"',
-            'apparmor_parser -R "$apparmor_profile"',
             'trusted_path="$(dirname "$bwrap"):$trusted_path"',
             "sudo /usr/bin/env -i",
             '"PATH=$trusted_path"',
@@ -2950,6 +2945,7 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertNotIn("pull_request", workflow)
         self.assertNotIn("matrix:", workflow)
         self.assertNotIn("apparmor_restrict_unprivileged_userns=0", workflow)
+        self.assertNotIn("apparmor_parser", workflow)
         self.assertIn(
             ".github/workflows/harness-isolation.yml",
             (PLUGIN_ROOT / "flake.nix").read_text(encoding="utf-8"),
@@ -2984,11 +2980,6 @@ class SourceHygieneTests(unittest.TestCase):
             "NIX_BINTOOLS_FOR_BUILD",
             "NIX_CFLAGS_COMPILE_FOR_BUILD",
             "NIX_LDFLAGS_FOR_BUILD",
-            "apparmor_restrict_unprivileged_userns",
-            "flags=(unconfined)",
-            "userns,",
-            'apparmor_parser -r "$apparmor_profile"',
-            'apparmor_parser -R "$apparmor_profile"',
             "--runtime-root",
             "--trusted-rust-inputs",
             "--evidence-root",
@@ -3024,6 +3015,7 @@ class SourceHygieneTests(unittest.TestCase):
         ):
             self.assertIn(evidence, workflow)
         self.assertNotIn("apparmor_restrict_unprivileged_userns=0", workflow)
+        self.assertNotIn("apparmor_parser", workflow)
         for forbidden in (
             "secrets.",
             "governor / validate",

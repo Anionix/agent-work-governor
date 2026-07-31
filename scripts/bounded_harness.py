@@ -631,18 +631,20 @@ def _macos_profile(
 def _linux_seccomp_program(
     machine: str | None = None, *, allow_loopback: bool = False
 ) -> bytes:
-    # LLM contract: PINNED_LINUX_ABI -> ARCH_BOUND_SOCKET_ALLOWLIST;
-    # unexpected ABI, x32, io_uring socket creation, or nonlocal socket domain
-    # transitions to policy denial before candidate-controlled network access.
+    # LLM contract: PINNED_LINUX_ABI -> ARCH_BOUND_SOCKET_AND_USERNS_FILTER;
+    # unexpected ABI/x32 is killed; io_uring, setns, and CLONE_NEWUSER fail
+    # closed with EPERM, clone3 with ENOSYS, and nonlocal sockets with EPERM
+    # before candidate-controlled network or namespace access.
     # Primary sources:
     # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/seccomp.h
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/sched.h
     # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/io_uring.h
     # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/arch/x86/entry/syscalls/syscall_64.tbl
     # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/asm-generic/unistd.h
     specifications = {
-        "x86_64": (0xC000003E, 41, 53, 0x40000000),
-        "aarch64": (0xC00000B7, 198, 199, 0),
-        "arm64": (0xC00000B7, 198, 199, 0),
+        "x86_64": (0xC000003E, 41, 53, 56, 272, 308, 0x40000000),
+        "aarch64": (0xC00000B7, 198, 199, 220, 97, 268, 0),
+        "arm64": (0xC00000B7, 198, 199, 220, 97, 268, 0),
     }
     specification = specifications.get((machine or platform.machine()).lower())
     _require(
@@ -650,8 +652,18 @@ def _linux_seccomp_program(
         "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
     )
     assert specification is not None
-    arch, socket_call, socketpair_call, x32_bit = specification
+    (
+        arch,
+        socket_call,
+        socketpair_call,
+        clone_call,
+        unshare_call,
+        setns_call,
+        x32_bit,
+    ) = specification
     deny = 0x00050000 | errno.EPERM
+    unavailable = 0x00050000 | errno.ENOSYS
+    clone_newuser = 0x10000000
     instructions = [
         (0x20, 0, 0, 4),  # seccomp_data.arch
         (0x15, 1, 0, arch),
@@ -664,6 +676,12 @@ def _linux_seccomp_program(
     if allow_loopback:
         domains += [int(socket.AF_INET), int(socket.AF_INET6)]
     instructions += [
+        (0x15, 0, 1, 435),  # clone3; pointed flags cannot be inspected by cBPF
+        (0x06, 0, 0, unavailable),
+        (0x15, 0, 1, setns_call),
+        (0x06, 0, 0, deny),
+        (0x15, 9 + len(domains), 0, clone_call),
+        (0x15, 8 + len(domains), 0, unshare_call),
         (0x15, 0, 1, 425),  # io_uring_setup
         (0x06, 0, 0, deny),
         (0x15, 2, 0, socket_call),
@@ -674,6 +692,10 @@ def _linux_seccomp_program(
             (0x15, len(domains) - index, 0, domain)
             for index, domain in enumerate(domains)
         ],
+        (0x06, 0, 0, deny),
+        (0x06, 0, 0, 0x7FFF0000),
+        (0x20, 0, 0, 16),  # clone/unshare flags
+        (0x45, 0, 1, clone_newuser),
         (0x06, 0, 0, deny),
         (0x06, 0, 0, 0x7FFF0000),
     ]
@@ -755,9 +777,9 @@ def _sandboxed_argv(
         and launcher.is_file(),
         "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
     )
-    # LLM contract: GENERIC_CANDIDATE -> HOST_NOBODY + LOCKED_USER_NAMESPACE;
-    # FIXED_PROBE -> ROOT_LAUNCHER + IN_PROCESS_DROP. Candidate bytes never
-    # inherit the root launcher capabilities or create a later user namespace.
+    # LLM contract: ROOT_LAUNCHER + TRUSTED_IDENTITY_ENTRY -> IN_PROCESS_DROP;
+    # candidate bytes never inherit launcher capabilities, and the installed
+    # seccomp program rejects every later user-namespace creation/join path.
     # Primary sources:
     # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L319-L333
     # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L3501-L3509
@@ -782,16 +804,6 @@ def _sandboxed_argv(
             and len(argv) == privileged_probe.argv_length + 2,
             "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
         )
-    identity_options = (
-        [
-            "--cap-add",
-            "CAP_SETGID",
-            "--cap-add",
-            "CAP_SETUID",
-        ]
-        if privileged_probe is not None
-        else ["--unshare-user", "--disable-userns"]
-    )
     command = [
         str(_trusted_executable(shutil.which("bwrap"))),
         "--add-seccomp-fd",
@@ -803,7 +815,10 @@ def _sandboxed_argv(
         "--die-with-parent",
         "--cap-drop",
         "ALL",
-        *identity_options,
+        "--cap-add",
+        "CAP_SETGID",
+        "--cap-add",
+        "CAP_SETUID",
         "--ro-bind",
         "/nix/store",
         "/nix/store",
@@ -897,21 +912,12 @@ def _fixed_probe_arguments(argv: list[str]) -> list[str]:
 
 
 def _linux_candidate_exec(argv: list[str]) -> int:
-    # LLM contract: PARENT_DROPPED_IDENTITY + LOCKED_USER_NAMESPACE + EXACT_ARGV
-    # -> VERIFIED_NOBODY_READY + CANDIDATE_EXEC | NETWORK_SETUP_EXIT. The
-    # protected launcher verifies rather than changes credentials before READY.
+    # LLM contract: ROOT_SANDBOX_LAUNCHER + EXACT_UID_GID + EXACT_ARGV ->
+    # VERIFIED_NOBODY_READY + CANDIDATE_EXEC | NETWORK_SETUP_EXIT. Candidate
+    # bytes start only after the complete credential drop is read back.
     try:
         _require(len(argv) >= 3, "HARNESS_IDENTITY_UNSAFE")
-        identity = RunIdentity(int(argv[0]), int(argv[1]))
-        command = argv[2:]
-        _require(
-            identity.uid not in (0, (1 << 32) - 1)
-            and identity.gid not in (0, (1 << 32) - 1)
-            and os.geteuid() == identity.uid
-            and os.getegid() == identity.gid
-            and os.getgroups() == [],
-            "HARNESS_IDENTITY_UNSAFE",
-        )
+        command = _drop_candidate_identity(argv)
         os.write(1, SANDBOX_READY)
         os.execvpe(command[0], command, os.environ)
     except (HarnessError, OSError, ValueError):
@@ -1316,7 +1322,7 @@ async def _spawn(
             ),
         )
         macos = sandbox == NetworkSandbox.MACOS
-        parent_drops_identity = macos or fixed_probe is None
+        parent_drops_identity = macos
         inherited = () if seccomp_fd is None else (seccomp_fd,)
         # LLM contract: LAUNCHER_SETSID -> SANDBOX_INHERITS_DETACHED_SESSION;
         # a second Bubblewrap setsid would fail closed before READY because the

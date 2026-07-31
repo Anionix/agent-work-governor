@@ -32,26 +32,23 @@ Before any candidate starts, the harness self-tests an inherited OS network
 boundary against trusted host-local canaries. Linux uses the catalog-pinned
 Bubblewrap to expose only protected inputs, candidate workspaces, and the
 canonical read-only launcher while creating network/PID/IPC/UTS namespaces.
-For ordinary checks the parent clears supplementary groups and launches
-Bubblewrap directly as the fixed host `nobody` identity. Bubblewrap creates one
-user namespace for its unprivileged mount setup, disables later user namespace
-creation, drops all capabilities, and loads the protected launcher at that same
-host identity. The post-merge workflow gives Ubuntu x86 authority, Ubuntu ARM
+For ordinary checks Bubblewrap starts as the trusted root launcher with only
+`CAP_SETGID` and `CAP_SETUID`, loads the protected entry, then drops to the
+fixed `nobody` identity before READY and candidate exec. Its inherited seccomp
+filter rejects later user-namespace creation or joining through `clone3`,
+`clone`, `unshare`, and `setns`. The post-merge workflow gives Ubuntu x86 authority, Ubuntu ARM
 Linux-portability shadow, and macOS platform shadow their own jobs while sharing
-only pinned steps. On Ubuntu hosts that restrict unprivileged user namespaces,
-the protected workflow temporarily grants only `userns,` to that exact locked
-Bubblewrap store path and removes the AppArmor profile after the run. On macOS,
+only pinned steps, so Linux no longer needs a temporary AppArmor exception. On macOS,
 the parent drops to nobody before `sandbox-exec`; the fixed in-sandbox probe
 verifies that identity and stays in process. The launcher verifies UID, GID,
-and the empty group list before
-READY and candidate exec. On Linux, fixed policy and trusted-network probes
-instead start the launcher as root with only `CAP_SETGID` and `CAP_SETUID`, then
-stay in that already-loaded launcher after its verified credential drop. On
+and the empty group list before READY and candidate exec. On Linux, fixed policy
+and trusted-network probes stay in that already-loaded launcher after the same
+verified credential drop. On
 both platforms neither fixed probe has a post-READY exec boundary. The trusted
 preflight's inherited,
 architecture-bound seccomp filter permits Unix, IPv4, and IPv6 sockets.
 Candidate filters permit Unix sockets only; VSOCK, packet, IPv4, IPv6,
-alternate-ABI, and `io_uring` socket paths fail with `EPERM`. A Bubblewrap
+alternate-ABI, `io_uring`, and later user-namespace paths fail closed. A Bubblewrap
 loopback `RTM_NEWADDR` denial with `EPERM` is reported only as the fixed
 `network-*-linux-loopback-rtnetlink-eperm` stage; launcher text is never
 emitted. On macOS, the protected fixed launcher enters a deny-default Seatbelt
