@@ -821,9 +821,7 @@ class BoundedHarnessTests(unittest.TestCase):
         self.assertIn('(allow network-outbound (remote ip "localhost:*"))', probe[2])
 
     def test_linux_sandbox_binds_trusted_launcher_outside_candidate_cwd(self) -> None:
-        script = self.root / "trusted-source/scripts/bounded_harness.py"
-        script.parent.mkdir(parents=True)
-        script.write_text("# trusted launcher\n", encoding="utf-8")
+        script = Path(harness.__file__).resolve()
         candidate_cwd = self.root / "candidate"
         candidate_cwd.mkdir()
         runtime = harness.RuntimePaths(
@@ -842,12 +840,30 @@ class BoundedHarnessTests(unittest.TestCase):
             command = harness._sandboxed_argv(
                 harness.NetworkSandbox.LINUX,
                 identity,
-                [str(script), "--network-probe"],
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(script),
+                    "--network-probe-entry",
+                    str(NOBODY.pw_uid),
+                    str(NOBODY.pw_gid),
+                    "10.0.0.1",
+                    "1234",
+                    "-",
+                    "0",
+                    "0",
+                    "1235",
+                    "/tmp/canary.sock",
+                    "/tmp/write-canary",
+                ],
                 candidate_cwd,
                 runtime,
                 cargo_home,
+                allow_loopback=True,
                 seccomp_fd=9,
                 trusted_launcher=script,
+                privileged_probe=harness.FIXED_PROBES["network"],
             )
         self.assertNotIn("--unshare-user", command)
         self.assertNotIn("--disable-userns", command)
@@ -888,6 +904,84 @@ class BoundedHarnessTests(unittest.TestCase):
                 command[lock_anchor - 1 : lock_anchor + 2],
             )
 
+    def test_linux_privileged_probe_rejects_unbound_spec_or_entry(self) -> None:
+        script = Path(harness.__file__).resolve()
+        runtime = harness.RuntimePaths(
+            self.root / "run.json",
+            self.root / "evidence",
+            self.root / "artifacts",
+            self.root / "tmp",
+        )
+        identity = harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid)
+        argv = [
+            sys.executable,
+            "-I",
+            "-B",
+            str(script),
+            "--policy-probe-entry",
+            str(identity.uid),
+            str(identity.gid),
+        ]
+        equal_but_unbound = harness.FixedProbeSpec(
+            "--candidate-ip-policy-probe", "--policy-probe-entry", False, 5
+        )
+        for probe, candidate in (
+            (equal_but_unbound, argv),
+            (
+                harness.FIXED_PROBES["policy"],
+                [*argv[:4], "--network-probe-entry", *argv[5:]],
+            ),
+        ):
+            with self.assertRaises(harness.HarnessError):
+                harness._sandboxed_argv(
+                    harness.NetworkSandbox.LINUX,
+                    identity,
+                    candidate,
+                    self.root,
+                    runtime,
+                    None,
+                    seccomp_fd=9,
+                    trusted_launcher=script,
+                    privileged_probe=probe,
+                )
+
+    def test_linux_candidate_uses_parent_identity_and_locked_user_namespace(
+        self,
+    ) -> None:
+        script = self.root / "trusted-source/scripts/bounded_harness.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("# trusted launcher\n", encoding="utf-8")
+        runtime = harness.RuntimePaths(
+            self.root / "run.json",
+            self.root / "evidence",
+            self.root / "artifacts",
+            self.root / "tmp",
+        )
+        with mock.patch.object(
+            harness,
+            "_trusted_executable",
+            return_value=Path("/nix/store/pinned-bwrap"),
+        ):
+            command = harness._sandboxed_argv(
+                harness.NetworkSandbox.LINUX,
+                harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
+                [str(script), "--linux-candidate-exec"],
+                self.root,
+                runtime,
+                None,
+                seccomp_fd=9,
+                trusted_launcher=script,
+            )
+        self.assertIn("--unshare-user", command)
+        self.assertIn("--disable-userns", command)
+        self.assertNotIn("CAP_SETGID", command)
+        self.assertNotIn("CAP_SETUID", command)
+        anchor = command.index(str(script))
+        self.assertEqual(
+            ["--ro-bind", str(script), str(script)],
+            command[anchor - 1 : anchor + 2],
+        )
+
     def test_linux_spawn_passes_then_closes_seccomp_fd(self) -> None:
         runtime = harness.RuntimePaths(
             self.root / "run.json",
@@ -925,6 +1019,9 @@ class BoundedHarnessTests(unittest.TestCase):
         assert await_args is not None
         self.assertEqual((9,), await_args.kwargs["pass_fds"])
         self.assertIs(True, await_args.kwargs["start_new_session"])
+        self.assertEqual((), await_args.kwargs["extra_groups"])
+        self.assertEqual(NOBODY.pw_gid, await_args.kwargs["group"])
+        self.assertEqual(NOBODY.pw_uid, await_args.kwargs["user"])
         stdout.read.assert_awaited_once_with(1)
         self.assertEqual(1, close.call_args_list.count(mock.call(9)))
         wrapped = sandboxed.call_args.args[2]
@@ -932,6 +1029,7 @@ class BoundedHarnessTests(unittest.TestCase):
             Path(harness.__file__).resolve(),
             sandboxed.call_args.kwargs["trusted_launcher"],
         )
+        self.assertIsNone(sandboxed.call_args.kwargs["privileged_probe"])
         self.assertEqual(
             [
                 "--linux-candidate-exec",
@@ -1012,11 +1110,22 @@ class BoundedHarnessTests(unittest.TestCase):
                     script if sandbox == harness.NetworkSandbox.LINUX else None,
                     sandboxed.call_args.kwargs["trusted_launcher"],
                 )
+                self.assertIs(
+                    harness.FIXED_PROBES[fixed_probe]
+                    if sandbox == harness.NetworkSandbox.LINUX
+                    else None,
+                    sandboxed.call_args.kwargs["privileged_probe"],
+                )
                 await_args = spawn.await_args
                 assert await_args is not None
-                self.assertIsNone(await_args.kwargs["user"])
-                self.assertIsNone(await_args.kwargs["group"])
-                self.assertIsNone(await_args.kwargs["extra_groups"])
+                if sandbox == harness.NetworkSandbox.MACOS:
+                    self.assertEqual(NOBODY.pw_uid, await_args.kwargs["user"])
+                    self.assertEqual(NOBODY.pw_gid, await_args.kwargs["group"])
+                    self.assertEqual((), await_args.kwargs["extra_groups"])
+                else:
+                    self.assertIsNone(await_args.kwargs["user"])
+                    self.assertIsNone(await_args.kwargs["group"])
+                    self.assertIsNone(await_args.kwargs["extra_groups"])
 
     def test_candidate_policy_probe_emits_ready_from_proving_process(self) -> None:
         with (
@@ -1037,6 +1146,7 @@ class BoundedHarnessTests(unittest.TestCase):
 
     def test_policy_probe_entry_drops_identity_without_exec(self) -> None:
         with (
+            mock.patch.object(harness.sys, "platform", "linux"),
             mock.patch.object(
                 harness,
                 "_drop_candidate_identity",
@@ -1062,6 +1172,7 @@ class BoundedHarnessTests(unittest.TestCase):
     def test_trusted_probe_entry_drops_identity_without_exec(self) -> None:
         arguments = ["host", "1", "-", "0", "0", "2", "unix", "write"]
         with (
+            mock.patch.object(harness.sys, "platform", "linux"),
             mock.patch.object(
                 harness,
                 "_drop_candidate_identity",
@@ -1082,16 +1193,34 @@ class BoundedHarnessTests(unittest.TestCase):
         prove.assert_called_once_with(arguments)
         execute.assert_not_called()
 
-    def test_linux_candidate_exec_drops_identity_before_ready(self) -> None:
-        writes: list[tuple[int, bytes]] = []
+    def test_macos_fixed_probe_verifies_parent_dropped_identity(self) -> None:
         with (
-            mock.patch.object(harness.sys, "platform", "linux"),
-            mock.patch.object(harness.os, "geteuid", side_effect=[0, NOBODY.pw_uid]),
+            mock.patch.object(harness.sys, "platform", "darwin"),
+            mock.patch.object(harness.os, "geteuid", return_value=NOBODY.pw_uid),
             mock.patch.object(harness.os, "getegid", return_value=NOBODY.pw_gid),
             mock.patch.object(harness.os, "getgroups", return_value=[]),
-            mock.patch.object(harness.os, "setgroups") as setgroups,
-            mock.patch.object(harness.os, "setgid") as setgid,
-            mock.patch.object(harness.os, "setuid") as setuid,
+            mock.patch.object(
+                harness,
+                "_candidate_ip_policy_probe",
+                return_value=0,
+            ) as prove,
+            mock.patch.object(harness.os, "execvpe") as execute,
+        ):
+            self.assertEqual(
+                0,
+                harness._candidate_policy_probe_entry(
+                    [str(NOBODY.pw_uid), str(NOBODY.pw_gid)]
+                ),
+            )
+        prove.assert_called_once_with()
+        execute.assert_not_called()
+
+    def test_linux_candidate_exec_verifies_identity_before_ready(self) -> None:
+        writes: list[tuple[int, bytes]] = []
+        with (
+            mock.patch.object(harness.os, "geteuid", return_value=NOBODY.pw_uid),
+            mock.patch.object(harness.os, "getegid", return_value=NOBODY.pw_gid),
+            mock.patch.object(harness.os, "getgroups", return_value=[]),
             mock.patch.object(
                 harness.os,
                 "write",
@@ -1112,9 +1241,6 @@ class BoundedHarnessTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(harness.NETWORK_SETUP_EXIT, result)
-        setgroups.assert_called_once_with([])
-        setgid.assert_called_once_with(NOBODY.pw_gid)
-        setuid.assert_called_once_with(NOBODY.pw_uid)
         self.assertEqual([(1, harness.SANDBOX_READY)], writes)
         execute.assert_called_once_with(
             "/nix/store/candidate",
@@ -1122,13 +1248,11 @@ class BoundedHarnessTests(unittest.TestCase):
             mock.ANY,
         )
 
-    def test_linux_candidate_exec_fails_before_ready_on_partial_drop(self) -> None:
+    def test_linux_candidate_exec_fails_before_ready_on_identity_mismatch(self) -> None:
         with (
-            mock.patch.object(harness.sys, "platform", "linux"),
             mock.patch.object(harness.os, "geteuid", return_value=0),
-            mock.patch.object(
-                harness.os, "setgroups", side_effect=OSError(errno.EPERM, "injected")
-            ),
+            mock.patch.object(harness.os, "getegid", return_value=NOBODY.pw_gid),
+            mock.patch.object(harness.os, "getgroups", return_value=[]),
             mock.patch.object(harness.os, "write") as write,
         ):
             self.assertEqual(

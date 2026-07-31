@@ -31,13 +31,23 @@ runner must still tear down any survivor after the job.
 Before any candidate starts, the harness self-tests an inherited OS network
 boundary against trusted host-local canaries. Linux uses the catalog-pinned
 Bubblewrap to expose only protected inputs, candidate workspaces, and the
-canonical read-only launcher while creating network/PID/IPC/UTS namespaces
-without a nested user namespace. Bubblewrap drops every capability except
-`CAP_SETGID` and `CAP_SETUID`; the trusted launcher uses them to clear
-supplementary groups, set and verify the fixed `nobody` GID/UID, and only then
-emits READY and executes the candidate. Fixed policy and trusted-network probes
-instead stay in that already-loaded launcher after the verified credential
-drop, so neither platform has a post-READY exec boundary. The trusted
+canonical read-only launcher while creating network/PID/IPC/UTS namespaces.
+For ordinary checks the parent clears supplementary groups and launches
+Bubblewrap directly as the fixed host `nobody` identity. Bubblewrap creates one
+user namespace for its unprivileged mount setup, disables later user namespace
+creation, drops all capabilities, and loads the protected launcher at that same
+host identity. The post-merge workflow gives Ubuntu x86 authority, Ubuntu ARM
+Linux-portability shadow, and macOS platform shadow their own jobs while sharing
+only pinned steps. On Ubuntu hosts that restrict unprivileged user namespaces,
+the protected workflow temporarily grants only `userns,` to that exact locked
+Bubblewrap store path and removes the AppArmor profile after the run. On macOS,
+the parent drops to nobody before `sandbox-exec`; the fixed in-sandbox probe
+verifies that identity and stays in process. The launcher verifies UID, GID,
+and the empty group list before
+READY and candidate exec. On Linux, fixed policy and trusted-network probes
+instead start the launcher as root with only `CAP_SETGID` and `CAP_SETUID`, then
+stay in that already-loaded launcher after its verified credential drop. On
+both platforms neither fixed probe has a post-READY exec boundary. The trusted
 preflight's inherited,
 architecture-bound seccomp filter permits Unix, IPv4, and IPv6 sockets.
 Candidate filters permit Unix sockets only; VSOCK, packet, IPv4, IPv6,
