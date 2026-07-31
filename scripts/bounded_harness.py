@@ -73,6 +73,8 @@ NETWORK_FAULTS = frozenset(
 )
 NETWORK_BYPASS_EXIT = 81
 NETWORK_SETUP_EXIT = 82
+NETWORK_POLICY_SOCKET_CREATE_EXIT = 83
+NETWORK_POLICY_SOCKET_OPERATION_EXIT = 84
 FAULT_SCHEMA_VERSION = "0.3"
 SANDBOX_READY = b"\x01"
 BWRAP_LOOPBACK_RTM_NEWADDR_EPERM = (
@@ -133,6 +135,11 @@ class NetworkStage(StrEnum):
         "network-candidate-linux-loopback-rtnetlink-eperm"
     )
     CANDIDATE_RESULT = "network-candidate-result"
+    CANDIDATE_SOCKET_CREATE_UNEXPECTED = "network-candidate-socket-create-unexpected"
+    CANDIDATE_SOCKET_OPERATION_UNEXPECTED = (
+        "network-candidate-socket-operation-unexpected"
+    )
+    CANDIDATE_PROCESS_EXIT_UNEXPECTED = "network-candidate-process-exit-unexpected"
     TRUSTED_START = "network-trusted-start"
     TRUSTED_CREATE = "network-trusted-create"
     TRUSTED_READY_EOF = "network-trusted-ready-eof"
@@ -901,7 +908,7 @@ def _candidate_ip_policy_once() -> int:
             except OSError as error:
                 if error.errno == errno.EPERM:
                     continue
-                return NETWORK_SETUP_EXIT
+                return NETWORK_POLICY_SOCKET_CREATE_EXIT
             try:
                 with client:
                     if kind == socket.SOCK_DGRAM:
@@ -911,13 +918,24 @@ def _candidate_ip_policy_once() -> int:
             except OSError as error:
                 if error.errno == errno.EPERM:
                     continue
-                return NETWORK_SETUP_EXIT
+                return NETWORK_POLICY_SOCKET_OPERATION_EXIT
             if result == errno.EPERM:
                 continue
             if result in {0, errno.ECONNREFUSED}:
                 return NETWORK_BYPASS_EXIT
-            return NETWORK_SETUP_EXIT
+            return NETWORK_POLICY_SOCKET_OPERATION_EXIT
     return 0
+
+
+def _candidate_policy_stage(returncode: int | None) -> NetworkStage:
+    # LLM contract: TRUSTED_PROCESS_RETURN + CANDIDATE_RESULT ->
+    # FIXED_NETWORK_STAGE; candidate bytes never enter evidence, and unknown
+    # returns remain a fail-closed process-exit classification.
+    if returncode == NETWORK_POLICY_SOCKET_CREATE_EXIT:
+        return NetworkStage.CANDIDATE_SOCKET_CREATE_UNEXPECTED
+    if returncode == NETWORK_POLICY_SOCKET_OPERATION_EXIT:
+        return NetworkStage.CANDIDATE_SOCKET_OPERATION_UNEXPECTED
+    return NetworkStage.CANDIDATE_PROCESS_EXIT_UNEXPECTED
 
 
 def _candidate_ip_policy_probe() -> int:
@@ -1300,7 +1318,10 @@ async def _verify_network_sandbox(
             if process.returncode == NETWORK_BYPASS_EXIT:
                 raise HarnessError("HARNESS_NETWORK_SANDBOX_BYPASS_DETECTED")
             if process.returncode != 0:
-                raise HarnessError("HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED")
+                raise HarnessError(
+                    "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
+                    stage=_candidate_policy_stage(process.returncode),
+                )
             native_arguments = (
                 [native_ipv6[0], str(native_ipv6[1]), str(native_ipv6[2])]
                 if native_ipv6 is not None

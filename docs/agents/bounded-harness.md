@@ -49,7 +49,13 @@ allow rules, so a host-local HTTP, SOCKS, or browser debug broker cannot relay
 egress. The candidate-policy proof runs directly as the fixed `nobody`
 identity; it does not require that identity to fork. A fixed stdout prefix
 proves that Bubblewrap or Seatbelt entered the sandbox before any check exit
-code can be evaluated. The trusted self-test
+code can be evaluated. If the direct proof fails, exit `81` remains an observed
+bypass at `network-candidate-result`; otherwise the trusted parent emits a
+fixed fault stage derived only from its return code: `83` selects
+`network-candidate-socket-create-unexpected`, `84` selects
+`network-candidate-socket-operation-unexpected`, and every other nonzero value
+selects `network-candidate-process-exit-unexpected`. Candidate output is never
+copied. The trusted self-test
 requires loopback success and denies host-interface TCP, IPv4-mapped IPv6, UDP/DNS
 transport, and a host Unix socket from both the probe and its descendants.
 When the host has routable native IPv6, it adds a reachable native canary;
@@ -70,6 +76,9 @@ Network stage values are fixed by the harness: `network-sandbox-select`,
 `network-host-canaries`,
 `network-candidate-{start,create,ready-eof,ready-output,ready-timeout,result}`,
 `network-candidate-linux-loopback-rtnetlink-eperm`,
+`network-candidate-socket-create-unexpected`,
+`network-candidate-socket-operation-unexpected`,
+`network-candidate-process-exit-unexpected`,
 `network-trusted-{start,create,ready-eof,ready-output,ready-timeout,result}`, or
 `network-trusted-linux-loopback-rtnetlink-eperm`.
 Schema `0.2` faults did not contain `launcher_diagnostic_sha256`; schema `0.1`

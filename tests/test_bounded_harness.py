@@ -672,7 +672,7 @@ class BoundedHarnessTests(unittest.TestCase):
             side_effect=OSError(errno.EAFNOSUPPORT, "host"),
         ):
             self.assertEqual(
-                harness.NETWORK_SETUP_EXIT,
+                harness.NETWORK_POLICY_SOCKET_CREATE_EXIT,
                 harness._candidate_ip_policy_probe(),
             )
 
@@ -701,6 +701,46 @@ class BoundedHarnessTests(unittest.TestCase):
                 harness.NETWORK_BYPASS_EXIT,
                 harness._candidate_ip_policy_once(),
             )
+
+    def test_candidate_ip_policy_stage_separates_failure_boundaries(
+        self,
+    ) -> None:
+        class OperationUnsupported:
+            def __enter__(self) -> Self:
+                return self
+
+            def __exit__(self, *_: object) -> None:
+                return None
+
+            def connect_ex(self, _: tuple[str, int]) -> int:
+                return errno.ENETUNREACH
+
+        with mock.patch.object(
+            harness.socket,
+            "socket",
+            return_value=OperationUnsupported(),
+        ):
+            self.assertEqual(
+                harness.NETWORK_POLICY_SOCKET_OPERATION_EXIT,
+                harness._candidate_ip_policy_once(),
+            )
+
+        for returncode, stage in (
+            (
+                harness.NETWORK_POLICY_SOCKET_CREATE_EXIT,
+                harness.NetworkStage.CANDIDATE_SOCKET_CREATE_UNEXPECTED,
+            ),
+            (
+                harness.NETWORK_POLICY_SOCKET_OPERATION_EXIT,
+                harness.NetworkStage.CANDIDATE_SOCKET_OPERATION_UNEXPECTED,
+            ),
+            (1, harness.NetworkStage.CANDIDATE_PROCESS_EXIT_UNEXPECTED),
+        ):
+            with self.subTest(returncode=returncode):
+                self.assertEqual(
+                    stage,
+                    harness._candidate_policy_stage(returncode),
+                )
 
     def test_missing_native_ipv6_route_is_not_used_as_policy_proof(self) -> None:
         class NoRouteSocket:
