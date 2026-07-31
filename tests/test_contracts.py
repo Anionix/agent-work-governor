@@ -2420,6 +2420,16 @@ class SourceHygieneTests(unittest.TestCase):
             run_repository_controls_fixture(docker_action_image="Dockerfile"),
             run_repository_controls_fixture(template_action=f"owner/action@{'a' * 40}"),
             run_repository_controls_fixture(uses_input=True),
+            run_repository_controls_fixture(tracked_output=".cargo/config.toml"),
+            run_repository_controls_fixture(tracked_output=".gradle/gradle.properties"),
+            run_repository_controls_fixture(tracked_output=".gradle/init.gradle"),
+            run_repository_controls_fixture(tracked_output=".gradle/init.gradle.kts"),
+            run_repository_controls_fixture(
+                tracked_output=".gradle/init.d/cache-settings.init.gradle.kts"
+            ),
+            run_repository_controls_fixture(
+                tracked_output="path.gradle/.gradle/gradle.properties"
+            ),
         ):
             self.assertEqual(0, accepted.returncode, accepted.stderr)
         for contract_kind in ("missing", "symlink", "submodule", "unreadable"):
@@ -2427,6 +2437,25 @@ class SourceHygieneTests(unittest.TestCase):
             with self.subTest(contract_kind=contract_kind):
                 self.assertEqual(1, rejected.returncode)
                 self.assertIn("REPOSITORY_CONTRACT_INVALID", rejected.stdout)
+        for tracked_output in (
+            ".gradle/caches/modules/a.jar",
+            ".gradle/8.14.4/fileHashes/fileHashes.lock",
+            ".gradle/buildOutputCleanup/cache.properties",
+            ".cargo/registry/cache/a.crate",
+            ".cargo/git/checkouts/repository/source.rs",
+            ".cargo/.global-cache",
+            ".cargo/.package-cache",
+            ".cargo/.package-cache-mutate",
+            ".governance/.gradle/gradle.properties",
+            ".cargo/registry/.gradle/gradle.properties",
+            ".gradle/init.d/cache/generated.gradle",
+            ".gradle/init.d/gradle8/cache-settings.init.gradle.kts",
+            ".gradle/caches/foo/.gradle/gradle.properties",
+        ):
+            rejected = run_repository_controls_fixture(tracked_output=tracked_output)
+            with self.subTest(tracked_output=tracked_output):
+                self.assertEqual(1, rejected.returncode)
+                self.assertIn("TRACKED_RUNTIME_OUTPUT", rejected.stdout)
         cases = (
             (
                 run_repository_controls_fixture(tracked_output="bin/tool"),
