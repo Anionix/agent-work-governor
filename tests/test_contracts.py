@@ -2985,6 +2985,11 @@ class SourceHygieneTests(unittest.TestCase):
             '"network-candidate-start"',
             '"network-candidate-ready-eof"',
             '"network-candidate-linux-loopback-rtnetlink-eperm"',
+            '"network-candidate-socket-create-unexpected"',
+            '"network-candidate-socket-operation-unexpected"',
+            '"network-candidate-process-exit-unexpected"',
+            'value.get("code")',
+            '"HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED"',
             'value.get("schema_version") != "0.3"',
             '"observed_check_outcomes"',
             '"rust_failure_diagnostics"',
@@ -3099,6 +3104,27 @@ class SourceHygieneTests(unittest.TestCase):
                 ("0.3", "network-candidate-result", "a" * 64, None, None),
                 (
                     "0.3",
+                    "network-candidate-socket-create-unexpected",
+                    None,
+                    "network-candidate-socket-create-unexpected",
+                    None,
+                ),
+                (
+                    "0.3",
+                    "network-candidate-socket-operation-unexpected",
+                    None,
+                    "network-candidate-socket-operation-unexpected",
+                    None,
+                ),
+                (
+                    "0.3",
+                    "network-candidate-process-exit-unexpected",
+                    None,
+                    "network-candidate-process-exit-unexpected",
+                    None,
+                ),
+                (
+                    "0.3",
                     "network-candidate-linux-loopback-rtnetlink-eperm",
                     None,
                     None,
@@ -3131,11 +3157,15 @@ class SourceHygieneTests(unittest.TestCase):
                 ),
                 ("0.2", "network-candidate-start", None, None, None),
             ):
-                code = (
-                    "HARNESS_INTERRUPTED"
-                    if stage == "network-trusted-ready-output"
-                    else "HARNESS_NETWORK_SANDBOX_SETUP_FAILED"
-                )
+                if isinstance(stage, str) and (
+                    stage.startswith("network-candidate-socket-")
+                    or stage == "network-candidate-process-exit-unexpected"
+                ):
+                    code = "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED"
+                elif stage == "network-trusted-ready-output":
+                    code = "HARNESS_INTERRUPTED"
+                else:
+                    code = "HARNESS_NETWORK_SANDBOX_SETUP_FAILED"
                 with self.subTest(
                     version=version,
                     stage=stage,
@@ -3164,6 +3194,36 @@ class SourceHygieneTests(unittest.TestCase):
                         expected_digest,
                         result["launcher_diagnostic_sha256"],
                     )
+
+            for code, stage in (
+                (
+                    "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+                    "network-candidate-socket-create-unexpected",
+                ),
+                (
+                    "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED",
+                    "network-candidate-result",
+                ),
+            ):
+                with self.subTest(code=code, stage=stage):
+                    fault.update(
+                        {
+                            "code": code,
+                            "launcher_diagnostic_sha256": None,
+                            "schema_version": "0.3",
+                            "stage": stage,
+                        }
+                    )
+                    (runtime / "run.json.fault.json").write_text(json.dumps(fault))
+                    process = subprocess.run(
+                        [sys.executable, "-c", script, *arguments],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                    )
+                    self.assertEqual(0, process.returncode, process.stderr)
+                    result = json.loads(process.stdout)
+                    self.assertIsNone(result["network_preflight_stage"])
 
     def test_split_rust_toolchain_lock_has_no_stale_references(self) -> None:
         stale_lock = "rust/toolchain" + ".lock.json"

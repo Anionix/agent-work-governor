@@ -402,6 +402,9 @@ jobs:
                   "network-candidate-ready-timeout",
                   "network-candidate-linux-loopback-rtnetlink-eperm",
                   "network-candidate-result",
+                  "network-candidate-socket-create-unexpected",
+                  "network-candidate-socket-operation-unexpected",
+                  "network-candidate-process-exit-unexpected",
                   "network-trusted-start",
                   "network-trusted-create",
                   "network-trusted-ready-eof",
@@ -431,6 +434,23 @@ jobs:
               stage = value.get("stage")
               if stage is not None and (
                   not isinstance(stage, str) or stage not in allowed
+              ):
+                  return None, None
+              policy_stages = {
+                  "network-candidate-socket-create-unexpected",
+                  "network-candidate-socket-operation-unexpected",
+                  "network-candidate-process-exit-unexpected",
+              }
+              if (
+                  stage in policy_stages
+                  and value.get("code")
+                  != "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED"
+              ):
+                  return None, None
+              if (
+                  stage == "network-candidate-result"
+                  and value.get("code")
+                  == "HARNESS_NETWORK_SANDBOX_POLICY_UNSUPPORTED"
               ):
                   return None, None
               digest = value.get("launcher_diagnostic_sha256")
