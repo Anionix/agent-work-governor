@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -22,6 +23,17 @@ from scripts import validate_kani_assurance
 
 
 class KaniAssuranceTests(unittest.TestCase):
+    def test_repository_manifest_binds_current_source(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        manifest = tomllib.loads(
+            (root / "rust/kani-assurance.toml").read_text(encoding="utf-8")
+        )
+        digest = hashlib.sha256(
+            (root / manifest["source_path"]).read_bytes()
+        ).hexdigest()
+        self.assertEqual(digest, manifest["source_sha256"])
+        self.assertEqual(digest, manifest["harness_sha256"])
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

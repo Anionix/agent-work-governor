@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 // LLM-CONTRACT
 // id: agent-work-governor.rust-report-model
@@ -89,7 +89,7 @@ pub enum Preset {
 }
 
 /// Stable machine-readable status.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Status {
     /// Every proven condition passed.
@@ -107,7 +107,7 @@ pub enum Status {
 }
 
 /// Result of evaluating external owner-scope evidence.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum OwnerScopeVerification {
     /// The policy does not declare an owner-original repository.

@@ -371,6 +371,38 @@ jobs:
           fi
           TYPED_COMMAND
 
+      - name: Check Rust/Python differential acceptance
+        if: needs.select.outputs.required == 'true'
+        shell: bash
+        run: |
+          # LLM contract: one versioned corpus + vendored offline routes ->
+          # exact authority parity or a separately typed code/infra failure.
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-differential \
+            --code DIFFERENTIAL_ACCEPTANCE_FAILED \
+            --infra-code DIFFERENTIAL_ACCEPTANCE_INFRA \
+            -- bash -euo pipefail <<'TYPED_COMMAND'
+          nix develop --no-update-lock-file --no-write-lock-file --command \
+            bash -euo pipefail <<'DIFFERENTIAL_COMMAND'
+          test_name="owner_scope_differential_acceptance"
+          listing="$RUNNER_TEMP/owner-scope-differential-tests.txt"
+          log="$RUNNER_TEMP/owner-scope-differential.log"
+          command=(cargo test --manifest-path rust/Cargo.toml --test owner_scope \
+            "$test_name" --locked --offline)
+          "${command[@]}" -- --ignored --exact --list 2>&1 | tee "$listing"
+          if [[ "$(grep -Ec "^${test_name}: test$" "$listing")" -ne 1 ]]; then
+            echo "::error title=DIFFERENTIAL_TEST_SKIPPED::expected exactly one acceptance test"
+            exit 1
+          fi
+          "${command[@]}" -- --ignored --exact --nocapture 2>&1 | tee "$log"
+          record='^\{"code":"DIFFERENTIAL_ACCEPTANCE_PASSED","fixture_count":14,"python_adapter_sha256":"[0-9a-f]{64}","python_dispatch_sha256":"[0-9a-f]{64}","rust_artifact_sha256":"[0-9a-f]{64}","schema_version":"0.1","status":"PASS"\}$'
+          if [[ "$(grep -Ec "$record" "$log")" -ne 1 ]]; then
+            echo "::error title=DIFFERENTIAL_RECORD_MISSING::acceptance identity record missing or malformed"
+            exit 1
+          fi
+          DIFFERENTIAL_COMMAND
+          TYPED_COMMAND
+
       - name: Check reproducible environment
         if: needs.select.outputs.required == 'true'
         shell: bash

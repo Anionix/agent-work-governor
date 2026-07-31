@@ -8,7 +8,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use toml::Value;
 
-use crate::{Finding, GovernorError, ValidatedPolicyAuthority};
+use crate::{Finding, GovernorError};
 
 const SCHEMA_VERSION: &str = "0.1";
 const ASK_MATT_SHA256: &str = "b1a134ada29cbfded84bc9a7f93356ab7a3d7f800edf1f541a2a964118ad45a7";
@@ -65,23 +65,30 @@ pub struct PolicyReceipt {
 
 /// Validate one policy without mutating the repository.
 pub(crate) fn validate_policy(path: &Path) -> Result<PolicyReceipt, GovernorError> {
-    evaluate_policy(path).map(|(receipt, _)| receipt)
+    evaluate_policy(path)
 }
 
-pub(crate) fn evaluate_policy(
-    path: &Path,
-) -> Result<(PolicyReceipt, Option<ValidatedPolicyAuthority>), GovernorError> {
+pub(crate) fn evaluate_policy(path: &Path) -> Result<PolicyReceipt, GovernorError> {
     let resolved = absolute_path(path)?;
     let source = match fs::read(&resolved) {
         Ok(bytes) => PolicySource::Bytes(bytes),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => PolicySource::Missing,
         Err(error) => PolicySource::Unreadable(error.to_string()),
     };
-    let authority = match &source {
-        PolicySource::Bytes(bytes) => ValidatedPolicyAuthority::from_bytes(bytes).ok(),
-        PolicySource::Missing | PolicySource::Unreadable(_) => None,
-    };
+    Ok(evaluate_source(&resolved, source))
+}
 
+pub(crate) fn evaluate_policy_snapshot(path: &Path, bytes: Option<&[u8]>) -> PolicyReceipt {
+    // LLM contract: descriptor-captured policy bytes -> one receipt or a
+    // closed parse finding; a refused snapshot is never reopened by pathname.
+    let source = bytes.map_or_else(
+        || PolicySource::Unreadable("descriptor-bound policy snapshot unavailable".to_owned()),
+        |bytes| PolicySource::Bytes(bytes.to_vec()),
+    );
+    evaluate_source(path, source)
+}
+
+fn evaluate_source(resolved: &Path, source: PolicySource) -> PolicyReceipt {
     let policy_sha256 = match &source {
         PolicySource::Bytes(bytes) => Some(sha256_bytes(bytes)),
         PolicySource::Missing | PolicySource::Unreadable(_) => None,
@@ -128,21 +135,18 @@ pub(crate) fn evaluate_policy(
     };
     sort_findings(&mut findings);
 
-    Ok((
-        PolicyReceipt {
-            policy_path: resolved.display().to_string(),
-            policy_sha256,
-            validator_sha256: sha256_bytes(include_bytes!("policy.rs")),
-            schema_version: SCHEMA_VERSION.to_owned(),
-            valid: findings.is_empty(),
-            findings,
-            repository_scope,
-        },
-        authority,
-    ))
+    PolicyReceipt {
+        policy_path: resolved.display().to_string(),
+        policy_sha256,
+        validator_sha256: sha256_bytes(include_bytes!("policy.rs")),
+        schema_version: SCHEMA_VERSION.to_owned(),
+        valid: findings.is_empty(),
+        findings,
+        repository_scope,
+    }
 }
 
-pub(crate) fn validated_authority(bytes: &[u8]) -> Option<(String, bool, bool)> {
+pub(crate) fn validated_authority(bytes: &[u8]) -> Option<(String, String, bool, bool)> {
     let Value::Table(document) = parse_document(bytes).ok()? else {
         return None;
     };
@@ -152,6 +156,7 @@ pub(crate) fn validated_authority(bytes: &[u8]) -> Option<(String, bool, bool)> 
     let authority = document.get("authority")?.as_table()?;
     Some((
         sha256_bytes(bytes),
+        string_value(document.get("repository_scope"))?.to_owned(),
         authority.get("repository_write")?.as_bool()?,
         authority.get("external_side_effects")?.as_bool()?,
     ))
