@@ -43,7 +43,8 @@ loopback `RTM_NEWADDR` denial with `EPERM` is reported only as the fixed
 `network-*-linux-loopback-rtnetlink-eperm` stage; launcher text is never
 emitted. On macOS, the trusted preflight uses a deny-default Seatbelt profile
 that permits only pinned system/toolchain, repository, and runtime paths plus
-IPv4/IPv6 loopback.
+an explicit IPv4 loopback fixture. Candidate IPv6 denial remains a separate,
+mandatory OS-policy proof and never depends on host IPv6 routing.
 Candidate checks use the same bounded file/process surface with no network
 allow rules, so a host-local HTTP, SOCKS, or browser debug broker cannot relay
 egress. The candidate-policy proof runs directly as the fixed `nobody`

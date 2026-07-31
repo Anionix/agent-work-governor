@@ -1085,10 +1085,12 @@ def _network_probe(argv: list[str]) -> int:
             and write_canary.is_absolute()
         )
         write_canary.write_bytes(b"network-sandbox-write-ok")
-        if not (
-            _loopback_fixture(socket.AF_INET, "127.0.0.1")
-            and _loopback_fixture(socket.AF_INET6, "::1")
-        ):
+        # LLM contract: TRUSTED_LOOPBACK_PROFILE -> IPV4_LOOPBACK_CONNECTED |
+        # NETWORK_SETUP_EXIT. Candidate IPv6 denial is proved separately;
+        # Bubblewrap configures only 127.0.0.1 in a fresh network namespace.
+        # Primary source:
+        # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/network.c#L139-L170
+        if not _loopback_fixture(socket.AF_INET, "127.0.0.1"):
             return NETWORK_SETUP_EXIT
         if not (
             _egress_blocked(host, tcp_port, native_ipv6, udp_port, unix_path)
