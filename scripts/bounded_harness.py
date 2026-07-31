@@ -208,13 +208,6 @@ class RuntimePaths:
     temporary: Path
 
 
-def _sandbox_host_identity(identity: RunIdentity) -> RunIdentity:
-    # LLM contract: Linux root launcher + user namespace -> sandbox nobody is
-    # mapped to host root; macOS keeps the real nobody identity.
-    # Primary source: https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L970-L1003
-    return RunIdentity(0, 0) if sys.platform == "linux" else identity
-
-
 def _cargo_lock_paths(cargo_home: Path) -> tuple[Path, Path]:
     return (
         cargo_home / ".package-cache",
@@ -544,8 +537,10 @@ def _macos_profile(
     allow_loopback: bool = False,
 ) -> str:
     # LLM contract: TRUSTED_PREFLIGHT -> EXPLICIT_LOOPBACK_CAPABILITY;
-    # CANDIDATE -> NO_NETWORK_RULES. Host-shared loopback is never exposed to
-    # candidate bytes because an ambient localhost broker could relay egress.
+    # CANDIDATE -> EXPLICIT_NETWORK_DENY_EPERM |
+    # HARNESS_NETWORK_SANDBOX_SETUP_FAILED. Host-shared loopback is never
+    # exposed to candidate bytes because an ambient localhost broker could
+    # relay egress.
     # Primary sources: Apple-shipped sandbox-exec(1),
     # /System/Library/Sandbox/Profiles/dyld-support.sb (process bootstrap),
     # /usr/share/sandbox/com.apple.CommCenter.sb (remote localhost filter), and
@@ -577,8 +572,10 @@ def _macos_profile(
     writes = "\n".join(
         f"(allow file-write* (subpath {json.dumps(str(path))}))" for path in writable
     )
+    network = "(deny network* (with errno EPERM))"
     loopback = ""
     if allow_loopback:
+        network = ""
         loopback = """
 (allow network-bind (local ip "localhost:*"))
 (allow network-inbound (local ip "localhost:*"))
@@ -599,6 +596,7 @@ def _macos_profile(
 {writes}
 (allow file-write-data file-ioctl (literal "/dev/null"))
 (allow sysctl-read user-preference-read ipc-posix-shm ipc-posix-sem)
+{network}
 {loopback}
 """
 
@@ -685,6 +683,7 @@ def _sandboxed_argv(
     *,
     allow_loopback: bool = False,
     seccomp_fd: int | None = None,
+    trusted_launcher: Path | None = None,
 ) -> list[str]:
     # LLM contract: verified OS sandbox + fixed identity -> one inherited
     # network boundary; unsupported policy refuses before candidate execution.
@@ -693,7 +692,10 @@ def _sandboxed_argv(
     # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L2447-L2464
     # https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/security/mac_socket.c#L147-L164
     if sandbox == NetworkSandbox.MACOS:
-        _require(seccomp_fd is None, "HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
+        _require(
+            seccomp_fd is None and trusted_launcher is None,
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+        )
         return [
             "/usr/bin/sandbox-exec",
             "-p",
@@ -709,23 +711,37 @@ def _sandboxed_argv(
         isinstance(seccomp_fd, int) and seccomp_fd >= 3,
         "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
     )
+    try:
+        launcher = (
+            None if trusted_launcher is None else trusted_launcher.resolve(strict=True)
+        )
+    except OSError as error:
+        raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
+    _require(
+        launcher is None
+        or (
+            trusted_launcher is not None
+            and trusted_launcher.is_absolute()
+            and launcher == trusted_launcher
+            and launcher.is_file()
+        ),
+        "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+    )
     command = [
         str(_trusted_executable(shutil.which("bwrap"))),
         "--add-seccomp-fd",
         str(seccomp_fd),
         "--unshare-net",
-        "--unshare-user",
         "--unshare-pid",
         "--unshare-ipc",
         "--unshare-uts",
         "--die-with-parent",
-        "--disable-userns",
         "--cap-drop",
         "ALL",
-        "--uid",
-        str(identity.uid),
-        "--gid",
-        str(identity.gid),
+        "--cap-add",
+        "CAP_SETGID",
+        "--cap-add",
+        "CAP_SETUID",
         "--ro-bind",
         "/nix/store",
         "/nix/store",
@@ -750,11 +766,50 @@ def _sandboxed_argv(
         command += ["--ro-bind", str(cargo_home), str(cargo_home)]
         for lock in _cargo_lock_paths(cargo_home):
             command += ["--bind", str(lock), str(lock)]
+    if launcher is not None:
+        command += ["--ro-bind", str(launcher), str(launcher)]
     if not cwd.is_relative_to(Path("/nix/store")) and not cwd.is_relative_to(
         runtime.artifacts
     ):
         command += ["--ro-bind", str(cwd), str(cwd)]
     return [*command, "--chdir", str(cwd), *argv]
+
+
+def _linux_candidate_exec(argv: list[str]) -> int:
+    # LLM contract: ROOT_SANDBOX_LAUNCHER + FIXED_UID_GID -> DISTINCT_UID_READY
+    # -> EXACT_ARGV; any partial or failed credential drop exits before READY.
+    # Primary sources:
+    # https://man7.org/linux/man-pages/man2/setuid.2.html
+    # https://man7.org/linux/man-pages/man2/setgroups.2.html
+    try:
+        _require(
+            sys.platform == "linux"
+            and os.geteuid() == 0
+            and len(argv) >= 3
+            and argv[0].isdecimal()
+            and argv[1].isdecimal(),
+            "HARNESS_IDENTITY_UNSAFE",
+        )
+        identity = RunIdentity(int(argv[0]), int(argv[1]))
+        _require(
+            identity.uid not in (0, (1 << 32) - 1)
+            and identity.gid not in (0, (1 << 32) - 1),
+            "HARNESS_IDENTITY_UNSAFE",
+        )
+        os.setgroups([])
+        os.setgid(identity.gid)
+        os.setuid(identity.uid)
+        _require(
+            os.geteuid() == identity.uid
+            and os.getegid() == identity.gid
+            and os.getgroups() == [],
+            "HARNESS_IDENTITY_UNSAFE",
+        )
+        os.write(1, SANDBOX_READY)
+        os.execvpe(argv[2], argv[2:], os.environ)
+    except (HarnessError, OSError, ValueError):
+        return NETWORK_SETUP_EXIT
+    return NETWORK_SETUP_EXIT
 
 
 def _loopback_fixture(family: socket.AddressFamily, host: str) -> bool:
@@ -1037,14 +1092,28 @@ async def _spawn(
     )
     process: asyncio.subprocess.Process | None = None
     try:
-        wrapped = [
-            sys.executable,
-            "-I",
-            "-B",
-            "-c",
-            CANDIDATE_EXEC,
-            *argv,
-        ]
+        trusted_launcher: Path | None = None
+        if sandbox == NetworkSandbox.LINUX:
+            trusted_launcher = Path(__file__).resolve(strict=True)
+            wrapped = [
+                sys.executable,
+                "-I",
+                "-B",
+                str(trusted_launcher),
+                "--linux-candidate-exec",
+                str(identity.uid),
+                str(identity.gid),
+                *argv,
+            ]
+        else:
+            wrapped = [
+                sys.executable,
+                "-I",
+                "-B",
+                "-c",
+                CANDIDATE_EXEC,
+                *argv,
+            ]
         command = _sandboxed_argv(
             sandbox,
             identity,
@@ -1054,6 +1123,7 @@ async def _spawn(
             cargo_home,
             allow_loopback=allow_loopback,
             seccomp_fd=seccomp_fd,
+            trusted_launcher=trusted_launcher,
         )
         macos = sandbox == NetworkSandbox.MACOS
         inherited = () if seccomp_fd is None else (seccomp_fd,)
@@ -1543,10 +1613,9 @@ def _prepare_rust_inputs(
         (advisory_root / "advisory-db-3157b0e258782691").symlink_to(
             source / "advisory-db"
         )
-        owner = _sandbox_host_identity(identity)
         for lock in _cargo_lock_paths(cargo_home):
             lock.touch(mode=0o600)
-            os.chown(lock, owner.uid, owner.gid)
+            os.chown(lock, identity.uid, identity.gid)
         return cargo_home
     except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
         raise HarnessError("HARNESS_RUST_INPUTS_UNTRUSTED") from error
@@ -1571,7 +1640,6 @@ def _prepare_runtime(
             temporary = artifacts
         else:
             _validate_subject(repository, identity)
-            owner = _sandbox_host_identity(identity)
             _require(
                 runtime_root.is_absolute()
                 and receipt.is_absolute()
@@ -1599,7 +1667,7 @@ def _prepare_runtime(
             evidence = _runtime_dir(runtime_root, "evidence")
             evidence.chmod(0o700)
             artifacts = _runtime_dir(runtime_root, "artifacts")
-            os.chown(artifacts, owner.uid, owner.gid)
+            os.chown(artifacts, identity.uid, identity.gid)
             artifacts.chmod(0o700)
             # LLM contract: protected 0711 runtime + root-owned readable anchor
             # -> candidate-only temporary workspace | typed preparation failure.
@@ -1614,11 +1682,11 @@ def _prepare_runtime(
                 "HARNESS_RUNTIME_ROOT_UNSAFE",
             )
             temporary = _runtime_dir(temporary_anchor, "tmp")
-            os.chown(temporary, owner.uid, owner.gid)
+            os.chown(temporary, identity.uid, identity.gid)
             temporary.chmod(0o700)
             metadata = temporary.lstat()
             _require(
-                metadata.st_uid == owner.uid
+                metadata.st_uid == identity.uid
                 and stat.S_ISDIR(metadata.st_mode)
                 and stat.S_IMODE(metadata.st_mode) == 0o700,
                 "HARNESS_RUNTIME_ROOT_UNSAFE",
@@ -1791,4 +1859,6 @@ if __name__ == "__main__":
         raise SystemExit(_network_probe(arguments[1:]))
     if arguments == ["--candidate-ip-policy-probe"]:
         raise SystemExit(_candidate_ip_policy_probe())
+    if arguments and arguments[0] == "--linux-candidate-exec":
+        raise SystemExit(_linux_candidate_exec(arguments[1:]))
     raise SystemExit(main(arguments))

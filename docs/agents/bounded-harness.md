@@ -30,9 +30,12 @@ runner must still tear down any survivor after the job.
 
 Before any candidate starts, the harness self-tests an inherited OS network
 boundary against trusted host-local canaries. Linux uses the catalog-pinned
-Bubblewrap to expose only the Nix store and candidate workspaces, create
-network/user/PID/IPC/UTS namespaces, disable nested user namespaces, and drop
-every capability before becoming `nobody`. The trusted preflight's inherited,
+Bubblewrap to expose only protected inputs, candidate workspaces, and the
+canonical read-only launcher while creating network/PID/IPC/UTS namespaces
+without a nested user namespace. Bubblewrap drops every capability except
+`CAP_SETGID` and `CAP_SETUID`; the trusted launcher uses them to clear
+supplementary groups, set and verify the fixed `nobody` GID/UID, and only then
+emits READY and executes the candidate. The trusted preflight's inherited,
 architecture-bound seccomp filter permits Unix, IPv4, and IPv6 sockets.
 Candidate filters permit Unix sockets only; VSOCK, packet, IPv4, IPv6,
 alternate-ABI, and `io_uring` socket paths fail with `EPERM`. A Bubblewrap
@@ -49,7 +52,7 @@ requires loopback success and denies host-interface TCP, IPv4-mapped IPv6, UDP/D
 transport, and a host Unix socket from both the probe and its descendants.
 When the host has routable native IPv6, it adds a reachable native canary;
 route absence is never accepted as isolation proof. It also verifies the
-platform-specific writable UID mapping; Linux exposes Cargo home read-only
+platform-specific candidate-owned paths; Linux exposes Cargo home read-only
 except for its two required lock files. A missing mechanism, unsupported
 policy, setup fault, or observed bypass returns a stable network-sandbox fault
 with exit 70; the shadow workflow classifies it as inconclusive before
