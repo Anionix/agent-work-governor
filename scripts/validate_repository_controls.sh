@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # LLM-CONTRACT
 # id: agent-work-governor.required-repository-controls
-# state: CANDIDATE_TREE -> REQUIRED_CONTROLS_PASS | CODE_FAIL
-# preconditions: checkout is the reviewed head and base/head are commit identities
-# invariant: missing contracts, tracked runtime output, mutable Actions, and invalid diffs never pass
+# state: REVIEWED_COMMIT -> REQUIRED_GIT_BLOBS + REQUIRED_CONTROLS -> PASS | CODE_FAIL
+# preconditions: head identifies the reviewed commit and base identifies its comparison point
+# invariant: required contracts are unique regular Git blobs; runtime output, mutable Actions, and invalid diffs never pass
 # failure: emit a stable CODE_FAIL reason and exit 1
-# source: repo:AGENTS.md
+# source: https://git-scm.com/docs/git-ls-tree
 # knowledge: bundle:knowledge/policies/work-governor.md
 # enforced_by: proof-slow / nix
 # test: bundle:tests/test_contracts.py
@@ -22,11 +22,41 @@ head_sha="${2:-}"
 [[ "$head_sha" =~ ^[0-9a-f]{40}$ ]] || code_fail HEAD_SHA_INVALID
 [[ "$(git rev-parse HEAD)" == "$head_sha" ]] || code_fail CHECKOUT_IDENTITY_MISMATCH
 
-for path in AGENTS.md CONTRIBUTING.md SECURITY.md flake.nix flake.lock; do
-  test -f "$path" || code_fail REPOSITORY_CONTRACT_MISSING
+required_contracts=(AGENTS.md CONTRIBUTING.md SECURITY.md flake.nix flake.lock)
+contract_exclusions=()
+for path in "${required_contracts[@]}"; do
+  entry="$(git ls-tree "$head_sha" -- "$path")" ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  [[ -n "$entry" && "$entry" != *$'\n'* ]] ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  read -r mode object_type object_id tracked_path extra <<<"$entry" ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  [[ -z "${extra:-}" && "$tracked_path" == "$path" ]] ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  [[ "$mode" == 100644 || "$mode" == 100755 ]] ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  [[ "$object_type" == blob ]] ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  declared_size="$(git cat-file -s "$object_id" 2>/dev/null)" ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  readback_size="$(
+    git cat-file blob "$object_id" 2>/dev/null | wc -c | tr -d '[:space:]'
+  )" ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  readback_id="$(
+    git cat-file blob "$object_id" 2>/dev/null | git hash-object --stdin
+  )" ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  [[ "$declared_size" =~ ^[0-9]+$ &&
+    "$readback_size" == "$declared_size" &&
+    "$readback_id" == "$object_id" ]] ||
+    code_fail REPOSITORY_CONTRACT_INVALID
+  contract_exclusions+=(":(exclude)$path")
 done
 
-forbidden="$(git ls-files --cached --ignored --exclude-standard)"
+forbidden="$(
+  git ls-files --cached --ignored --exclude-standard -- . "${contract_exclusions[@]}"
+)"
 test -z "$forbidden" || {
   echo "$forbidden"
   code_fail TRACKED_RUNTIME_OUTPUT
