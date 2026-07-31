@@ -440,6 +440,18 @@ jobs:
             "$cache_state" "$duration"
           exit 1
 
+      - name: Reject a corrupted Buck2 release digest
+        if: needs.select.outputs.required == 'true'
+        shell: bash
+        run: |
+          # LLM contract: one isolated top-level digest mutation ->
+          # HASH_REJECTION or typed failure; platform artifacts remain unchanged.
+          python3 scripts/run_typed_ci.py \
+            --gate proof-slow-buck2-release \
+            --code BUCK2_RELEASE_DIGEST_REGRESSION_FAILED \
+            --infra-code BUCK2_RELEASE_DIGEST_REGRESSION_INFRA \
+            -- bash scripts/test_buck2_release_digest.sh
+
       - name: Check shadow input byte stability
         if: needs.select.outputs.required == 'true'
         shell: bash
