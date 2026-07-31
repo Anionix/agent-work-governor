@@ -742,16 +742,20 @@ class BoundedHarnessTests(unittest.TestCase):
             allow_loopback=True,
         )
         self.assertNotIn("(allow network-", candidate[2])
+        self.assertIn("(deny network* (with errno EPERM))", candidate[2])
         self.assertIn('(import "dyld-support.sb")', candidate[2])
         self.assertNotIn("\n(allow file-read*)\n", candidate[2])
         self.assertIn(f'(subpath "{self.root}")', candidate[2])
         self.assertIn('(subpath "/nix/store")', candidate[2])
+        self.assertNotIn("(deny network*", probe[2])
         self.assertIn('(allow network-outbound (remote ip "localhost:*"))', probe[2])
 
-    def test_linux_probe_mounts_source_inside_a_non_nestable_user_namespace(
-        self,
-    ) -> None:
+    def test_linux_sandbox_binds_trusted_launcher_outside_candidate_cwd(self) -> None:
         script = self.root / "trusted-source/scripts/bounded_harness.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("# trusted launcher\n", encoding="utf-8")
+        candidate_cwd = self.root / "candidate"
+        candidate_cwd.mkdir()
         runtime = harness.RuntimePaths(
             self.root / "run.json",
             self.root / "evidence",
@@ -760,11 +764,6 @@ class BoundedHarnessTests(unittest.TestCase):
         )
         cargo_home = self.root / "cargo-home"
         identity = harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid)
-        with mock.patch.object(harness.sys, "platform", "linux"):
-            self.assertEqual(
-                harness.RunIdentity(0, 0),
-                harness._sandbox_host_identity(identity),
-            )
         with mock.patch.object(
             harness,
             "_trusted_executable",
@@ -774,22 +773,38 @@ class BoundedHarnessTests(unittest.TestCase):
                 harness.NetworkSandbox.LINUX,
                 identity,
                 [str(script), "--network-probe"],
-                script.parent,
+                candidate_cwd,
                 runtime,
                 cargo_home,
                 seccomp_fd=9,
+                trusted_launcher=script,
             )
-        self.assertIn("--unshare-user", command)
-        self.assertIn("--disable-userns", command)
+        self.assertNotIn("--unshare-user", command)
+        self.assertNotIn("--disable-userns", command)
         self.assertNotIn("--new-session", command)
+        self.assertNotIn("--uid", command)
+        self.assertNotIn("--gid", command)
+        self.assertIn(
+            ["--cap-add", "CAP_SETGID"],
+            [command[index : index + 2] for index in range(len(command))],
+        )
+        self.assertIn(
+            ["--cap-add", "CAP_SETUID"],
+            [command[index : index + 2] for index in range(len(command))],
+        )
         self.assertIn(
             ["--add-seccomp-fd", "9"],
             [command[index : index + 2] for index in range(len(command))],
         )
-        anchor = command.index(str(script.parent))
+        anchor = command.index(str(script))
         self.assertEqual(
-            ["--ro-bind", str(script.parent), str(script.parent)],
+            ["--ro-bind", str(script), str(script)],
             command[anchor - 1 : anchor + 2],
+        )
+        cwd_anchor = command.index(str(candidate_cwd))
+        self.assertEqual(
+            ["--ro-bind", str(candidate_cwd), str(candidate_cwd)],
+            command[cwd_anchor - 1 : cwd_anchor + 2],
         )
         cargo_anchor = command.index(str(cargo_home))
         self.assertEqual(
@@ -815,7 +830,9 @@ class BoundedHarnessTests(unittest.TestCase):
         process = SimpleNamespace(stdout=stdout)
         with (
             mock.patch.object(harness, "_linux_seccomp_fd", return_value=9),
-            mock.patch.object(harness, "_sandboxed_argv", return_value=["bwrap"]),
+            mock.patch.object(
+                harness, "_sandboxed_argv", return_value=["bwrap"]
+            ) as sandboxed,
             mock.patch.object(
                 harness.asyncio,
                 "create_subprocess_exec",
@@ -840,6 +857,77 @@ class BoundedHarnessTests(unittest.TestCase):
         self.assertIs(True, await_args.kwargs["start_new_session"])
         stdout.read.assert_awaited_once_with(1)
         self.assertEqual(1, close.call_args_list.count(mock.call(9)))
+        wrapped = sandboxed.call_args.args[2]
+        self.assertEqual(
+            Path(harness.__file__).resolve(),
+            sandboxed.call_args.kwargs["trusted_launcher"],
+        )
+        self.assertEqual(
+            [
+                "--linux-candidate-exec",
+                str(NOBODY.pw_uid),
+                str(NOBODY.pw_gid),
+                "candidate",
+            ],
+            wrapped[4:],
+        )
+
+    def test_linux_candidate_exec_drops_identity_before_ready(self) -> None:
+        writes: list[tuple[int, bytes]] = []
+        with (
+            mock.patch.object(harness.sys, "platform", "linux"),
+            mock.patch.object(harness.os, "geteuid", side_effect=[0, NOBODY.pw_uid]),
+            mock.patch.object(harness.os, "getegid", return_value=NOBODY.pw_gid),
+            mock.patch.object(harness.os, "getgroups", return_value=[]),
+            mock.patch.object(harness.os, "setgroups") as setgroups,
+            mock.patch.object(harness.os, "setgid") as setgid,
+            mock.patch.object(harness.os, "setuid") as setuid,
+            mock.patch.object(
+                harness.os,
+                "write",
+                side_effect=lambda fd, value: writes.append((fd, value)) or len(value),
+            ),
+            mock.patch.object(
+                harness.os,
+                "execvpe",
+                side_effect=OSError(errno.ENOENT, "injected"),
+            ) as execute,
+        ):
+            result = harness._linux_candidate_exec(
+                [
+                    str(NOBODY.pw_uid),
+                    str(NOBODY.pw_gid),
+                    "/nix/store/candidate",
+                    "argument",
+                ]
+            )
+        self.assertEqual(harness.NETWORK_SETUP_EXIT, result)
+        setgroups.assert_called_once_with([])
+        setgid.assert_called_once_with(NOBODY.pw_gid)
+        setuid.assert_called_once_with(NOBODY.pw_uid)
+        self.assertEqual([(1, harness.SANDBOX_READY)], writes)
+        execute.assert_called_once_with(
+            "/nix/store/candidate",
+            ["/nix/store/candidate", "argument"],
+            mock.ANY,
+        )
+
+    def test_linux_candidate_exec_fails_before_ready_on_partial_drop(self) -> None:
+        with (
+            mock.patch.object(harness.sys, "platform", "linux"),
+            mock.patch.object(harness.os, "geteuid", return_value=0),
+            mock.patch.object(
+                harness.os, "setgroups", side_effect=OSError(errno.EPERM, "injected")
+            ),
+            mock.patch.object(harness.os, "write") as write,
+        ):
+            self.assertEqual(
+                harness.NETWORK_SETUP_EXIT,
+                harness._linux_candidate_exec(
+                    [str(NOBODY.pw_uid), str(NOBODY.pw_gid), "candidate"]
+                ),
+            )
+        write.assert_not_called()
 
     def test_candidate_exec_prefixes_output_with_readiness(self) -> None:
         result = subprocess.run(
@@ -1251,7 +1339,7 @@ finally:
         self.assertEqual(0o711, stat.S_IMODE(runtime_root.stat().st_mode))
         self.assertEqual(0o755, stat.S_IMODE(temporary_anchor.stat().st_mode))
         self.assertEqual(
-            harness._sandbox_host_identity(identity).uid,
+            identity.uid,
             (temporary_anchor / "tmp").stat().st_uid,
         )
         self.assertEqual(
