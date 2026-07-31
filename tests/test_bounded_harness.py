@@ -529,6 +529,32 @@ class BoundedHarnessTests(unittest.TestCase):
                     harness._network_probe(arguments),
                 )
 
+    def test_network_probe_requires_explicit_ipv4_loopback(self) -> None:
+        arguments = [
+            "10.0.0.1",
+            "1234",
+            "-",
+            "0",
+            "0",
+            "1235",
+            "/tmp/canary.sock",
+            str(self.root / "write-canary"),
+        ]
+        with (
+            mock.patch.object(
+                harness, "_loopback_fixture", return_value=True
+            ) as loopback,
+            mock.patch.object(harness, "_egress_blocked", return_value=True),
+            mock.patch.object(harness, "_descendant_egress_blocked", return_value=True),
+        ):
+            self.assertEqual(0, harness._network_probe(arguments))
+        loopback.assert_called_once_with(socket.AF_INET, "127.0.0.1")
+        with mock.patch.object(harness, "_loopback_fixture", return_value=False):
+            self.assertEqual(
+                harness.NETWORK_SETUP_EXIT,
+                harness._network_probe(arguments),
+            )
+
     def test_egress_probe_rejects_reachable_native_ipv6_canary(self) -> None:
         targets: list[tuple[str, int]] = []
 
