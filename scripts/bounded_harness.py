@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
 import errno
 import hashlib
 import ipaddress
@@ -18,6 +19,7 @@ import signal
 import socket
 import stat
 import struct
+import subprocess
 import sys
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -79,14 +81,6 @@ FAULT_SCHEMA_VERSION = "0.3"
 SANDBOX_READY = b"\x01"
 BWRAP_LOOPBACK_RTM_NEWADDR_EPERM = (
     b"bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted"
-)
-# LLM contract: OS_SANDBOX_ENTERED -> STDOUT_READY_BYTE -> CANDIDATE_EXEC;
-# the fixed prefix crosses each launcher on its existing output channel, while
-# missing readiness proves setup failure before candidate outcome evaluation.
-# Primary sources: https://docs.python.org/3.14/library/os.html#os.execvpe and
-# https://docs.python.org/3.14/library/asyncio-subprocess.html#asyncio.subprocess.Process.stdout
-CANDIDATE_EXEC = (
-    "import os,sys;os.write(1,b'\\x01');os.execvpe(sys.argv[1],sys.argv[1:],os.environ)"
 )
 
 
@@ -560,6 +554,7 @@ def _macos_profile(
     runtime: RuntimePaths,
     cargo_home: Path | None,
     cwd: Path,
+    trusted_launcher: Path,
     *,
     allow_loopback: bool = False,
 ) -> str:
@@ -581,6 +576,7 @@ def _macos_profile(
         Path("/private/etc"),
         Path("/private/var/db/timezone"),
         cwd,
+        trusted_launcher,
         runtime.artifacts,
         runtime.temporary,
     ]
@@ -741,28 +737,6 @@ def _sandboxed_argv(
     # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/sched.h
     # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L2447-L2464
     # https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/security/mac_socket.c#L147-L164
-    if sandbox == NetworkSandbox.MACOS:
-        _require(
-            seccomp_fd is None
-            and trusted_launcher is None
-            and privileged_probe is None,
-            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
-        )
-        return [
-            "/usr/bin/sandbox-exec",
-            "-p",
-            _macos_profile(
-                runtime,
-                cargo_home,
-                cwd,
-                allow_loopback=allow_loopback,
-            ),
-            *argv,
-        ]
-    _require(
-        isinstance(seccomp_fd, int) and seccomp_fd >= 3,
-        "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
-    )
     try:
         launcher = (
             None if trusted_launcher is None else trusted_launcher.resolve(strict=True)
@@ -775,6 +749,28 @@ def _sandboxed_argv(
         and trusted_launcher.is_absolute()
         and launcher == trusted_launcher
         and launcher.is_file(),
+        "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+    )
+    if sandbox == NetworkSandbox.MACOS:
+        _require(
+            seccomp_fd is None and launcher is not None and privileged_probe is None,
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+        )
+        assert launcher is not None
+        return [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            _macos_profile(
+                runtime,
+                cargo_home,
+                cwd,
+                launcher,
+                allow_loopback=allow_loopback,
+            ),
+            *argv,
+        ]
+    _require(
+        isinstance(seccomp_fd, int) and seccomp_fd >= 3,
         "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
     )
     # LLM contract: ROOT_LAUNCHER + TRUSTED_IDENTITY_ENTRY -> IN_PROCESS_DROP;
@@ -879,6 +875,7 @@ def _drop_candidate_identity(argv: list[str]) -> list[str]:
     os.setgroups([])
     os.setgid(identity.gid)
     os.setuid(identity.uid)
+    _clear_linux_active_capabilities()
     _require(
         os.geteuid() == identity.uid
         and os.getegid() == identity.gid
@@ -886,6 +883,68 @@ def _drop_candidate_identity(argv: list[str]) -> list[str]:
         "HARNESS_IDENTITY_UNSAFE",
     )
     return argv[2:]
+
+
+def _clear_linux_active_capabilities() -> None:
+    # LLM contract: NON_ROOT_LINUX_LAUNCHER -> ZERO_ACTIVE_CAPABILITY_SETS |
+    # HARNESS_IDENTITY_UNSAFE; candidate exec never inherits Bubblewrap's
+    # temporary effective, permitted, inheritable, or ambient capabilities.
+    # Primary sources:
+    # https://man7.org/linux/man-pages/man7/capabilities.7.html
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/linux/capability.h
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/arch/x86/entry/syscalls/syscall_64.tbl
+    # https://github.com/torvalds/linux/blob/fc02acf6ac0ccde0c805c2daa9148683cdd01ba8/include/uapi/asm-generic/unistd.h
+    if sys.platform != "linux":
+        return
+
+    class CapabilityHeader(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+    class CapabilityData(ctypes.Structure):
+        _fields_ = [
+            ("effective", ctypes.c_uint32),
+            ("permitted", ctypes.c_uint32),
+            ("inheritable", ctypes.c_uint32),
+        ]
+
+    capset_syscall_number = {"aarch64": 91, "arm64": 91, "x86_64": 126}.get(
+        platform.machine().lower()
+    )
+    _require(capset_syscall_number is not None, "HARNESS_IDENTITY_UNSAFE")
+    linux_capability_version_3 = 0x20080522
+    linux_capability_u32s_3 = 2
+    header = CapabilityHeader(linux_capability_version_3, 0)
+    data = (CapabilityData * linux_capability_u32s_3)()
+    libc = ctypes.CDLL(None, use_errno=True)
+    _require(
+        libc.syscall(
+            capset_syscall_number,
+            ctypes.byref(header),
+            ctypes.byref(data),
+        )
+        == 0,
+        "HARNESS_IDENTITY_UNSAFE",
+    )
+    try:
+        status = Path("/proc/self/status").read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise HarnessError("HARNESS_IDENTITY_UNSAFE") from error
+    expected = {"CapAmb", "CapEff", "CapInh", "CapPrm"}
+    fields: dict[str, str] = {}
+    for line in status.splitlines():
+        name, separator, value = line.partition(":")
+        if name not in expected:
+            continue
+        _require(separator == ":" and name not in fields, "HARNESS_IDENTITY_UNSAFE")
+        fields[name] = value.strip()
+    _require(
+        set(fields) == expected
+        and all(
+            re.fullmatch(r"[0-9a-f]{16}", value) is not None and int(value, 16) == 0
+            for value in fields.values()
+        ),
+        "HARNESS_IDENTITY_UNSAFE",
+    )
 
 
 def _fixed_probe_arguments(argv: list[str]) -> list[str]:
@@ -911,18 +970,75 @@ def _fixed_probe_arguments(argv: list[str]) -> list[str]:
     return argv[2:]
 
 
-def _linux_candidate_exec(argv: list[str]) -> int:
-    # LLM contract: ROOT_SANDBOX_LAUNCHER + EXACT_UID_GID + EXACT_ARGV ->
-    # VERIFIED_NOBODY_READY + CANDIDATE_EXEC | NETWORK_SETUP_EXIT. Candidate
-    # bytes start only after the complete credential drop is read back.
+def _supervise_candidate_exec(command: list[str]) -> int:
+    # LLM contract: VERIFIED_NOBODY + EXACT_ARGV -> EXEC_SUCCEEDED + READY +
+    # CANDIDATE_RESULT | NETWORK_SETUP_EXIT. Popen re-raises pre-exec faults in
+    # this trusted parent, so READY is published only after the image starts.
+    # Primary source: https://docs.python.org/3.14/library/subprocess.html#exceptions
+    process: subprocess.Popen[bytes] | None = None
+    try:
+        _require(bool(command), "HARNESS_IDENTITY_UNSAFE")
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=os.environ,
+        )
+        _require(
+            os.write(1, SANDBOX_READY) == len(SANDBOX_READY),
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+        )
+        output = process.stdout
+        if output is None:
+            raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
+        while chunk := output.read(65_536):
+            pending = memoryview(chunk)
+            while pending:
+                written = os.write(1, pending)
+                _require(written > 0, "HARNESS_NETWORK_SANDBOX_SETUP_FAILED")
+                pending = pending[written:]
+        returncode = process.wait()
+        return returncode if returncode >= 0 else 128 - returncode
+    except (HarnessError, OSError, ValueError):
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait()
+        if process is not None:
+            # LLM contract: POST_READY_SUPERVISOR_FAULT -> DISTINCT_SIGNAL;
+            # a sandboxed candidate signal is normalized above, so the outer
+            # trusted process can fail closed without colliding with exit 82.
+            # Primary source: https://docs.python.org/3.14/library/signal.html#signal.signal
+            signal.signal(signal.SIGUSR2, signal.SIG_DFL)
+            os.kill(os.getpid(), signal.SIGUSR2)
+        return NETWORK_SETUP_EXIT
+
+
+def _candidate_exit_code(
+    returncode: int | None,
+    sandbox: NetworkSandbox | None,
+) -> int:
+    # LLM contract: COMPLETED_SUPERVISOR + SANDBOX -> CANDIDATE_EXIT |
+    # TYPED_NETWORK_FAULT; a negative supervisor result can never become
+    # candidate evidence after READY.
+    if returncode is None or sandbox is not None and returncode < 0:
+        raise HarnessError(
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+            stage=NetworkStage.CANDIDATE_RESULT,
+        )
+    return returncode
+
+
+def _candidate_exec_entry(argv: list[str]) -> int:
+    # LLM contract: ROOT_LINUX_LAUNCHER | MACOS_PARENT_NOBODY + EXACT_ARGV ->
+    # VERIFIED_NOBODY + PROVEN_EXEC_READY + CANDIDATE_RESULT |
+    # NETWORK_SETUP_EXIT. Candidate output cannot forge pre-exec readiness.
     try:
         _require(len(argv) >= 3, "HARNESS_IDENTITY_UNSAFE")
-        command = _drop_candidate_identity(argv)
-        os.write(1, SANDBOX_READY)
-        os.execvpe(command[0], command, os.environ)
+        command = _fixed_probe_arguments(argv)
     except (HarnessError, OSError, ValueError):
         return NETWORK_SETUP_EXIT
-    return NETWORK_SETUP_EXIT
+    return _supervise_candidate_exec(command)
 
 
 def _candidate_policy_probe_entry(argv: list[str]) -> int:
@@ -1284,25 +1400,16 @@ async def _spawn(
                 str(identity.gid),
                 *argv[5:],
             ]
-        elif sandbox == NetworkSandbox.LINUX:
+        else:
             trusted_launcher = Path(__file__).resolve(strict=True)
             wrapped = [
                 sys.executable,
                 "-I",
                 "-B",
                 str(trusted_launcher),
-                "--linux-candidate-exec",
+                "--candidate-exec-entry",
                 str(identity.uid),
                 str(identity.gid),
-                *argv,
-            ]
-        else:
-            wrapped = [
-                sys.executable,
-                "-I",
-                "-B",
-                "-c",
-                CANDIDATE_EXEC,
                 *argv,
             ]
         command = _sandboxed_argv(
@@ -1314,9 +1421,7 @@ async def _spawn(
             cargo_home,
             allow_loopback=allow_loopback,
             seccomp_fd=seccomp_fd,
-            trusted_launcher=(
-                trusted_launcher if sandbox == NetworkSandbox.LINUX else None
-            ),
+            trusted_launcher=trusted_launcher,
             privileged_probe=(
                 privileged_probe if sandbox == NetworkSandbox.LINUX else None
             ),
@@ -1641,6 +1746,14 @@ async def _execute_check(
                 state[identifier] = CheckPhase.FAILED
                 error.failed = [identifier]
             raise
+        exit_code: int | None = None
+        if not timed_out:
+            try:
+                exit_code = _candidate_exit_code(process.returncode, sandbox)
+            except HarnessError as error:
+                state[identifier] = CheckPhase.FAILED
+                error.failed = [identifier]
+                raise
         evidence = bytes(output)
         relative = f".governance/receipts/evidence/{identifier}.log"
         try:
@@ -1655,7 +1768,7 @@ async def _execute_check(
             "identifier": identifier,
             "outcome": "TIMED_OUT"
             if timed_out
-            else {"EXITED": {"exit_code": process.returncode}},
+            else {"EXITED": {"exit_code": exit_code}},
             "output_bytes": len(evidence),
             "output_sha256": _sha(evidence),
         }
@@ -2065,6 +2178,6 @@ if __name__ == "__main__":
         raise SystemExit(_candidate_policy_probe_entry(arguments[1:]))
     if arguments and arguments[0] == "--network-probe-entry":
         raise SystemExit(_trusted_network_probe_entry(arguments[1:]))
-    if arguments and arguments[0] == "--linux-candidate-exec":
-        raise SystemExit(_linux_candidate_exec(arguments[1:]))
+    if arguments and arguments[0] == "--candidate-exec-entry":
+        raise SystemExit(_candidate_exec_entry(arguments[1:]))
     raise SystemExit(main(arguments))
