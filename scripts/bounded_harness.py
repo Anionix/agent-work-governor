@@ -711,6 +711,7 @@ def _sandboxed_argv(
     allow_loopback: bool = False,
     seccomp_fd: int | None = None,
     trusted_launcher: Path | None = None,
+    privileged_probe: FixedProbeSpec | None = None,
 ) -> list[str]:
     # LLM contract: verified OS sandbox + fixed identity -> one inherited
     # network boundary; unsupported policy refuses before candidate execution.
@@ -720,7 +721,9 @@ def _sandboxed_argv(
     # https://github.com/apple-oss-distributions/xnu/blob/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/security/mac_socket.c#L147-L164
     if sandbox == NetworkSandbox.MACOS:
         _require(
-            seccomp_fd is None and trusted_launcher is None,
+            seccomp_fd is None
+            and trusted_launcher is None
+            and privileged_probe is None,
             "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
         )
         return [
@@ -746,13 +749,48 @@ def _sandboxed_argv(
         raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
     _require(
         launcher is None
-        or (
-            trusted_launcher is not None
-            and trusted_launcher.is_absolute()
-            and launcher == trusted_launcher
-            and launcher.is_file()
-        ),
+        or trusted_launcher is not None
+        and trusted_launcher.is_absolute()
+        and launcher == trusted_launcher
+        and launcher.is_file(),
         "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+    )
+    # LLM contract: GENERIC_CANDIDATE -> HOST_NOBODY + LOCKED_USER_NAMESPACE;
+    # FIXED_PROBE -> ROOT_LAUNCHER + IN_PROCESS_DROP. Candidate bytes never
+    # inherit the root launcher capabilities or create a later user namespace.
+    # Primary sources:
+    # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L319-L333
+    # https://github.com/containers/bubblewrap/blob/1b80120ef26a28e065e67f89bfef873f13bdd317/bubblewrap.c#L3501-L3509
+    if privileged_probe is not None:
+        try:
+            protected_launcher = Path(__file__).resolve(strict=True)
+        except OSError as error:
+            raise HarnessError("HARNESS_NETWORK_SANDBOX_SETUP_FAILED") from error
+        _require(
+            launcher == protected_launcher
+            and any(privileged_probe is probe for probe in FIXED_PROBES.values())
+            and allow_loopback is privileged_probe.allow_loopback
+            and argv[:5]
+            == [
+                sys.executable,
+                "-I",
+                "-B",
+                str(protected_launcher),
+                privileged_probe.entry,
+            ]
+            and argv[5:7] == [str(identity.uid), str(identity.gid)]
+            and len(argv) == privileged_probe.argv_length + 2,
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+        )
+    identity_options = (
+        [
+            "--cap-add",
+            "CAP_SETGID",
+            "--cap-add",
+            "CAP_SETUID",
+        ]
+        if privileged_probe is not None
+        else ["--unshare-user", "--disable-userns"]
     )
     command = [
         str(_trusted_executable(shutil.which("bwrap"))),
@@ -765,10 +803,7 @@ def _sandboxed_argv(
         "--die-with-parent",
         "--cap-drop",
         "ALL",
-        "--cap-add",
-        "CAP_SETGID",
-        "--cap-add",
-        "CAP_SETUID",
+        *identity_options,
         "--ro-bind",
         "/nix/store",
         "/nix/store",
@@ -838,12 +873,45 @@ def _drop_candidate_identity(argv: list[str]) -> list[str]:
     return argv[2:]
 
 
+def _fixed_probe_arguments(argv: list[str]) -> list[str]:
+    # LLM contract: LINUX_ROOT_LAUNCHER | MACOS_PARENT_DROPPED_IDENTITY ->
+    # VERIFIED_NOBODY_ARGUMENTS | HARNESS_IDENTITY_UNSAFE. A fixed probe never
+    # crosses a post-READY exec boundary on either platform.
+    # Primary source: https://docs.python.org/3.14/library/subprocess.html#popen-constructor
+    if sys.platform != "darwin":
+        return _drop_candidate_identity(argv)
+    _require(
+        len(argv) >= 2 and argv[0].isdecimal() and argv[1].isdecimal(),
+        "HARNESS_IDENTITY_UNSAFE",
+    )
+    identity = RunIdentity(int(argv[0]), int(argv[1]))
+    _require(
+        identity.uid not in (0, (1 << 32) - 1)
+        and identity.gid not in (0, (1 << 32) - 1)
+        and os.geteuid() == identity.uid
+        and os.getegid() == identity.gid
+        and os.getgroups() == [],
+        "HARNESS_IDENTITY_UNSAFE",
+    )
+    return argv[2:]
+
+
 def _linux_candidate_exec(argv: list[str]) -> int:
-    # LLM contract: DISTINCT_UID + EXACT_ARGV -> READY + CANDIDATE_EXEC |
-    # NETWORK_SETUP_EXIT; an empty command or failed exec remains fail closed.
+    # LLM contract: PARENT_DROPPED_IDENTITY + LOCKED_USER_NAMESPACE + EXACT_ARGV
+    # -> VERIFIED_NOBODY_READY + CANDIDATE_EXEC | NETWORK_SETUP_EXIT. The
+    # protected launcher verifies rather than changes credentials before READY.
     try:
         _require(len(argv) >= 3, "HARNESS_IDENTITY_UNSAFE")
-        command = _drop_candidate_identity(argv)
+        identity = RunIdentity(int(argv[0]), int(argv[1]))
+        command = argv[2:]
+        _require(
+            identity.uid not in (0, (1 << 32) - 1)
+            and identity.gid not in (0, (1 << 32) - 1)
+            and os.geteuid() == identity.uid
+            and os.getegid() == identity.gid
+            and os.getgroups() == [],
+            "HARNESS_IDENTITY_UNSAFE",
+        )
         os.write(1, SANDBOX_READY)
         os.execvpe(command[0], command, os.environ)
     except (HarnessError, OSError, ValueError):
@@ -857,10 +925,7 @@ def _candidate_policy_probe_entry(argv: list[str]) -> int:
     # fail before READY and no post-READY exec boundary exists.
     try:
         _require(len(argv) == 2, "HARNESS_IDENTITY_UNSAFE")
-        _require(
-            not _drop_candidate_identity(argv),
-            "HARNESS_IDENTITY_UNSAFE",
-        )
+        _require(not _fixed_probe_arguments(argv), "HARNESS_IDENTITY_UNSAFE")
     except (HarnessError, OSError, ValueError):
         return NETWORK_SETUP_EXIT
     return _candidate_ip_policy_probe()
@@ -1137,7 +1202,7 @@ def _trusted_network_probe_entry(argv: list[str]) -> int:
     # Loading the protected launcher precedes the credential drop, while READY
     # is emitted only after the drop and no later exec boundary exists.
     try:
-        arguments = _drop_candidate_identity(argv)
+        arguments = _fixed_probe_arguments(argv)
         _require(len(arguments) == 8 and all(arguments))
         _require(
             os.write(1, SANDBOX_READY) == len(SANDBOX_READY),
@@ -1183,6 +1248,7 @@ async def _spawn(
     process: asyncio.subprocess.Process | None = None
     try:
         trusted_launcher: Path | None = None
+        privileged_probe: FixedProbeSpec | None = None
         if fixed_probe is not None:
             trusted_launcher = Path(__file__).resolve(strict=True)
             specification = FIXED_PROBES.get(fixed_probe)
@@ -1191,6 +1257,7 @@ async def _spawn(
                 "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
             )
             assert specification is not None
+            privileged_probe = specification
             prefix = [
                 sys.executable,
                 "-I",
@@ -1212,7 +1279,7 @@ async def _spawn(
                 *argv[5:],
             ]
         elif sandbox == NetworkSandbox.LINUX:
-            trusted_launcher = trusted_launcher or Path(__file__).resolve(strict=True)
+            trusted_launcher = Path(__file__).resolve(strict=True)
             wrapped = [
                 sys.executable,
                 "-I",
@@ -1244,9 +1311,12 @@ async def _spawn(
             trusted_launcher=(
                 trusted_launcher if sandbox == NetworkSandbox.LINUX else None
             ),
+            privileged_probe=(
+                privileged_probe if sandbox == NetworkSandbox.LINUX else None
+            ),
         )
         macos = sandbox == NetworkSandbox.MACOS
-        parent_drops_identity = macos and fixed_probe is None
+        parent_drops_identity = macos or fixed_probe is None
         inherited = () if seccomp_fd is None else (seccomp_fd,)
         # LLM contract: LAUNCHER_SETSID -> SANDBOX_INHERITS_DETACHED_SESSION;
         # a second Bubblewrap setsid would fail closed before READY because the
