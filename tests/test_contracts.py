@@ -16,6 +16,7 @@ import textwrap
 import tomllib
 import unittest
 import zipfile
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -344,7 +345,7 @@ def run_repository_controls_fixture(
     docker_action_image: str | None = None,
     ignored_output: bool = False,
     invalid_diff: bool = False,
-    missing_contract: bool = False,
+    contract_kind: str = "regular",
     template_action: str | None = None,
     tracked_output: str | None = None,
     uses_input: bool = False,
@@ -352,6 +353,15 @@ def run_repository_controls_fixture(
     """Run required repository controls against one isolated candidate tree."""
 
     with tempfile.TemporaryDirectory() as directory:
+        if contract_kind not in {
+            "regular",
+            "ignored",
+            "missing",
+            "symlink",
+            "submodule",
+            "unreadable",
+        }:
+            raise ValueError(f"unsupported contract kind: {contract_kind}")
         root = Path(directory)
         workflow = root / ".github/workflows/fixture.yml"
         workflow.parent.mkdir(parents=True)
@@ -388,8 +398,11 @@ def run_repository_controls_fixture(
             )
         required = "AGENTS.md CONTRIBUTING.md SECURITY.md flake.nix flake.lock"
         for name in required.split():
-            if not (missing_contract and name == "SECURITY.md"):
+            if not (contract_kind == "missing" and name == "SECURITY.md"):
                 (root / name).write_text("", encoding="utf-8")
+        if contract_kind == "symlink":
+            (root / "SECURITY.md").unlink()
+            (root / "SECURITY.md").symlink_to("AGENTS.md")
         (root / ".gitignore").write_text("runtime/\n", encoding="utf-8")
         output_path = "runtime/cache" if ignored_output else tracked_output
         if output_path:
@@ -411,6 +424,25 @@ def run_repository_controls_fixture(
             git("add", "-f", "runtime/cache")
         git("commit", "-qm", "fixture")
         base = git("rev-parse", "HEAD")
+        if contract_kind == "ignored":
+            (root / ".gitignore").write_text(
+                "runtime/\nSECURITY.md\n", encoding="utf-8"
+            )
+            git("add", ".gitignore")
+            git("commit", "-qm", "ignore tracked contract")
+        elif contract_kind == "submodule":
+            git(
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"160000,{base},SECURITY.md",
+            )
+            git("commit", "-qm", "replace contract with gitlink")
+        elif contract_kind == "unreadable":
+            object_id = git("rev-parse", "HEAD:SECURITY.md")
+            loose_object = root / ".git/objects" / object_id[:2] / object_id[2:]
+            loose_object.chmod(0o600)
+            loose_object.write_bytes(zlib.compress(b"blob 100\0"))
         if invalid_diff:
             invalid = root / "docs/invalid.md"
             invalid.parent.mkdir()
@@ -2377,7 +2409,8 @@ class SourceHygieneTests(unittest.TestCase):
 
     def test_required_repository_controls_fail_closed(self) -> None:
         for accepted in (
-            run_repository_controls_fixture(),
+            run_repository_controls_fixture(contract_kind="regular"),
+            run_repository_controls_fixture(contract_kind="ignored"),
             run_repository_controls_fixture(
                 action=f"uses: docker://alpine@sha256:{'a' * 64}"
             ),
@@ -2389,11 +2422,12 @@ class SourceHygieneTests(unittest.TestCase):
             run_repository_controls_fixture(uses_input=True),
         ):
             self.assertEqual(0, accepted.returncode, accepted.stderr)
+        for contract_kind in ("missing", "symlink", "submodule", "unreadable"):
+            rejected = run_repository_controls_fixture(contract_kind=contract_kind)
+            with self.subTest(contract_kind=contract_kind):
+                self.assertEqual(1, rejected.returncode)
+                self.assertIn("REPOSITORY_CONTRACT_INVALID", rejected.stdout)
         cases = (
-            (
-                run_repository_controls_fixture(missing_contract=True),
-                "REPOSITORY_CONTRACT_MISSING",
-            ),
             (
                 run_repository_controls_fixture(tracked_output="bin/tool"),
                 "TRACKED_RUNTIME_OUTPUT",
