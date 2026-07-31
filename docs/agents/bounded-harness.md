@@ -35,23 +35,27 @@ canonical read-only launcher while creating network/PID/IPC/UTS namespaces
 without a nested user namespace. Bubblewrap drops every capability except
 `CAP_SETGID` and `CAP_SETUID`; the trusted launcher uses them to clear
 supplementary groups, set and verify the fixed `nobody` GID/UID, and only then
-emits READY and executes the candidate. The trusted preflight's inherited,
+emits READY and executes the candidate. Fixed policy and trusted-network probes
+instead stay in that already-loaded launcher after the verified credential
+drop, so neither platform has a post-READY exec boundary. The trusted
+preflight's inherited,
 architecture-bound seccomp filter permits Unix, IPv4, and IPv6 sockets.
 Candidate filters permit Unix sockets only; VSOCK, packet, IPv4, IPv6,
 alternate-ABI, and `io_uring` socket paths fail with `EPERM`. A Bubblewrap
 loopback `RTM_NEWADDR` denial with `EPERM` is reported only as the fixed
 `network-*-linux-loopback-rtnetlink-eperm` stage; launcher text is never
-emitted. On macOS, the trusted preflight uses a deny-default Seatbelt profile
-that permits only pinned system/toolchain, repository, and runtime paths plus
-an explicit IPv4 loopback fixture. Candidate IPv6 denial remains a separate,
-mandatory OS-policy proof and never depends on host IPv6 routing.
+emitted. On macOS, the protected fixed launcher enters a deny-default Seatbelt
+profile before dropping to `nobody`; candidate commands still start directly as
+`nobody`. The profile permits only pinned system/toolchain, repository, and
+runtime paths plus an explicit IPv4 loopback fixture. Candidate IPv6 denial
+remains a separate, mandatory OS-policy proof and never depends on host IPv6
+routing.
 Candidate checks use the same bounded file/process surface with no network
 allow rules, so a host-local HTTP, SOCKS, or browser debug broker cannot relay
-egress. The candidate-policy proof runs directly as the fixed `nobody`
-identity; it does not require that identity to fork. A fixed stdout prefix
-is emitted by that same proving process after sandbox entry and complete
-credential drop; the policy proof has no post-READY exec boundary. If the
-direct proof fails, exit `81` remains an observed bypass at
+egress. Both fixed probes run directly as the fixed `nobody` identity; neither
+requires that identity to exec again. A fixed stdout prefix is emitted by each
+proving process after sandbox entry and complete credential drop. If the direct
+policy proof fails, exit `81` remains an observed bypass at
 `network-candidate-result`; otherwise the trusted parent emits a fixed fault
 stage derived only from its return code: `83` selects
 `network-candidate-socket-create-unexpected`, `84` selects
