@@ -61,16 +61,34 @@ test -z "$forbidden" || {
   echo "$forbidden"
   code_fail TRACKED_RUNTIME_OUTPUT
 }
+# Primary sources: https://docs.gradle.org/current/userguide/directory_layout.html
+# https://docs.gradle.org/current/userguide/init_scripts.html#sec:using_an_init_script
+# https://doc.rust-lang.org/cargo/guide/cargo-home.html
+# https://github.com/rust-lang/cargo/blob/1e02d691ba8b99d46a664ca5af7a6bd56e1e44cf/src/util/cache_lock.rs#L458-L462
+# https://github.com/rust-lang/cargo/blob/1e02d691ba8b99d46a664ca5af7a6bd56e1e44cf/src/workspace/global_cache_tracker.rs#L134-L135
 while IFS= read -r -d '' tracked_path; do
+  # LLM contract: TRACKED_PATH -> ACCEPTABLE_GRADLE_CONFIGURATION only after
+  # forbidden ancestors are excluded and only from the first .gradle component;
+  # every other .gradle descendant fails closed.
   case "/$tracked_path/" in
-    */.cache/* | */.devenv/* | */.direnv/* | */.governance/* | \
+    */.cache/* | */.cargo/.global-cache/ | */.cargo/.package-cache/ | \
+      */.cargo/.package-cache-mutate/ | */.cargo/git/* | \
+      */.cargo/registry/* | */.devenv/* | */.direnv/* | */.governance/* | \
       */.mypy_cache/* | */.nox/* | */.pytest_cache/* | */.ruff_cache/* | \
       */.tox/* | */.venv/* | */__pycache__/* | */bin/* | */build/* | \
-      */dist/* | */dist-packages/* | */node_modules/* | */site-packages/* | \
-      */Scripts/activate*/* | */Scripts/python*.exe/* | \
+      */dist/* | */dist-packages/* | */node_modules/* | \
+      */site-packages/* | */Scripts/activate*/* | */Scripts/python*.exe/* | \
       */rust/target/* | */target/* | */venv/*)
       echo "$tracked_path"
       code_fail TRACKED_RUNTIME_OUTPUT
+      ;;
+    */.gradle/*)
+      gradle_suffix="/$tracked_path"
+      gradle_suffix="${gradle_suffix#*/.gradle/}"
+      if ! [[ "$gradle_suffix" =~ ^(gradle\.properties|init\.gradle(\.kts)?|init\.d/[^/]+\.gradle(\.kts)?)$ ]]; then
+        echo "$tracked_path"
+        code_fail TRACKED_RUNTIME_OUTPUT
+      fi
       ;;
   esac
   case "${tracked_path##*/}" in
