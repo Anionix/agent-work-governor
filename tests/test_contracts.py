@@ -2645,6 +2645,61 @@ class SourceHygieneTests(unittest.TestCase):
         self.assertIn('if [[ "$status" -eq 2 ]]', check)
         self.assertNotIn("grep -Eqi", check)
 
+    def test_buck2_release_digest_corruption_is_rejected(self) -> None:
+        flake = (PLUGIN_ROOT / "flake.nix").read_text(encoding="utf-8")
+        release_binding = flake[
+            flake.index("bindBuck2ReleaseSource =") : flake.index(
+                "# id: agent-work-governor.buck2-package-binding"
+            )
+        ]
+        for evidence in (
+            "expected.source != canonicalSource",
+            'digest = builtins.match "sha256:([0-9a-f]{64})"',
+            "pkgs.fetchurl",
+            "url = expected.source;",
+            "sha256 = builtins.head digest;",
+        ):
+            self.assertIn(evidence, release_binding)
+        self.assertIn(
+            "buck2-release-source = toolchain.buck2ReleaseSource;",
+            flake,
+        )
+
+        regression = (PLUGIN_ROOT / "scripts/test_buck2_release_digest.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('pin["source_digest"] = f"sha256:{\'0\' * 64}"', regression)
+        self.assertIn("BUCK2_PLATFORM_ARTIFACT_DRIFT", regression)
+        self.assertIn('"path:$runtime#buck2-release-source"', regression)
+        self.assertIn(
+            'grep -Fqi "hash mismatch in fixed-output derivation"',
+            regression,
+        )
+        self.assertIn(
+            'grep -Fq "buck2-$release-release-launcher.drv"',
+            regression,
+        )
+        self.assertIn('grep -Fq "specified: $corrupted_sri"', regression)
+        syntax = subprocess.run(
+            ["bash", "-n", "scripts/test_buck2_release_digest.sh"],
+            cwd=PLUGIN_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(0, syntax.returncode, syntax.stderr)
+
+        workflow = (PLUGIN_ROOT / ".github/workflows/proof-slow.yml").read_text(
+            encoding="utf-8"
+        )
+        check = workflow_run_block(
+            workflow,
+            "Reject a corrupted Buck2 release digest",
+        )
+        self.assertIn("--code BUCK2_RELEASE_DIGEST_REGRESSION_FAILED", check)
+        self.assertIn("--infra-code BUCK2_RELEASE_DIGEST_REGRESSION_INFRA", check)
+        self.assertIn("bash scripts/test_buck2_release_digest.sh", check)
+
     def test_unified_toolchain_matches_project_and_environment_inputs(self) -> None:
         catalog_path = PLUGIN_ROOT / "toolchain.lock.json"
         catalog = json.loads(catalog_path.read_text(encoding="utf-8"))

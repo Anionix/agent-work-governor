@@ -326,6 +326,41 @@
           bindPackage language toolId expectedPname package
         );
       # LLM-CONTRACT
+      # id: agent-work-governor.buck2-release-binding
+      # state: CATALOG_RELEASE -> CANONICAL_FIXED_OUTPUT_SOURCE | EVALUATION_FAILURE
+      # preconditions: the Buck2 pin declares a dated official release launcher
+      # invariant: the launcher URL and bytes remain independently bound
+      # failure: malformed identity fails evaluation; byte drift fails the Nix build
+      # source: https://github.com/facebook/buck2/blob/1560aca2002865cd73d7cafb22c705cfb640b2bc/README.md
+      # knowledge: bundle:knowledge/references/buck2-shadow-pilot.md
+      # enforced_by: buck2-release-source
+      # test: bundle:tests/test_contracts.py
+      bindBuck2ReleaseSource =
+        pkgs:
+        let
+          expected = pinFor "rust" "buck2";
+          release = builtins.replaceStrings [ "." ] [ "-" ] expected.version;
+          canonicalSource = "https://github.com/facebook/buck2/releases/download/${release}/buck2";
+          digest = builtins.match "sha256:([0-9a-f]{64})" expected.source_digest;
+        in
+        if expected.source != canonicalSource then
+          fail "TOOLCHAIN_RELEASE_SOURCE_URL_MISMATCH" "buck2"
+        else if digest == null then
+          fail "TOOLCHAIN_RELEASE_SOURCE_DIGEST_MISMATCH" "buck2"
+        else
+          let
+            launcher = pkgs.fetchurl {
+              name = "buck2-${release}-release-launcher";
+              url = expected.source;
+              sha256 = builtins.head digest;
+            };
+          in
+          pkgs.runCommand "buck2-${release}-release-source" { } ''
+            mkdir -p "$out/share/buck2"
+            cp ${launcher} "$out/share/buck2/release-launcher"
+            chmod 0444 "$out/share/buck2/release-launcher"
+          '';
+      # LLM-CONTRACT
       # id: agent-work-governor.buck2-package-binding
       # state: CATALOG_ARTIFACT + NIX_PACKAGE -> PINNED_BUCK2 | EVALUATION_FAILURE
       # preconditions: the catalog declares one artifact for every supported system
@@ -354,8 +389,7 @@
           };
         in
         bindNixPackageIdentity "buck2" (
-          expected
-          // {
+          {
             source = artifact.url;
             source_digest = "sha256:${artifact.sha256}";
           }
@@ -492,6 +526,7 @@
           python = pythonBase;
           actionlint = bindNixPackage "nix" "actionlint" "actionlint" pkgs.actionlint;
           bubblewrap = bindNixPackage "nix" "bubblewrap" "bubblewrap" pkgs.bubblewrap;
+          buck2ReleaseSource = bindBuck2ReleaseSource pkgs;
           buck2 = bindBuck2 pkgs;
           cargoAudit = bindNixPackage "rust" "cargo-audit" "cargo-audit" pkgs.cargo-audit;
           cargoDeny = bindNixPackage "rust" "cargo-deny" "cargo-deny" pkgs.cargo-deny;
@@ -625,6 +660,7 @@
               '';
         in
         {
+          buck2-release-source = toolchain.buck2ReleaseSource;
           shadow-inputs = shadowInputs;
           default = rustPlatform.buildRustPackage {
             pname = "agent-work-governor";
@@ -738,6 +774,7 @@
 
       checks = forAllSystems (pkgs: {
         inherit (self.packages.${pkgs.stdenv.hostPlatform.system})
+          buck2-release-source
           default
           shadow-inputs
           ;
@@ -761,6 +798,7 @@
               toolchain.rust
               toolchain.python
               toolchain.actionlint
+              toolchain.buck2ReleaseSource
               toolchain.buck2
               toolchain.cargoAudit
               toolchain.cargoDeny
