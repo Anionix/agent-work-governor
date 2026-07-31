@@ -801,6 +801,7 @@ class BoundedHarnessTests(unittest.TestCase):
             self.assertIsNone(harness._native_ipv6_listener(stack))
 
     def test_macos_candidate_profile_denies_loopback_brokers(self) -> None:
+        script = Path(harness.__file__).resolve()
         runtime = harness.RuntimePaths(
             self.root / "run.json",
             self.root / "evidence",
@@ -815,6 +816,7 @@ class BoundedHarnessTests(unittest.TestCase):
             self.root,
             runtime,
             None,
+            trusted_launcher=script,
         )
         probe = harness._sandboxed_argv(
             harness.NetworkSandbox.MACOS,
@@ -824,12 +826,14 @@ class BoundedHarnessTests(unittest.TestCase):
             runtime,
             None,
             allow_loopback=True,
+            trusted_launcher=script,
         )
         self.assertNotIn("(allow network-", candidate[2])
         self.assertIn("(deny network* (with errno EPERM))", candidate[2])
         self.assertIn('(import "dyld-support.sb")', candidate[2])
         self.assertNotIn("\n(allow file-read*)\n", candidate[2])
         self.assertIn(f'(subpath "{self.root}")', candidate[2])
+        self.assertIn(f'(subpath "{script}")', candidate[2])
         self.assertIn('(subpath "/nix/store")', candidate[2])
         self.assertNotIn("(deny network*", probe[2])
         self.assertIn('(allow network-outbound (remote ip "localhost:*"))', probe[2])
@@ -977,7 +981,7 @@ class BoundedHarnessTests(unittest.TestCase):
             command = harness._sandboxed_argv(
                 harness.NetworkSandbox.LINUX,
                 harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
-                [str(script), "--linux-candidate-exec"],
+                [str(script), "--candidate-exec-entry"],
                 self.root,
                 runtime,
                 None,
@@ -1044,7 +1048,7 @@ class BoundedHarnessTests(unittest.TestCase):
         self.assertIsNone(sandboxed.call_args.kwargs["privileged_probe"])
         self.assertEqual(
             [
-                "--linux-candidate-exec",
+                "--candidate-exec-entry",
                 str(NOBODY.pw_uid),
                 str(NOBODY.pw_gid),
                 "candidate",
@@ -1119,7 +1123,7 @@ class BoundedHarnessTests(unittest.TestCase):
                     sandboxed.call_args.args[2][4:],
                 )
                 self.assertEqual(
-                    script if sandbox == harness.NetworkSandbox.LINUX else None,
+                    script,
                     sandboxed.call_args.kwargs["trusted_launcher"],
                 )
                 self.assertIs(
@@ -1227,26 +1231,20 @@ class BoundedHarnessTests(unittest.TestCase):
         prove.assert_called_once_with()
         execute.assert_not_called()
 
-    def test_linux_candidate_exec_verifies_identity_before_ready(self) -> None:
-        writes: list[tuple[int, bytes]] = []
+    def test_candidate_exec_entry_verifies_identity_before_supervision(self) -> None:
         with (
             mock.patch.object(
                 harness,
-                "_drop_candidate_identity",
+                "_fixed_probe_arguments",
                 return_value=["/nix/store/candidate", "argument"],
             ) as drop,
             mock.patch.object(
-                harness.os,
-                "write",
-                side_effect=lambda fd, value: writes.append((fd, value)) or len(value),
-            ),
-            mock.patch.object(
-                harness.os,
-                "execvpe",
-                side_effect=OSError(errno.ENOENT, "injected"),
-            ) as execute,
+                harness,
+                "_supervise_candidate_exec",
+                return_value=7,
+            ) as supervise,
         ):
-            result = harness._linux_candidate_exec(
+            result = harness._candidate_exec_entry(
                 [
                     str(NOBODY.pw_uid),
                     str(NOBODY.pw_gid),
@@ -1254,54 +1252,181 @@ class BoundedHarnessTests(unittest.TestCase):
                     "argument",
                 ]
             )
-        self.assertEqual(harness.NETWORK_SETUP_EXIT, result)
+        self.assertEqual(7, result)
         drop.assert_called_once()
-        self.assertEqual([(1, harness.SANDBOX_READY)], writes)
-        execute.assert_called_once_with(
-            "/nix/store/candidate",
+        supervise.assert_called_once_with(
             ["/nix/store/candidate", "argument"],
-            mock.ANY,
         )
 
-    def test_linux_candidate_exec_fails_before_ready_on_identity_mismatch(self) -> None:
+    def test_linux_identity_drop_clears_capabilities_before_readback(self) -> None:
         with (
+            mock.patch.object(harness.sys, "platform", "linux"),
             mock.patch.object(
-                harness,
-                "_drop_candidate_identity",
-                side_effect=harness.HarnessError("HARNESS_IDENTITY_UNSAFE"),
+                harness.os,
+                "geteuid",
+                side_effect=[0, NOBODY.pw_uid],
             ),
-            mock.patch.object(harness.os, "write") as write,
+            mock.patch.object(harness.os, "getegid", return_value=NOBODY.pw_gid),
+            mock.patch.object(harness.os, "getgroups", return_value=[]),
+            mock.patch.object(harness.os, "setgroups") as setgroups,
+            mock.patch.object(harness.os, "setgid") as setgid,
+            mock.patch.object(harness.os, "setuid") as setuid,
+            mock.patch.object(harness, "_clear_linux_active_capabilities") as clear,
         ):
             self.assertEqual(
-                harness.NETWORK_SETUP_EXIT,
-                harness._linux_candidate_exec(
+                ["candidate"],
+                harness._drop_candidate_identity(
                     [str(NOBODY.pw_uid), str(NOBODY.pw_gid), "candidate"]
                 ),
             )
-        write.assert_not_called()
+        setgroups.assert_called_once_with([])
+        setgid.assert_called_once_with(NOBODY.pw_gid)
+        setuid.assert_called_once_with(NOBODY.pw_uid)
+        clear.assert_called_once_with()
 
-    def test_candidate_exec_prefixes_output_with_readiness(self) -> None:
-        result = subprocess.run(
-            [
-                sys.executable,
-                "-I",
-                "-B",
-                "-c",
-                harness.CANDIDATE_EXEC,
-                sys.executable,
-                "-I",
-                "-B",
-                "-c",
-                "import os;os.write(1,b'candidate-output')",
-            ],
-            check=False,
-            capture_output=True,
+    def test_linux_capability_clear_requires_zero_kernel_readback(self) -> None:
+        zero = (
+            "CapInh:\t0000000000000000\n"
+            "CapPrm:\t0000000000000000\n"
+            "CapEff:\t0000000000000000\n"
+            "CapAmb:\t0000000000000000"
         )
-        self.assertEqual(0, result.returncode, result.stderr)
+
+        def clear(status: str, machine: str = "x86_64") -> SimpleNamespace:
+            library = SimpleNamespace(syscall=mock.Mock(return_value=0))
+            with (
+                mock.patch.object(harness.sys, "platform", "linux"),
+                mock.patch.object(harness.platform, "machine", return_value=machine),
+                mock.patch.object(harness.ctypes, "CDLL", return_value=library),
+                mock.patch.object(harness.Path, "read_text", return_value=status),
+            ):
+                harness._clear_linux_active_capabilities()
+            return library
+
+        for machine, capset_syscall_number in (("x86_64", 126), ("aarch64", 91)):
+            with self.subTest(machine=machine):
+                self.assertEqual(
+                    capset_syscall_number,
+                    clear(zero, machine).syscall.call_args.args[0],
+                )
+
+        invalid = (
+            zero.replace("CapInh:\t0000000000000000", "CapInh:\t0000000000000002"),
+            f"{zero}\nCapInh:\t0000000000000000",
+        )
+        for status in invalid:
+            with self.subTest(status=status), self.assertRaises(harness.HarnessError):
+                clear(status)
+
+    def test_candidate_exec_entry_fails_before_supervision_on_identity_mismatch(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(
+                harness,
+                "_fixed_probe_arguments",
+                side_effect=harness.HarnessError("HARNESS_IDENTITY_UNSAFE"),
+            ),
+            mock.patch.object(harness, "_supervise_candidate_exec") as supervise,
+        ):
+            self.assertEqual(
+                harness.NETWORK_SETUP_EXIT,
+                harness._candidate_exec_entry(
+                    [str(NOBODY.pw_uid), str(NOBODY.pw_gid), "candidate"]
+                ),
+            )
+        supervise.assert_not_called()
+
+    def test_candidate_exec_supervisor_distinguishes_exec_failure_from_exit_82(
+        self,
+    ) -> None:
+        cases = (
+            (
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    "import os;os.write(1,b'candidate-output')",
+                ],
+                0,
+                harness.SANDBOX_READY + b"candidate-output",
+            ),
+            (
+                [sys.executable, "-I", "-B", "-c", "raise SystemExit(82)"],
+                82,
+                harness.SANDBOX_READY,
+            ),
+            (
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    "-c",
+                    "import os,signal;os.kill(os.getpid(),signal.SIGTERM)",
+                ],
+                128 + harness.signal.SIGTERM,
+                harness.SANDBOX_READY,
+            ),
+            (["/definitely/missing/candidate"], harness.NETWORK_SETUP_EXIT, b""),
+        )
+        for command, returncode, stdout in cases:
+            with self.subTest(command=command):
+                program = (
+                    "from scripts import bounded_harness as h;"
+                    f"raise SystemExit(h._supervise_candidate_exec({command!r}))"
+                )
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        "-c",
+                        program,
+                    ],
+                    check=False,
+                    capture_output=True,
+                )
+                self.assertEqual(returncode, result.returncode, result.stderr)
+                self.assertEqual(stdout, result.stdout)
+
+    def test_post_ready_supervisor_fault_is_not_candidate_exit(self) -> None:
+        process = SimpleNamespace(
+            stdout=SimpleNamespace(read=mock.Mock(side_effect=OSError("injected"))),
+            poll=mock.Mock(return_value=None),
+            kill=mock.Mock(),
+            wait=mock.Mock(return_value=0),
+        )
+        with (
+            mock.patch.object(harness.subprocess, "Popen", return_value=process),
+            mock.patch.object(harness.os, "write", return_value=1),
+            mock.patch.object(harness.signal, "signal") as reset,
+            mock.patch.object(
+                harness.os,
+                "kill",
+                side_effect=SystemExit(99),
+            ) as terminate,
+            self.assertRaisesRegex(SystemExit, "99"),
+        ):
+            harness._supervise_candidate_exec(["candidate"])
+        process.kill.assert_called_once_with()
+        process.wait.assert_called_once_with()
+        reset.assert_called_once_with(harness.signal.SIGUSR2, harness.signal.SIG_DFL)
+        terminate.assert_called_once_with(os.getpid(), harness.signal.SIGUSR2)
+
         self.assertEqual(
-            harness.SANDBOX_READY + b"candidate-output",
-            result.stdout,
+            harness.NETWORK_SETUP_EXIT,
+            harness._candidate_exit_code(
+                harness.NETWORK_SETUP_EXIT,
+                harness.NetworkSandbox.LINUX,
+            ),
         )
+        with self.assertRaises(harness.HarnessError) as fault:
+            harness._candidate_exit_code(
+                -harness.signal.SIGUSR2,
+                harness.NetworkSandbox.LINUX,
+            )
+        self.assertEqual("HARNESS_NETWORK_SANDBOX_SETUP_FAILED", fault.exception.code)
+        self.assertEqual(harness.NetworkStage.CANDIDATE_RESULT, fault.exception.stage)
 
     def test_sandbox_startup_failure_is_typed(self) -> None:
         runtime = harness.RuntimePaths(

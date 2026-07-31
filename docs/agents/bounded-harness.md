@@ -34,7 +34,10 @@ Bubblewrap to expose only protected inputs, candidate workspaces, and the
 canonical read-only launcher while creating network/PID/IPC/UTS namespaces.
 For ordinary checks Bubblewrap starts as the trusted root launcher with only
 `CAP_SETGID` and `CAP_SETUID`, loads the protected entry, then drops to the
-fixed `nobody` identity before READY and candidate exec. Its inherited seccomp
+fixed `nobody` identity, clears every active capability set, and starts a
+candidate child. Python's `Popen` constructor propagates pre-exec failures to
+the trusted supervisor, which emits READY only after startup succeeds and then
+relays candidate output. Its inherited seccomp
 filter rejects later user-namespace creation or joining through `clone3`,
 `clone`, `unshare`, and `setns`. The post-merge workflow gives Ubuntu x86 authority, Ubuntu ARM
 Linux-portability shadow, and macOS platform shadow their own jobs while sharing
@@ -53,7 +56,8 @@ loopback `RTM_NEWADDR` denial with `EPERM` is reported only as the fixed
 `network-*-linux-loopback-rtnetlink-eperm` stage; launcher text is never
 emitted. On macOS, the protected fixed launcher enters a deny-default Seatbelt
 profile before dropping to `nobody`; candidate commands still start directly as
-`nobody`. The profile permits only pinned system/toolchain, repository, and
+`nobody`. The same protected supervisor verifies that identity and completes
+the `Popen` startup boundary before READY. The profile permits only pinned system/toolchain, repository, and
 runtime paths plus an explicit IPv4 loopback fixture. Candidate IPv6 denial
 remains a separate, mandatory OS-policy proof and never depends on host IPv6
 routing.
