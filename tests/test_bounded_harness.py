@@ -654,7 +654,7 @@ class BoundedHarnessTests(unittest.TestCase):
             mock.patch.object(harness.socket, "socket", side_effect=deny),
             mock.patch.object(harness.os, "fork") as fork,
         ):
-            self.assertEqual(0, harness._candidate_ip_policy_probe())
+            self.assertEqual(0, harness._candidate_ip_policy_once())
         fork.assert_not_called()
         self.assertEqual(
             [
@@ -673,7 +673,7 @@ class BoundedHarnessTests(unittest.TestCase):
         ):
             self.assertEqual(
                 harness.NETWORK_POLICY_SOCKET_CREATE_EXIT,
-                harness._candidate_ip_policy_probe(),
+                harness._candidate_ip_policy_once(),
             )
 
         class DatagramAllowed:
@@ -915,6 +915,112 @@ class BoundedHarnessTests(unittest.TestCase):
             ],
             wrapped[4:],
         )
+
+    def test_policy_probe_has_no_post_ready_exec_boundary(self) -> None:
+        runtime = harness.RuntimePaths(
+            self.root / "run.json",
+            self.root / "evidence",
+            self.root / "artifacts",
+            self.root / "tmp",
+        )
+        script = Path(harness.__file__).resolve()
+        argv = [
+            sys.executable,
+            "-I",
+            "-B",
+            str(script),
+            "--candidate-ip-policy-probe",
+        ]
+        for sandbox in (
+            harness.NetworkSandbox.LINUX,
+            harness.NetworkSandbox.MACOS,
+        ):
+            with self.subTest(sandbox=sandbox):
+                stdout = mock.AsyncMock()
+                stdout.read.return_value = harness.SANDBOX_READY
+                process = SimpleNamespace(stdout=stdout)
+                with (
+                    mock.patch.object(harness, "_linux_seccomp_fd", return_value=9),
+                    mock.patch.object(
+                        harness, "_sandboxed_argv", return_value=["sandbox"]
+                    ) as sandboxed,
+                    mock.patch.object(
+                        harness.asyncio,
+                        "create_subprocess_exec",
+                        return_value=process,
+                    ),
+                    mock.patch.object(harness.os, "close"),
+                ):
+                    result = asyncio.run(
+                        harness._spawn(
+                            argv,
+                            script.parent,
+                            runtime,
+                            None,
+                            harness.RunIdentity(NOBODY.pw_uid, NOBODY.pw_gid),
+                            sandbox,
+                            direct_policy_probe=True,
+                        )
+                    )
+                self.assertIs(process, result)
+                wrapped = sandboxed.call_args.args[2]
+                if sandbox == harness.NetworkSandbox.LINUX:
+                    self.assertEqual(
+                        [
+                            "--linux-candidate-policy-probe",
+                            str(NOBODY.pw_uid),
+                            str(NOBODY.pw_gid),
+                        ],
+                        wrapped[4:],
+                    )
+                    self.assertEqual(
+                        script,
+                        sandboxed.call_args.kwargs["trusted_launcher"],
+                    )
+                else:
+                    self.assertEqual(argv, wrapped)
+                    self.assertIsNone(sandboxed.call_args.kwargs["trusted_launcher"])
+
+    def test_candidate_policy_probe_emits_ready_from_proving_process(self) -> None:
+        with (
+            mock.patch.object(
+                harness.os,
+                "write",
+                return_value=len(harness.SANDBOX_READY),
+            ) as write,
+            mock.patch.object(
+                harness,
+                "_candidate_ip_policy_once",
+                return_value=0,
+            ) as prove,
+        ):
+            self.assertEqual(0, harness._candidate_ip_policy_probe())
+        write.assert_called_once_with(1, harness.SANDBOX_READY)
+        prove.assert_called_once_with()
+
+    def test_linux_policy_probe_drops_identity_without_exec(self) -> None:
+        with (
+            mock.patch.object(
+                harness,
+                "_drop_linux_candidate_identity",
+                return_value=[],
+            ) as drop,
+            mock.patch.object(
+                harness,
+                "_candidate_ip_policy_probe",
+                return_value=0,
+            ) as prove,
+            mock.patch.object(harness.os, "execvpe") as execute,
+        ):
+            self.assertEqual(
+                0,
+                harness._linux_candidate_policy_probe(
+                    [str(NOBODY.pw_uid), str(NOBODY.pw_gid)]
+                ),
+            )
+        drop.assert_called_once_with([str(NOBODY.pw_uid), str(NOBODY.pw_gid)])
+        prove.assert_called_once_with()
+        execute.assert_not_called()
 
     def test_linux_candidate_exec_drops_identity_before_ready(self) -> None:
         writes: list[tuple[int, bytes]] = []

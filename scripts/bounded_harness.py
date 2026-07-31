@@ -782,41 +782,65 @@ def _sandboxed_argv(
     return [*command, "--chdir", str(cwd), *argv]
 
 
-def _linux_candidate_exec(argv: list[str]) -> int:
-    # LLM contract: ROOT_SANDBOX_LAUNCHER + FIXED_UID_GID -> DISTINCT_UID_READY
-    # -> EXACT_ARGV; any partial or failed credential drop exits before READY.
+def _drop_linux_candidate_identity(argv: list[str]) -> list[str]:
+    # LLM contract: ROOT_SANDBOX_LAUNCHER + FIXED_UID_GID -> DISTINCT_UID |
+    # HARNESS_IDENTITY_UNSAFE; no candidate operation starts before the complete
+    # credential drop is read back.
     # Primary sources:
     # https://man7.org/linux/man-pages/man2/setuid.2.html
     # https://man7.org/linux/man-pages/man2/setgroups.2.html
+    _require(
+        sys.platform == "linux"
+        and os.geteuid() == 0
+        and len(argv) >= 2
+        and argv[0].isdecimal()
+        and argv[1].isdecimal(),
+        "HARNESS_IDENTITY_UNSAFE",
+    )
+    identity = RunIdentity(int(argv[0]), int(argv[1]))
+    _require(
+        identity.uid not in (0, (1 << 32) - 1)
+        and identity.gid not in (0, (1 << 32) - 1),
+        "HARNESS_IDENTITY_UNSAFE",
+    )
+    os.setgroups([])
+    os.setgid(identity.gid)
+    os.setuid(identity.uid)
+    _require(
+        os.geteuid() == identity.uid
+        and os.getegid() == identity.gid
+        and os.getgroups() == [],
+        "HARNESS_IDENTITY_UNSAFE",
+    )
+    return argv[2:]
+
+
+def _linux_candidate_exec(argv: list[str]) -> int:
+    # LLM contract: DISTINCT_UID + EXACT_ARGV -> READY + CANDIDATE_EXEC |
+    # NETWORK_SETUP_EXIT; an empty command or failed exec remains fail closed.
     try:
-        _require(
-            sys.platform == "linux"
-            and os.geteuid() == 0
-            and len(argv) >= 3
-            and argv[0].isdecimal()
-            and argv[1].isdecimal(),
-            "HARNESS_IDENTITY_UNSAFE",
-        )
-        identity = RunIdentity(int(argv[0]), int(argv[1]))
-        _require(
-            identity.uid not in (0, (1 << 32) - 1)
-            and identity.gid not in (0, (1 << 32) - 1),
-            "HARNESS_IDENTITY_UNSAFE",
-        )
-        os.setgroups([])
-        os.setgid(identity.gid)
-        os.setuid(identity.uid)
-        _require(
-            os.geteuid() == identity.uid
-            and os.getegid() == identity.gid
-            and os.getgroups() == [],
-            "HARNESS_IDENTITY_UNSAFE",
-        )
+        _require(len(argv) >= 3, "HARNESS_IDENTITY_UNSAFE")
+        command = _drop_linux_candidate_identity(argv)
         os.write(1, SANDBOX_READY)
-        os.execvpe(argv[2], argv[2:], os.environ)
+        os.execvpe(command[0], command, os.environ)
     except (HarnessError, OSError, ValueError):
         return NETWORK_SETUP_EXIT
     return NETWORK_SETUP_EXIT
+
+
+def _linux_candidate_policy_probe(argv: list[str]) -> int:
+    # LLM contract: ROOT_SANDBOX_LAUNCHER + EXACT_UID_GID -> DISTINCT_UID +
+    # IN_PROCESS_POLICY_PROBE; unexpected arguments or credential transitions
+    # fail before READY and no post-READY exec boundary exists.
+    try:
+        _require(len(argv) == 2, "HARNESS_IDENTITY_UNSAFE")
+        _require(
+            not _drop_linux_candidate_identity(argv),
+            "HARNESS_IDENTITY_UNSAFE",
+        )
+    except (HarnessError, OSError, ValueError):
+        return NETWORK_SETUP_EXIT
+    return _candidate_ip_policy_probe()
 
 
 def _loopback_fixture(family: socket.AddressFamily, host: str) -> bool:
@@ -939,10 +963,16 @@ def _candidate_policy_stage(returncode: int | None) -> NetworkStage:
 
 
 def _candidate_ip_policy_probe() -> int:
-    # LLM contract: FIXED_NOBODY_CANDIDATE -> DIRECT_POLICY_PROOF |
-    # TYPED_NETWORK_EXIT. Descendant egress is proved independently by the
-    # trusted preflight; this proof never requires the isolated identity to
-    # create another process.
+    # LLM contract: FIXED_NOBODY_CANDIDATE -> READY + DIRECT_POLICY_PROOF |
+    # TYPED_NETWORK_EXIT. Readiness is emitted by the process that performs the
+    # proof, so a successful prefix cannot hide a later exec failure.
+    try:
+        _require(
+            os.write(1, SANDBOX_READY) == len(SANDBOX_READY),
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+        )
+    except (HarnessError, OSError):
+        return NETWORK_SETUP_EXIT
     return _candidate_ip_policy_once()
 
 
@@ -1085,9 +1115,14 @@ async def _spawn(
     sandbox: NetworkSandbox | None,
     *,
     allow_loopback: bool = False,
+    direct_policy_probe: bool = False,
     startup_failure: NetworkStage | None = None,
 ) -> asyncio.subprocess.Process:
     if identity is None:
+        _require(
+            not direct_policy_probe,
+            "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+        )
         return await asyncio.create_subprocess_exec(
             *argv,
             cwd=cwd,
@@ -1106,18 +1141,46 @@ async def _spawn(
     process: asyncio.subprocess.Process | None = None
     try:
         trusted_launcher: Path | None = None
-        if sandbox == NetworkSandbox.LINUX:
+        if direct_policy_probe:
             trusted_launcher = Path(__file__).resolve(strict=True)
-            wrapped = [
-                sys.executable,
-                "-I",
-                "-B",
-                str(trusted_launcher),
-                "--linux-candidate-exec",
-                str(identity.uid),
-                str(identity.gid),
-                *argv,
-            ]
+            _require(
+                not allow_loopback
+                and argv
+                == [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(trusted_launcher),
+                    "--candidate-ip-policy-probe",
+                ],
+                "HARNESS_NETWORK_SANDBOX_SETUP_FAILED",
+            )
+        if sandbox == NetworkSandbox.LINUX:
+            trusted_launcher = trusted_launcher or Path(__file__).resolve(strict=True)
+            if direct_policy_probe:
+                wrapped = [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(trusted_launcher),
+                    "--linux-candidate-policy-probe",
+                    str(identity.uid),
+                    str(identity.gid),
+                ]
+            else:
+                wrapped = [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(trusted_launcher),
+                    "--linux-candidate-exec",
+                    str(identity.uid),
+                    str(identity.gid),
+                    *argv,
+                ]
+        elif direct_policy_probe:
+            wrapped = argv
+            trusted_launcher = None
         else:
             wrapped = [
                 sys.executable,
@@ -1310,6 +1373,7 @@ async def _verify_network_sandbox(
                 None,
                 identity,
                 sandbox,
+                direct_policy_probe=True,
                 startup_failure=stage,
             )
             stage = NetworkStage.CANDIDATE_RESULT
@@ -1875,6 +1939,8 @@ if __name__ == "__main__":
         raise SystemExit(_network_probe(arguments[1:]))
     if arguments == ["--candidate-ip-policy-probe"]:
         raise SystemExit(_candidate_ip_policy_probe())
+    if arguments and arguments[0] == "--linux-candidate-policy-probe":
+        raise SystemExit(_linux_candidate_policy_probe(arguments[1:]))
     if arguments and arguments[0] == "--linux-candidate-exec":
         raise SystemExit(_linux_candidate_exec(arguments[1:]))
     raise SystemExit(main(arguments))
