@@ -6,6 +6,7 @@ result
 result-*
 target/
 rust/target/
+buck-out/
 bin/
 .venv/
 venv/

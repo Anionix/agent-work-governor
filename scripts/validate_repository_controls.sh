@@ -75,8 +75,8 @@ while IFS= read -r -d '' tracked_path; do
       */.cargo/.package-cache-mutate/ | */.cargo/git/* | \
       */.cargo/registry/* | */.devenv/* | */.direnv/* | */.governance/* | \
       */.mypy_cache/* | */.nox/* | */.pytest_cache/* | */.ruff_cache/* | \
-      */.tox/* | */.venv/* | */__pycache__/* | */bin/* | */build/* | \
-      */dist/* | */dist-packages/* | */node_modules/* | \
+      */.tox/* | */.venv/* | */__pycache__/* | */bin/* | */buck-out/* | \
+      */build/* | */dist/* | */dist-packages/* | */node_modules/* | \
       */site-packages/* | */Scripts/activate*/* | */Scripts/python*.exe/* | \
       */rust/target/* | */target/* | */venv/*)
       echo "$tracked_path"

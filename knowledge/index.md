@@ -20,3 +20,4 @@
 
 - [OKF v0.2](references/okf-v0.2.md) - Locked format specification.
 - [ask-matt](references/ask-matt.md) - Locked routing contract.
+- [Buck2 shadow pilot](references/buck2-shadow-pilot.md) - Reproducible local benchmark and shadow-only decision.

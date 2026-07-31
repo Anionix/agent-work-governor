@@ -325,6 +325,41 @@
         bindNixPackageIdentity toolId (pinFor language toolId) (
           bindPackage language toolId expectedPname package
         );
+      # LLM-CONTRACT
+      # id: agent-work-governor.buck2-package-binding
+      # state: CATALOG_ARTIFACT + NIX_PACKAGE -> PINNED_BUCK2 | EVALUATION_FAILURE
+      # preconditions: the catalog declares one artifact for every supported system
+      # invariant: version, platform URL, and source bytes match the locked package
+      # failure: Nix evaluation stops before Buck2 enters the development environment
+      # source: https://github.com/NixOS/nixpkgs/blob/624af665418d3c65d544145b4d34ad696439570e/pkgs/by-name/bu/buck2/package.nix
+      # knowledge: bundle:knowledge/references/buck2-shadow-pilot.md
+      # enforced_by: bindBuck2
+      # test: bundle:tests/test_contracts.py
+      bindBuck2 =
+        pkgs:
+        let
+          expected = pinFor "rust" "buck2";
+          artifact =
+            (expected.artifacts or { }).${pkgs.stdenv.hostPlatform.system}
+              or (fail "TOOLCHAIN_ARTIFACT_SET_INVALID" "buck2");
+          sources = pkgs.buck2.srcs or [ ];
+          source =
+            if builtins.isList sources && sources != [ ] then
+              builtins.head sources
+            else
+              fail "TOOLCHAIN_PACKAGE_SOURCE_MISSING" "buck2";
+          package = pkgs.buck2 // {
+            version = builtins.replaceStrings [ "-" ] [ "." ] pkgs.buck2.version;
+            src = source;
+          };
+        in
+        bindNixPackageIdentity "buck2" (
+          expected
+          // {
+            source = artifact.url;
+            source_digest = "sha256:${artifact.sha256}";
+          }
+        ) (bindPackage "rust" "buck2" "buck2" package);
       mkWheelTool =
         pkgs: toolId:
         let
@@ -457,6 +492,7 @@
           python = pythonBase;
           actionlint = bindNixPackage "nix" "actionlint" "actionlint" pkgs.actionlint;
           bubblewrap = bindNixPackage "nix" "bubblewrap" "bubblewrap" pkgs.bubblewrap;
+          buck2 = bindBuck2 pkgs;
           cargoAudit = bindNixPackage "rust" "cargo-audit" "cargo-audit" pkgs.cargo-audit;
           cargoDeny = bindNixPackage "rust" "cargo-deny" "cargo-deny" pkgs.cargo-deny;
           git = builtins.seq provenanceBindingSelfTest (
@@ -725,6 +761,7 @@
               toolchain.rust
               toolchain.python
               toolchain.actionlint
+              toolchain.buck2
               toolchain.cargoAudit
               toolchain.cargoDeny
               toolchain.git

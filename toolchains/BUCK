@@ -1,0 +1,14 @@
+# LLM-CONTRACT
+# id: agent-work-governor.buck2-demo-toolchains
+# state: PINNED_BUCK2_PRELUDE -> SHADOW_TOOLCHAINS | TOOLCHAIN_FAILURE
+# preconditions: the catalog-bound Buck2 binary supplies its bundled prelude
+# invariant: demo toolchains are used only by the non-authoritative benchmark
+# failure: target analysis exits non-zero and cannot authorize any governor decision
+# source: https://buck2.build/docs/concepts/toolchain/
+# knowledge: bundle:knowledge/policies/work-governor.md
+# enforced_by: system_demo_toolchains
+# test: bundle:tests/test_contracts.py
+
+load("@prelude//toolchains:demo.bzl", "system_demo_toolchains")
+
+system_demo_toolchains()

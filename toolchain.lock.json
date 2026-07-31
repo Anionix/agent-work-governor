@@ -1,5 +1,5 @@
 {
-  "locked_at": "2026-07-30",
+  "locked_at": "2026-07-31",
   "required": [
     "actionlint",
     "actions/create-github-app-token",
@@ -34,6 +34,7 @@
     {"id": "actionlint", "language": "nix", "version": "1.7.12", "source": "https://github.com/rhysd/actionlint/archive/refs/tags/v1.7.12.tar.gz", "source_digest": "sha256:9800926f7b1842d9228f3935d263e2da7772df36a4a275b58e553b0ff0d5f923"},
     {"id": "actions/create-github-app-token", "language": "github_actions", "version": "v3.2.0", "source": "https://github.com/actions/create-github-app-token/commit/bcd2ba49218906704ab6c1aa796996da409d3eb1", "source_digest": "git:bcd2ba49218906704ab6c1aa796996da409d3eb1"},
     {"id": "bubblewrap", "language": "nix", "version": "0.11.2", "source": "https://github.com/containers/bubblewrap/archive/v0.11.2.tar.gz", "source_digest": "sha256:3148c932127c43db184321aa03bcdf32eb588cc4993661075ecd87dd637899b1"},
+    {"id": "buck2", "language": "rust", "version": "2026.07.15", "source": "https://github.com/facebook/buck2/releases/download/2026-07-15/buck2", "source_digest": "sha256:863d066c235d8c0b722a7e5a6e1f9e022bfd09ea5ebb851662d1c172bea46177", "artifacts": {"aarch64-darwin": {"url": "https://github.com/facebook/buck2/releases/download/2026-07-15/buck2-aarch64-apple-darwin.zst", "sha256": "088cacc72c400fa438be4052c36782f56b2af86287aadf13ece5e9772d72455c"}, "aarch64-linux": {"url": "https://github.com/facebook/buck2/releases/download/2026-07-15/buck2-aarch64-unknown-linux-gnu.zst", "sha256": "e239bf72f40a7987db9024eb6d5e325642f6496c589dec6be54c1008d2618a19"}, "x86_64-linux": {"url": "https://github.com/facebook/buck2/releases/download/2026-07-15/buck2-x86_64-unknown-linux-gnu.zst", "sha256": "ecc3d807dd0b0feff1a423688bd598263b8339d223e685578a87196456c19d95"}}},
     {"id": "cachix/install-nix-action", "language": "github_actions", "version": "v31.11.0", "source": "https://github.com/cachix/install-nix-action/commit/630ae543ea3a38a9a4166f03376c02c50f408342", "source_digest": "git:630ae543ea3a38a9a4166f03376c02c50f408342"},
     {"id": "cargo", "language": "rust", "version": "1.97.1", "source": "https://github.com/rust-lang/cargo/commit/c980f4866141969fab6254a680546a277789d6f0", "source_digest": "git:c980f4866141969fab6254a680546a277789d6f0"},
     {"id": "cargo-audit", "language": "rust", "version": "0.22.2", "source": "https://static.crates.io/crates/cargo-audit/0.22.2/download", "source_digest": "sha256:86b9240d126f5ded9f96d5a3116d80d3fb8a5455aafbd3bec11a61b098d3d6d1"},
