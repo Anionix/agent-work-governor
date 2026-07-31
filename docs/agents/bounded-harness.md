@@ -48,10 +48,11 @@ Candidate checks use the same bounded file/process surface with no network
 allow rules, so a host-local HTTP, SOCKS, or browser debug broker cannot relay
 egress. The candidate-policy proof runs directly as the fixed `nobody`
 identity; it does not require that identity to fork. A fixed stdout prefix
-proves that Bubblewrap or Seatbelt entered the sandbox before any check exit
-code can be evaluated. If the direct proof fails, exit `81` remains an observed
-bypass at `network-candidate-result`; otherwise the trusted parent emits a
-fixed fault stage derived only from its return code: `83` selects
+is emitted by that same proving process after sandbox entry and complete
+credential drop; the policy proof has no post-READY exec boundary. If the
+direct proof fails, exit `81` remains an observed bypass at
+`network-candidate-result`; otherwise the trusted parent emits a fixed fault
+stage derived only from its return code: `83` selects
 `network-candidate-socket-create-unexpected`, `84` selects
 `network-candidate-socket-operation-unexpected`, and every other nonzero value
 selects `network-candidate-process-exit-unexpected`. Candidate output is never
